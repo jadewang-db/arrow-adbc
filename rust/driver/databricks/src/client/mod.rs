@@ -38,10 +38,12 @@
 
 mod error;
 mod models;
+mod polling;
 mod retry;
 
 pub use error::{SeaError, SeaErrorCode, SeaErrorResponse};
 pub use models::*;
+pub use polling::{poll_until_complete, is_terminal_state, PollingConfig};
 pub use retry::{retry_with_backoff, retry_with_backoff_and_retry_after, RetryConfig};
 
 use crate::error::{Error, Result};
@@ -553,6 +555,125 @@ impl SeaClient {
     /// transient failures gracefully.
     pub async fn delete_session_with_retry(&self, session_id: &str) -> Result<()> {
         self.delete_with_retry(&self.session_url(session_id)).await
+    }
+
+    // =========================================================================
+    // Statement Execution
+    // =========================================================================
+
+    /// Execute a SQL statement.
+    ///
+    /// Sends the statement to the SQL Warehouse for execution. The response
+    /// may contain inline results (for small result sets) or external links
+    /// (for large result sets).
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The execute statement request with SQL and options
+    ///
+    /// # Returns
+    ///
+    /// The statement response containing the statement ID, status, and results.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The request fails to send
+    /// - The SQL is invalid
+    /// - Authentication fails
+    pub async fn execute_statement(
+        &self,
+        request: ExecuteStatementRequest,
+    ) -> Result<StatementResponse> {
+        self.post(&self.statements_url(), &request).await
+    }
+
+    /// Execute a SQL statement with automatic retry for transient errors.
+    ///
+    /// This is the recommended method for statement execution as it handles
+    /// transient failures gracefully.
+    pub async fn execute_statement_with_retry(
+        &self,
+        request: ExecuteStatementRequest,
+    ) -> Result<StatementResponse> {
+        self.post_with_retry(&self.statements_url(), &request).await
+    }
+
+    /// Get the status and results of a statement.
+    ///
+    /// Used to poll for statement completion or retrieve results after
+    /// execution.
+    ///
+    /// # Arguments
+    ///
+    /// * `statement_id` - The statement ID returned from execute_statement
+    ///
+    /// # Returns
+    ///
+    /// The statement response with current status and any available results.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The statement ID is not found
+    /// - Authentication fails
+    pub async fn get_statement(&self, statement_id: &str) -> Result<StatementResponse> {
+        self.get(&self.statement_url(statement_id)).await
+    }
+
+    /// Get statement status with automatic retry for transient errors.
+    pub async fn get_statement_with_retry(&self, statement_id: &str) -> Result<StatementResponse> {
+        self.get_with_retry(&self.statement_url(statement_id)).await
+    }
+
+    /// Cancel a running statement.
+    ///
+    /// # Arguments
+    ///
+    /// * `statement_id` - The statement ID to cancel
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The statement ID is not found
+    /// - The statement is already completed
+    pub async fn cancel_statement(&self, statement_id: &str) -> Result<()> {
+        // Cancel uses POST to /statements/{id}/cancel
+        let url = self.statement_cancel_url(statement_id);
+        let _: serde_json::Value = self.post(&url, &serde_json::json!({})).await?;
+        Ok(())
+    }
+
+    /// Cancel a running statement with automatic retry.
+    pub async fn cancel_statement_with_retry(&self, statement_id: &str) -> Result<()> {
+        let url = self.statement_cancel_url(statement_id);
+        let _: serde_json::Value = self.post_with_retry(&url, &serde_json::json!({})).await?;
+        Ok(())
+    }
+
+    /// Close a statement and release resources.
+    ///
+    /// # Arguments
+    ///
+    /// * `statement_id` - The statement ID to close
+    pub async fn close_statement(&self, statement_id: &str) -> Result<()> {
+        self.delete(&self.statement_url(statement_id)).await
+    }
+
+    /// Get a result chunk by index.
+    ///
+    /// Used to refresh external links when they expire.
+    ///
+    /// # Arguments
+    ///
+    /// * `statement_id` - The statement ID
+    /// * `chunk_index` - The chunk index to retrieve
+    ///
+    /// # Returns
+    ///
+    /// The chunk response with refreshed external links.
+    pub async fn get_chunk(&self, statement_id: &str, chunk_index: i32) -> Result<ChunkResponse> {
+        self.get(&self.statement_chunk_url(statement_id, chunk_index)).await
     }
 
     // =========================================================================

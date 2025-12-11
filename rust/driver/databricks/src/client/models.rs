@@ -138,6 +138,44 @@ pub struct StatementStatus {
     pub error: Option<StatementError>,
 }
 
+impl StatementStatus {
+    /// Check if the statement has succeeded.
+    pub fn is_succeeded(&self) -> bool {
+        self.state == StatementState::Succeeded
+    }
+
+    /// Check if the statement has failed.
+    pub fn is_failed(&self) -> bool {
+        self.state == StatementState::Failed
+    }
+
+    /// Check if the statement was cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.state == StatementState::Cancelled
+    }
+
+    /// Check if the statement is still running (pending or running).
+    pub fn is_running(&self) -> bool {
+        matches!(self.state, StatementState::Pending | StatementState::Running)
+    }
+
+    /// Check if the statement is in a terminal state.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            StatementState::Succeeded
+                | StatementState::Failed
+                | StatementState::Cancelled
+                | StatementState::Closed
+        )
+    }
+
+    /// Get the error message if the statement failed.
+    pub fn error_message(&self) -> Option<String> {
+        self.error.as_ref().and_then(|e| e.message.clone())
+    }
+}
+
 /// Statement error information.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StatementError {
@@ -150,6 +188,10 @@ pub struct StatementError {
 /// Result manifest for large results.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResultManifest {
+    /// Result format (e.g., "ARROW_STREAM").
+    pub format: Option<String>,
+    /// Schema information.
+    pub schema: Option<ManifestSchema>,
     /// Total number of chunks.
     pub total_chunk_count: i32,
     /// Total number of rows.
@@ -158,6 +200,33 @@ pub struct ResultManifest {
     pub total_byte_count: Option<i64>,
     /// Whether the result is truncated.
     pub truncated: Option<bool>,
+}
+
+/// Schema information from the manifest.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManifestSchema {
+    /// Column information.
+    pub columns: Vec<ColumnInfo>,
+}
+
+/// Column information from the manifest schema.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ColumnInfo {
+    /// Column name.
+    pub name: String,
+    /// Spark SQL type name (e.g., "INT", "STRING").
+    pub type_name: String,
+    /// Full type text.
+    pub type_text: String,
+    /// Column position (0-indexed).
+    pub position: i32,
+    /// Whether the column is nullable.
+    #[serde(default = "default_true")]
+    pub nullable: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// External link to result data.
