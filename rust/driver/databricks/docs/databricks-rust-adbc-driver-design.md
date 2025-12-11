@@ -32,11 +32,12 @@ This document describes the design of a native Rust ADBC (Arrow Database Connect
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Authentication | PAT only | Simplest to implement; OAuth can be added later |
-| Result Disposition | INLINE_OR_EXTERNAL_LINKS | Auto-selects optimal mode based on result size |
+| Result Disposition | **INLINE_OR_EXTERNAL_LINKS** | Auto-selects optimal mode based on result size; **requires DatabricksJDBCDriverOSS User-Agent** |
 | Result Format | ARROW_STREAM | Native Arrow format for ADBC |
 | Async Runtime | Tokio | Industry standard; sync wrappers for ADBC traits |
 | Session Management | Always use sessions | Maintains connection state, enables temp tables |
 | Compression | LZ4_FRAME | Reduces network transfer, ~3-5x compression |
+| User-Agent | `DatabricksJDBCDriverOSS/{version} (ADBC)` | **REQUIRED** for INLINE_OR_EXTERNAL_LINKS disposition support |
 
 ---
 
@@ -1199,19 +1200,21 @@ session_id: if current_catalog.is_some() || current_schema.is_some() {
 
 **Code Location**: `src/statement.rs:214-218, 375-379`
 
-##### Finding 3: Different Dispositions for Query Types
+##### Finding 3: Unified Disposition Strategy
 
-**Issue**: DDL statements like `USE CATALOG` failed with format errors when using ArrowStream format.
+**Initial Issue**: DDL statements like `USE CATALOG` failed with format errors when using different disposition strategies.
 
-**Root Cause**: Different statement types have different result format requirements:
-- SELECT queries: Can use `EXTERNAL_LINKS` + `ARROW_STREAM`
-- DDL/DML statements: Should use `INLINE` + `JSON_ARRAY`
+**Root Cause**: Initially tried using `EXTERNAL_LINKS` for queries and `INLINE` with `JSON_ARRAY` for DDL/DML due to the User-Agent issue.
 
-**Solution**: Use different dispositions/formats for different execution methods:
-- `execute()`: `EXTERNAL_LINKS` + `ARROW_STREAM` (for SELECT queries)
-- `execute_update()`: `INLINE` + `JSON_ARRAY` (for DDL/DML)
+**Final Solution**: Use `INLINE_OR_EXTERNAL_LINKS` + `ARROW_STREAM` + `LZ4_FRAME` for **all** statement types (SELECT, DDL, DML). This works correctly once the User-Agent header is fixed.
 
-**Status**: Partially resolved. SQL-based catalog/schema changes via `USE CATALOG`/`USE SCHEMA` still have issues. Recommend using ADBC's `set_option` mechanism instead.
+**Benefits of Unified Approach**:
+- **Simplicity**: Single configuration for all statement types
+- **Optimal Performance**: API automatically chooses inline for small results, external links for large results
+- **Consistency**: Same code path regardless of query type
+- **Lower Latency**: Small results returned inline without additional HTTP requests
+
+**Note**: SQL-based catalog/schema changes via `USE CATALOG`/`USE SCHEMA` may still have issues unrelated to disposition. Recommend using ADBC's `set_option` mechanism for catalog/schema changes.
 
 ##### Finding 4: Parallel Downloading Performance
 
@@ -1274,10 +1277,22 @@ Based on implementation findings, the following design decisions have been updat
 
 | Decision | Original Choice | Updated Choice | Rationale |
 |----------|----------------|----------------|-----------|
-| Result Disposition | INLINE_OR_EXTERNAL_LINKS | ~~INLINE_OR_EXTERNAL_LINKS~~ → EXTERNAL_LINKS for queries, INLINE for DDL | More reliable; INLINE_OR_EXTERNAL_LINKS requires specific User-Agent |
-| User-Agent Format | Generic driver name | `DatabricksJDBCDriverOSS/{version} (ADBC)` | Required for server-side feature detection |
+| Result Disposition | INLINE_OR_EXTERNAL_LINKS | **INLINE_OR_EXTERNAL_LINKS** (restored) | Optimal performance; API auto-selects based on size. Now works with correct User-Agent header |
+| User-Agent Format | Generic driver name | `DatabricksJDBCDriverOSS/{version} (ADBC)` | **REQUIRED** for INLINE_OR_EXTERNAL_LINKS support |
 | Session ID Handling | Always include | Conditional (omit with catalog/schema) | API restriction on parameter combinations |
 | Catalog/Schema Changes | Support SQL statements | Prefer `set_option` mechanism | SQL-based changes have format compatibility issues |
+
+**Important**: The key insight is that `INLINE_OR_EXTERNAL_LINKS` disposition **requires** the `DatabricksJDBCDriverOSS` User-Agent prefix. With the correct User-Agent, this disposition provides optimal performance by allowing the server to choose:
+- **Inline results** for small responses (< 16MB) - lower latency, no additional HTTP requests
+- **External links** for large responses (> 16MB) - parallel chunk fetching, better scalability
+
+**Recommended Configuration** (post-fix):
+```rust
+// For all statement types (SELECT, DDL, DML)
+disposition: Some(Disposition::InlineOrExternalLinks),
+format: Some(Format::ArrowStream),
+compression: Some(Compression::Lz4Frame),
+```
 
 #### 9.5.4 Recommendations for Production Use
 
