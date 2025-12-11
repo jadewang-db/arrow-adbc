@@ -1,0 +1,26 @@
+{
+    "hostName": "https://your-workspace.cloud.databricks.com",
+    "path": "/sql/1.0/warehouses/YOUR_WAREHOUSE_ID",
+    "token": "dapi_YOUR_PERSONAL_ACCESS_TOKEN",
+    "auth_type": "token",
+    "type": "databricks",
+    "catalog": "e2e_tests",
+    "dbSchema": "rust_adbc_driver",
+    "query": "",
+    "expectedResults": 0,
+    "metadata": {
+        "catalog": "e2e_tests",
+        "schema": "rust_adbc_driver",
+        "table": "test_types",
+        "expectedColumnCount": 15
+    },
+    "http_options": {
+        "tls": {
+            "enabled": null,
+            "disable_server_certificate_validation": null,
+            "allow_self_signed": null,
+            "allow_hostname_mismatch": null,
+            "trusted_certificate_path": null
+        }
+    }
+}

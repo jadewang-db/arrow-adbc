@@ -1,0 +1,5 @@
+# E2E test configuration files with credentials (never commit)
+*.local.json
+
+# Test output and temporary files
+test_output/
