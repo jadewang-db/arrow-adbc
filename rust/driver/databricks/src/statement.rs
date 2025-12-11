@@ -27,11 +27,12 @@ use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 
 use crate::client::{
-    poll_until_complete, Disposition, ExecuteStatementRequest, Format, PollingConfig, SeaClient,
+    poll_until_complete, Compression, Disposition, ExecuteStatementRequest, Format, PollingConfig,
+    SeaClient, StatementResponse,
 };
 use crate::database::Runtime;
 use crate::error;
-use crate::fetch::ArrowResultReader;
+use crate::fetch::{ArrowResultReader, ChunkFetcher};
 use crate::options::DatabaseConfig;
 use crate::session::SessionManager;
 
@@ -178,7 +179,10 @@ impl DatabricksStatement {
         self.runtime.clone()
     }
 
-    /// Execute the statement and return an ArrowResultReader for inline results.
+    /// Execute the statement and return an ArrowResultReader.
+    ///
+    /// This method handles both inline results (small) and external links results (large).
+    /// For external links, it uses ChunkFetcher to download chunks in parallel.
     fn execute_internal(&mut self) -> adbc_core::error::Result<ArrowResultReader> {
         let sql = self.sql_query.clone().ok_or_else(|| {
             Error::with_message_and_status(
@@ -202,7 +206,7 @@ impl DatabricksStatement {
             // Get session ID
             let session_id = session_manager.get_session_id().await?;
 
-            // Build the request
+            // Build the request - use InlineOrExternalLinks to support large results
             let request = ExecuteStatementRequest {
                 warehouse_id: client.warehouse_id().to_string(),
                 statement: sql,
@@ -212,9 +216,9 @@ impl DatabricksStatement {
                 wait_timeout: Some(wait_timeout),
                 row_limit,
                 byte_limit,
-                disposition: Some(Disposition::Inline),
+                disposition: Some(Disposition::InlineOrExternalLinks),
                 format: Some(Format::ArrowStream),
-                compression: None,
+                compression: Some(Compression::Lz4Frame),
             };
 
             // Execute the statement
@@ -243,6 +247,17 @@ impl DatabricksStatement {
         // Store the statement ID
         self.statement_id = Some(response.statement_id.clone());
 
+        // Handle results based on disposition
+        self.process_response(response)
+    }
+
+    /// Process the statement response and create an ArrowResultReader.
+    ///
+    /// Handles both inline and external links results.
+    fn process_response(
+        &self,
+        response: StatementResponse,
+    ) -> adbc_core::error::Result<ArrowResultReader> {
         // Check if this is an inline result
         if let Some(result) = &response.result {
             if result.data_array.is_some() {
@@ -257,19 +272,17 @@ impl DatabricksStatement {
                 return Ok(reader);
             }
 
-            if result.external_links.is_some() {
-                // External links result - not yet implemented
-                return Err(Error::with_message_and_status(
-                    "External links results not yet implemented. Use smaller result sets or enable INLINE disposition.",
-                    Status::NotImplemented,
-                ));
+            if let Some(external_links) = &result.external_links {
+                // External links result - fetch chunks in parallel
+                return self.fetch_external_links_result(&response, external_links.clone());
             }
         }
 
         // No result data - return empty reader with schema from manifest
-        let schema = if let Some(manifest) = &response.manifest {
-            if let Some(manifest_schema) = &manifest.schema {
-                let fields: Vec<arrow_schema::Field> = manifest_schema
+        let schema = ArrowResultReader::get_manifest(&response)
+            .and_then(|m| m.schema.as_ref())
+            .map(|s| {
+                let fields: Vec<arrow_schema::Field> = s
                     .columns
                     .iter()
                     .map(|col| {
@@ -281,14 +294,48 @@ impl DatabricksStatement {
                     })
                     .collect();
                 Arc::new(Schema::new(fields))
-            } else {
-                Arc::new(Schema::empty())
-            }
-        } else {
-            Arc::new(Schema::empty())
-        };
+            })
+            .unwrap_or_else(|| Arc::new(Schema::empty()));
 
         Ok(ArrowResultReader::empty(schema))
+    }
+
+    /// Fetch results from external links using parallel chunk fetching.
+    fn fetch_external_links_result(
+        &self,
+        response: &StatementResponse,
+        external_links: Vec<crate::client::ExternalLink>,
+    ) -> adbc_core::error::Result<ArrowResultReader> {
+        let client = self.client.clone();
+        let statement_id = response.statement_id.clone();
+        let manifest = response.manifest.clone();
+
+        // Fetch chunks in parallel
+        let chunk_data = self.runtime.block_on(async {
+            // Create chunk fetcher with default concurrency (8)
+            let fetcher = ChunkFetcher::new(client, statement_id, 8).map_err(|e| {
+                error::Error::internal(format!("Failed to create chunk fetcher: {}", e))
+            })?;
+
+            // Fetch and decompress all chunks
+            fetcher
+                .fetch_and_decompress_all(external_links.clone())
+                .await
+        }).map_err(|e: error::Error| {
+            Error::with_message_and_status(
+                format!("Failed to fetch external links: {}", e),
+                e.status(),
+            )
+        })?;
+
+        // Create reader from chunk data
+        ArrowResultReader::from_external_links(manifest.as_ref(), &external_links, chunk_data)
+            .map_err(|e| {
+                Error::with_message_and_status(
+                    format!("Failed to parse external links results: {}", e),
+                    Status::InvalidData,
+                )
+            })
     }
 
     /// Execute update and return row count.
@@ -1181,5 +1228,391 @@ mod tests {
 
         // Schema should still be available
         assert_eq!(reader.schema(), schema);
+    }
+
+    // ==================== External Links Tests ====================
+
+    /// Helper to create Arrow IPC bytes from a record batch.
+    fn create_arrow_ipc_bytes(batch: &RecordBatch) -> Vec<u8> {
+        use arrow_ipc::writer::StreamWriter;
+        use std::io::Cursor;
+
+        let mut buffer = Cursor::new(Vec::new());
+        {
+            let mut writer = StreamWriter::try_new(&mut buffer, &batch.schema()).unwrap();
+            writer.write(batch).unwrap();
+            writer.finish().unwrap();
+        }
+        buffer.into_inner()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_statement_execute_external_links() {
+        let mock_server = MockServer::start().await;
+
+        // Create test batch and Arrow IPC data
+        let schema = Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int32, false),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("c")])),
+            ],
+        )
+        .unwrap();
+        let chunk_data = create_arrow_ipc_bytes(&batch);
+
+        // Mock session creation
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(SessionResponse {
+                session_id: "test-session".to_string(),
+            }))
+            .mount(&mock_server)
+            .await;
+
+        // Mock session deletion
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/test-session"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Mock execute statement - returns external links
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-ext-links",
+                "status": {
+                    "state": "SUCCEEDED"
+                },
+                "manifest": {
+                    "format": "ARROW_STREAM",
+                    "schema": {
+                        "columns": [
+                            {"name": "id", "type_name": "INT", "type_text": "INT", "position": 0, "nullable": false},
+                            {"name": "name", "type_name": "STRING", "type_text": "STRING", "position": 1, "nullable": true}
+                        ]
+                    },
+                    "total_chunk_count": 1,
+                    "total_row_count": 3,
+                    "total_byte_count": 1000
+                },
+                "result": {
+                    "external_links": [{
+                        "chunk_index": 0,
+                        "row_offset": 0,
+                        "row_count": 3,
+                        "byte_count": 1000,
+                        "external_link": format!("{}/chunk/0", mock_server.uri()),
+                        "expiration": "2099-12-31T23:59:59Z"
+                    }]
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock chunk download
+        Mock::given(method("GET"))
+            .and(path("/chunk/0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(chunk_data))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let runtime = create_test_runtime();
+        let client = Arc::new(
+            SeaClient::new(crate::client::SeaClientConfig::new(
+                &config.host,
+                &config.token,
+                &config.warehouse_id,
+            ))
+            .unwrap(),
+        );
+        let session_manager = Arc::new(SessionManager::new(client.clone(), None, None));
+
+        runtime
+            .block_on(session_manager.get_session_id())
+            .unwrap();
+
+        let mut stmt = DatabricksStatement::new(
+            client,
+            session_manager,
+            runtime,
+            config,
+            None,
+            None,
+        );
+
+        stmt.set_sql_query("SELECT * FROM large_table").unwrap();
+        let mut reader = stmt.execute().unwrap();
+
+        // Verify we got the expected results
+        let batch_result = reader.next();
+        assert!(batch_result.is_some());
+        let result_batch = batch_result.unwrap().unwrap();
+        assert_eq!(result_batch.num_rows(), 3);
+        assert_eq!(result_batch.num_columns(), 2);
+
+        // No more batches
+        assert!(reader.next().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_statement_execute_external_links_with_compression() {
+        use lz4_flex::frame::FrameEncoder;
+        use std::io::Write;
+
+        let mock_server = MockServer::start().await;
+
+        // Create test batch and compress the Arrow IPC data
+        let schema = Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("value", arrow_schema::DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![100, 200, 300, 400, 500]))],
+        )
+        .unwrap();
+        let arrow_data = create_arrow_ipc_bytes(&batch);
+
+        // Compress with LZ4
+        let mut encoder = FrameEncoder::new(Vec::new());
+        encoder.write_all(&arrow_data).unwrap();
+        let compressed_data = encoder.finish().unwrap();
+
+        // Mock session creation
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(SessionResponse {
+                session_id: "test-session".to_string(),
+            }))
+            .mount(&mock_server)
+            .await;
+
+        // Mock session deletion
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/test-session"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Mock execute statement
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-compressed",
+                "status": {
+                    "state": "SUCCEEDED"
+                },
+                "manifest": {
+                    "format": "ARROW_STREAM",
+                    "schema": {
+                        "columns": [
+                            {"name": "value", "type_name": "BIGINT", "type_text": "BIGINT", "position": 0, "nullable": false}
+                        ]
+                    },
+                    "total_chunk_count": 1,
+                    "total_row_count": 5
+                },
+                "result": {
+                    "external_links": [{
+                        "chunk_index": 0,
+                        "row_offset": 0,
+                        "row_count": 5,
+                        "byte_count": compressed_data.len(),
+                        "external_link": format!("{}/chunk/0", mock_server.uri()),
+                        "expiration": "2099-12-31T23:59:59Z"
+                    }]
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock compressed chunk download
+        Mock::given(method("GET"))
+            .and(path("/chunk/0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(compressed_data))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let runtime = create_test_runtime();
+        let client = Arc::new(
+            SeaClient::new(crate::client::SeaClientConfig::new(
+                &config.host,
+                &config.token,
+                &config.warehouse_id,
+            ))
+            .unwrap(),
+        );
+        let session_manager = Arc::new(SessionManager::new(client.clone(), None, None));
+
+        runtime
+            .block_on(session_manager.get_session_id())
+            .unwrap();
+
+        let mut stmt = DatabricksStatement::new(
+            client,
+            session_manager,
+            runtime,
+            config,
+            None,
+            None,
+        );
+
+        stmt.set_sql_query("SELECT * FROM compressed_table").unwrap();
+        let mut reader = stmt.execute().unwrap();
+
+        // Verify we got the expected results after decompression
+        let batch_result = reader.next();
+        assert!(batch_result.is_some());
+        let result_batch = batch_result.unwrap().unwrap();
+        assert_eq!(result_batch.num_rows(), 5);
+        assert_eq!(result_batch.num_columns(), 1);
+
+        // No more batches
+        assert!(reader.next().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_statement_execute_external_links_multiple_chunks() {
+        let mock_server = MockServer::start().await;
+
+        // Create test batches
+        let schema = Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int32, false),
+        ]));
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![4, 5]))],
+        )
+        .unwrap();
+
+        let chunk0_data = create_arrow_ipc_bytes(&batch1);
+        let chunk1_data = create_arrow_ipc_bytes(&batch2);
+
+        // Mock session creation
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(SessionResponse {
+                session_id: "test-session".to_string(),
+            }))
+            .mount(&mock_server)
+            .await;
+
+        // Mock session deletion
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/test-session"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Mock execute statement with multiple chunks
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-multi-chunk",
+                "status": {
+                    "state": "SUCCEEDED"
+                },
+                "manifest": {
+                    "format": "ARROW_STREAM",
+                    "schema": {
+                        "columns": [
+                            {"name": "id", "type_name": "INT", "type_text": "INT", "position": 0, "nullable": false}
+                        ]
+                    },
+                    "total_chunk_count": 2,
+                    "total_row_count": 5
+                },
+                "result": {
+                    "external_links": [
+                        {
+                            "chunk_index": 0,
+                            "row_offset": 0,
+                            "row_count": 3,
+                            "byte_count": chunk0_data.len(),
+                            "external_link": format!("{}/chunk/0", mock_server.uri()),
+                            "expiration": "2099-12-31T23:59:59Z"
+                        },
+                        {
+                            "chunk_index": 1,
+                            "row_offset": 3,
+                            "row_count": 2,
+                            "byte_count": chunk1_data.len(),
+                            "external_link": format!("{}/chunk/1", mock_server.uri()),
+                            "expiration": "2099-12-31T23:59:59Z"
+                        }
+                    ]
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock chunk downloads
+        Mock::given(method("GET"))
+            .and(path("/chunk/0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(chunk0_data))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/chunk/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(chunk1_data))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let runtime = create_test_runtime();
+        let client = Arc::new(
+            SeaClient::new(crate::client::SeaClientConfig::new(
+                &config.host,
+                &config.token,
+                &config.warehouse_id,
+            ))
+            .unwrap(),
+        );
+        let session_manager = Arc::new(SessionManager::new(client.clone(), None, None));
+
+        runtime
+            .block_on(session_manager.get_session_id())
+            .unwrap();
+
+        let mut stmt = DatabricksStatement::new(
+            client,
+            session_manager,
+            runtime,
+            config,
+            None,
+            None,
+        );
+
+        stmt.set_sql_query("SELECT * FROM multi_chunk_table").unwrap();
+        let mut reader = stmt.execute().unwrap();
+
+        // First batch from chunk 0
+        let batch1_result = reader.next();
+        assert!(batch1_result.is_some());
+        let result_batch1 = batch1_result.unwrap().unwrap();
+        assert_eq!(result_batch1.num_rows(), 3);
+
+        // Second batch from chunk 1
+        let batch2_result = reader.next();
+        assert!(batch2_result.is_some());
+        let result_batch2 = batch2_result.unwrap().unwrap();
+        assert_eq!(result_batch2.num_rows(), 2);
+
+        // Total 5 rows across 2 batches
+        assert!(reader.next().is_none());
     }
 }

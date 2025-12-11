@@ -2502,7 +2502,15 @@ Complete the execute() method for queries returning inline results (small result
 
 # Sprint 3: External Links & Parallel Chunk Fetching
 
-## 3.1 SEA Client - Get Chunk Endpoint
+## 3.1 SEA Client - Get Chunk Endpoint [COMPLETED - 2024-12-11]
+
+### Status: COMPLETED
+
+Implementation notes:
+- get_chunk() method already implemented in SeaClient (lines 663-677)
+- Uses statement_chunk_url() helper for URL construction
+- Returns ChunkResponse with external_links Vec<ExternalLink>
+- Integrated with ChunkFetcher for URL refresh on 403 errors
 
 ### Objective
 Implement the get_chunk endpoint for retrieving refreshed external links when URLs expire.
@@ -2548,7 +2556,18 @@ Implement the get_chunk endpoint for retrieving refreshed external links when UR
 
 ---
 
-## 3.2 LZ4 Decompression
+## 3.2 LZ4 Decompression [COMPLETED - 2024-12-11]
+
+### Status: COMPLETED
+
+Implementation notes:
+- Implemented in src/fetch/decompress.rs
+- Added LZ4_FRAME_MAGIC constant for detection ([0x04, 0x22, 0x4D, 0x18])
+- is_lz4_compressed() checks for magic number at start of data
+- decompress_lz4_frame() uses lz4_flex::frame::FrameDecoder
+- decompress_if_needed() auto-detects and handles both compressed/uncompressed
+- Comprehensive test suite: magic number detection, roundtrip, various sizes
+- All decompression tests pass (12 tests)
 
 ### Objective
 Implement LZ4_FRAME decompression for compressed Arrow IPC data from cloud storage.
@@ -2621,7 +2640,20 @@ fn test_is_lz4_compressed() {
 
 ---
 
-## 3.3 ChunkFetcher - Core Implementation
+## 3.3 ChunkFetcher - Core Implementation [COMPLETED - 2024-12-11]
+
+### Status: COMPLETED
+
+Implementation notes:
+- Implemented in src/fetch/mod.rs
+- ChunkFetcherConfig with concurrency, timeout, max_retries settings
+- ChunkFetcher struct with HTTP client for cloud storage, SeaClient for URL refresh
+- fetch_chunk() downloads from presigned URLs
+- fetch_all_chunks() spawns parallel tasks with semaphore for concurrency control
+- fetch_and_decompress_all() combines fetching and LZ4 decompression
+- ChunkFetcherHandle internal struct for cloning in async tasks
+- Default concurrency: 8, timeout: 300s, max_retries: 3
+- Comprehensive test suite (12 tests) including wiremock-based HTTP tests
 
 ### Objective
 Implement parallel chunk fetching infrastructure for downloading Arrow data from cloud storage.
@@ -2695,7 +2727,18 @@ Implement parallel chunk fetching infrastructure for downloading Arrow data from
 
 ---
 
-## 3.4 ChunkFetcher - Ordered Output
+## 3.4 ChunkFetcher - Ordered Output [COMPLETED - 2024-12-11]
+
+### Status: COMPLETED
+
+Implementation notes:
+- fetch_all_chunks() uses Vec<Option<Vec<u8>>> buffer sized to total chunks
+- Each task returns (chunk_index, data) tuple
+- Results placed in buffer at correct index regardless of completion order
+- Final conversion ensures all chunks present (returns error if any missing)
+- Test test_fetch_multiple_chunks_in_order validates ordering
+- Concurrency limited via tokio Semaphore
+- Test test_concurrency_limit validates semaphore behavior with 10 chunks, 2 concurrency
 
 ### Objective
 Ensure chunks are yielded in correct order (0, 1, 2, ...) despite being fetched in parallel.
@@ -2783,7 +2826,19 @@ Ensure chunks are yielded in correct order (0, 1, 2, ...) despite being fetched 
 
 ---
 
-## 3.5 ChunkFetcher - URL Expiration Handling
+## 3.5 ChunkFetcher - URL Expiration Handling [COMPLETED - 2024-12-11]
+
+### Status: COMPLETED
+
+Implementation notes:
+- ChunkFetcherHandle::fetch_chunk_with_retry() implements retry logic
+- On HTTP 403, calls refresh_chunk_link() via SeaClient.get_chunk()
+- URL refresh doesn't count against retry attempts
+- Retryable errors (5xx) use exponential backoff (100ms * 2^attempt)
+- is_url_expired_error() helper checks for 403 status
+- Test test_fetch_with_url_refresh validates refresh flow
+- Test test_fetch_with_retry_on_transient_error validates backoff
+- Test test_fetch_non_retryable_error validates immediate failure on 404
 
 ### Objective
 Implement automatic URL refresh when presigned URLs expire during download.
@@ -2847,7 +2902,19 @@ Implement automatic URL refresh when presigned URLs expire during download.
 
 ---
 
-## 3.6 Arrow Result Reader - External Links
+## 3.6 Arrow Result Reader - External Links [COMPLETED - 2024-12-11]
+
+### Status: COMPLETED
+
+Implementation notes:
+- Added from_external_links() method to ArrowResultReader
+- Parses Arrow IPC data from decompressed chunk bytes
+- schema_from_manifest_info() extracts schema from ResultManifest
+- Helper methods: has_external_links(), get_external_links(), get_manifest()
+- Each chunk parsed via arrow_ipc::reader::StreamReader
+- Schema taken from first chunk, or falls back to manifest schema
+- Empty chunks (zero bytes) are skipped
+- Comprehensive test suite (12 tests) for external links functionality
 
 ### Objective
 Extend the ArrowResultReader to support streaming results from ChunkFetcher.
@@ -2904,7 +2971,21 @@ Extend the ArrowResultReader to support streaming results from ChunkFetcher.
 
 ---
 
-## 3.7 Statement Execute - External Links Path
+## 3.7 Statement Execute - External Links Path [COMPLETED - 2024-12-11]
+
+### Status: COMPLETED
+
+Implementation notes:
+- Changed disposition from Inline to InlineOrExternalLinks
+- Added compression: Some(Compression::Lz4Frame) to request
+- New process_response() method handles both inline and external links
+- fetch_external_links_result() creates ChunkFetcher and downloads chunks
+- Uses runtime.block_on() for async chunk fetching in sync ADBC interface
+- Chunks fetched with concurrency 8, decompressed, parsed to ArrowResultReader
+- Three integration tests added:
+  - test_statement_execute_external_links (basic flow)
+  - test_statement_execute_external_links_with_compression (LZ4)
+  - test_statement_execute_external_links_multiple_chunks (ordering)
 
 ### Objective
 Complete execute() implementation for queries returning external links (large result sets).
@@ -2992,7 +3073,16 @@ Complete execute() implementation for queries returning external links (large re
 
 ---
 
-## 3.8 Statement Cancel
+## 3.8 Statement Cancel [COMPLETED - 2024-12-11]
+
+### Status: COMPLETED
+
+Implementation notes:
+- cancel_internal() already implemented in DatabricksStatement
+- Calls SeaClient.cancel_statement() via runtime.block_on()
+- Returns Ok(()) on success, error on failure
+- Test test_statement_cancel validates the cancel flow with mock server
+- Cancellation supported for statements with stored statement_id
 
 ### Objective
 Implement statement cancellation for stopping in-progress queries.
