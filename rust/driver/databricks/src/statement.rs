@@ -206,11 +206,17 @@ impl DatabricksStatement {
             // Get session ID
             let session_id = session_manager.get_session_id().await?;
 
-            // Build the request - use ExternalLinks (API handles inline for small results)
+            // Build the request - use ExternalLinks for consistent handling
+            // (even for small results, the API will provide external links)
             let request = ExecuteStatementRequest {
                 warehouse_id: client.warehouse_id().to_string(),
                 statement: sql,
-                session_id: Some(session_id),
+                // Note: Databricks API doesn't allow session_id when catalog/schema are specified
+                session_id: if current_catalog.is_some() || current_schema.is_some() {
+                    None
+                } else {
+                    Some(session_id)
+                },
                 catalog: current_catalog,
                 schema: current_schema,
                 wait_timeout: Some(wait_timeout),
@@ -363,17 +369,24 @@ impl DatabricksStatement {
             let session_id = session_manager.get_session_id().await?;
 
             // Build the request
+            // For execute_update (DDL/DML), use Inline with JsonArray since these
+            // typically don't return large result sets and avoid Arrow decoding issues
             let request = ExecuteStatementRequest {
                 warehouse_id: client.warehouse_id().to_string(),
                 statement: sql,
-                session_id: Some(session_id),
+                // Note: Databricks API doesn't allow session_id when catalog/schema are specified
+                session_id: if current_catalog.is_some() || current_schema.is_some() {
+                    None
+                } else {
+                    Some(session_id)
+                },
                 catalog: current_catalog,
                 schema: current_schema,
                 wait_timeout: Some(wait_timeout),
                 row_limit,
                 byte_limit,
                 disposition: Some(Disposition::Inline),
-                format: Some(Format::ArrowStream),
+                format: Some(Format::JsonArray),
                 compression: None,
             };
 
