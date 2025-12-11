@@ -58,6 +58,7 @@ mod database;
 mod driver;
 mod error;
 mod fetch;
+mod metadata;
 mod options;
 mod session;
 mod statement;

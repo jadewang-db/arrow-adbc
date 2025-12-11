@@ -3128,9 +3128,21 @@ Implement statement cancellation for stopping in-progress queries.
 
 ---
 
-# Sprint 4: Metadata APIs & execute_update
+# Sprint 4: Metadata APIs & execute_update [COMPLETED - 2024-12-11]
 
-## 4.1-4.6 Connection Metadata APIs
+## 4.1-4.6 Connection Metadata APIs [COMPLETED]
+
+### Status: COMPLETED
+
+Implementation notes:
+- Created new `metadata.rs` module for metadata helper functions
+- Implemented `get_info()` returning driver info (vendor name, version, arrow version, etc.)
+- Implemented `get_table_types()` returning TABLE, VIEW, EXTERNAL, MANAGED, STREAMING_TABLE
+- Implemented `get_objects()` with full hierarchical support (catalogs, schemas, tables, columns)
+- Uses SQL queries: SHOW CATALOGS, SHOW SCHEMAS IN, SHOW TABLES IN, INFORMATION_SCHEMA.COLUMNS
+- Implemented `get_table_schema()` using INFORMATION_SCHEMA.COLUMNS
+- Added type conversion from Databricks types to Arrow types
+- Added comprehensive unit tests for all metadata functions
 
 ### Objective
 Implement all Connection metadata methods: get_info, get_table_types, get_objects at all depths.
@@ -3155,7 +3167,15 @@ For each metadata API, the pattern is:
 
 ---
 
-## 4.7 Connection - get_table_schema()
+## 4.7 Connection - get_table_schema() [COMPLETED]
+
+### Status: COMPLETED
+
+Implementation notes:
+- Uses INFORMATION_SCHEMA.COLUMNS query for column metadata
+- Converts Databricks types (BIGINT, STRING, DECIMAL, ARRAY, MAP, etc.) to Arrow types
+- Falls back to current catalog/schema if not specified
+- Returns proper Arrow Schema with field names, types, and nullability
 
 ### Objective
 Implement efficient single-table schema retrieval.
@@ -3193,7 +3213,11 @@ impl Connection for DatabricksConnection {
 
 ---
 
-## 4.8 Statement - execute_update()
+## 4.8 Statement - execute_update() [COMPLETED - Previously in Sprint 2]
+
+### Status: COMPLETED
+
+Already implemented in Sprint 2, work item 2.5. Verified working.
 
 ### Objective
 Implement DDL/DML execution returning affected row count.
@@ -3216,7 +3240,11 @@ impl Statement for DatabricksStatement {
 
 ---
 
-## 4.9 Statement - execute_schema()
+## 4.9 Statement - execute_schema() [COMPLETED - Previously in Sprint 2]
+
+### Status: COMPLETED
+
+Already implemented in Sprint 2, work item 2.5. Verified working.
 
 ### Objective
 Get query schema without executing the full query.

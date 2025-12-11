@@ -219,6 +219,11 @@ impl Error {
     pub fn internal(message: impl Into<String>) -> Self {
         Error::StatementFailed(message.into())
     }
+
+    /// Create an error from an Arrow error.
+    pub fn arrow(err: arrow_schema::ArrowError) -> Self {
+        Error::Arrow(err)
+    }
 }
 
 impl From<Error> for adbc_core::error::Error {

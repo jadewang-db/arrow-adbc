@@ -1189,22 +1189,24 @@ Base URL: `https://{workspace-host}/api/2.0/sql/statements`
 
 | Trait | Method | Implementation Status |
 |-------|--------|----------------------|
-| Driver | `new_database` | Required |
-| Driver | `new_database_with_opts` | Required |
-| Database | `new_connection` | Required |
-| Database | `new_connection_with_opts` | Required |
-| Connection | `new_statement` | Required |
-| Connection | `cancel` | Required |
-| Connection | `get_info` | Required |
-| Connection | `get_objects` | Required |
-| Connection | `get_table_schema` | Required |
-| Connection | `get_table_types` | Required |
+| Driver | `new_database` | Implemented |
+| Driver | `new_database_with_opts` | Implemented |
+| Database | `new_connection` | Implemented |
+| Database | `new_connection_with_opts` | Implemented |
+| Connection | `new_statement` | Implemented |
+| Connection | `cancel` | Implemented (no-op) |
+| Connection | `get_info` | Implemented |
+| Connection | `get_objects` | Implemented |
+| Connection | `get_table_schema` | Implemented |
+| Connection | `get_table_types` | Implemented |
+| Connection | `get_statistics` | Returns NotImplemented |
+| Connection | `get_statistic_names` | Returns NotImplemented |
 | Connection | `commit` | Returns NotImplemented |
 | Connection | `rollback` | Returns NotImplemented |
-| Statement | `set_sql_query` | Required |
-| Statement | `execute` | Required |
-| Statement | `execute_update` | Required |
-| Statement | `execute_schema` | Required |
-| Statement | `cancel` | Required |
+| Statement | `set_sql_query` | Implemented |
+| Statement | `execute` | Implemented |
+| Statement | `execute_update` | Implemented |
+| Statement | `execute_schema` | Implemented |
+| Statement | `cancel` | Implemented |
 | Statement | `bind` | Phase 2 |
 | Statement | `prepare` | Phase 2 |

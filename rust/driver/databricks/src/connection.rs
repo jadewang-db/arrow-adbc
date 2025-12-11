@@ -52,11 +52,12 @@ use std::sync::Arc;
 use adbc_core::error::{Error, Status};
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
 use adbc_core::{Connection, Optionable};
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 
 use crate::client::{SeaClient, SeaClientConfig};
 use crate::database::Runtime;
+use crate::metadata;
 use crate::options::DatabaseConfig;
 use crate::session::SessionManager;
 use crate::statement::DatabricksStatement;
@@ -241,6 +242,270 @@ impl DatabricksConnection {
     pub(crate) fn config(&self) -> &DatabaseConfig {
         &self.config
     }
+
+    /// Get the current catalog.
+    pub(crate) fn current_catalog(&self) -> Option<&str> {
+        self.current_catalog.as_deref()
+    }
+
+    /// Get the current schema.
+    pub(crate) fn current_schema(&self) -> Option<&str> {
+        self.current_schema.as_deref()
+    }
+
+    /// Execute a SQL query and return results as a RecordBatch reader.
+    ///
+    /// This is used internally for metadata queries like get_objects, get_table_schema, etc.
+    fn execute_metadata_query(&self, sql: &str) -> adbc_core::error::Result<Vec<RecordBatch>> {
+        use crate::client::{poll_until_complete, Compression, Disposition, ExecuteStatementRequest, Format, PollingConfig};
+        use crate::fetch::{ArrowResultReader, ChunkFetcher};
+        use std::time::Duration;
+
+        let client = self.client.clone();
+        let session_manager = self.session_manager.clone();
+        let current_catalog = self.current_catalog.clone();
+        let current_schema = self.current_schema.clone();
+
+        let polling_config = PollingConfig::new(Duration::from_secs(1))
+            .with_max_delay(Duration::from_secs(10));
+
+        let response = self.runtime.block_on(async {
+            let session_id = session_manager.get_session_id().await?;
+
+            let request = ExecuteStatementRequest {
+                warehouse_id: client.warehouse_id().to_string(),
+                statement: sql.to_string(),
+                session_id: Some(session_id),
+                catalog: current_catalog,
+                schema: current_schema,
+                wait_timeout: Some("10s".to_string()),
+                row_limit: Some(10000), // Limit metadata queries
+                byte_limit: None,
+                disposition: Some(Disposition::InlineOrExternalLinks),
+                format: Some(Format::ArrowStream),
+                compression: Some(Compression::Lz4Frame),
+            };
+
+            let response = client.execute_statement_with_retry(request).await?;
+
+            if response.status.is_succeeded() {
+                Ok(response)
+            } else if response.status.is_failed() {
+                let error_msg = response
+                    .status
+                    .error_message()
+                    .unwrap_or_else(|| "Statement execution failed".to_string());
+                Err(crate::error::Error::statement_failed(error_msg))
+            } else if response.status.is_cancelled() {
+                Err(crate::error::Error::cancelled("Statement was cancelled"))
+            } else {
+                poll_until_complete(&client, &response.statement_id, &polling_config).await
+            }
+        }).map_err(|e: crate::error::Error| {
+            Error::with_message_and_status(format!("Metadata query failed: {}", e), e.status())
+        })?;
+
+        // Process response and collect batches
+        let mut batches = Vec::new();
+
+        if let Some(result) = &response.result {
+            if result.data_array.is_some() {
+                // Inline result
+                let reader = ArrowResultReader::from_inline_response(&response).map_err(|e| {
+                    Error::with_message_and_status(
+                        format!("Failed to parse inline results: {}", e),
+                        Status::InvalidData,
+                    )
+                })?;
+
+                for batch_result in reader {
+                    let batch = batch_result.map_err(|e| {
+                        Error::with_message_and_status(
+                            format!("Failed to read batch: {}", e),
+                            Status::InvalidData,
+                        )
+                    })?;
+                    batches.push(batch);
+                }
+            } else if let Some(external_links) = &result.external_links {
+                // External links result
+                let client = self.client.clone();
+                let statement_id = response.statement_id.clone();
+                let manifest = response.manifest.clone();
+
+                let chunk_data = self.runtime.block_on(async {
+                    let fetcher = ChunkFetcher::new(client, statement_id, 8).map_err(|e| {
+                        crate::error::Error::internal(format!("Failed to create chunk fetcher: {}", e))
+                    })?;
+
+                    fetcher
+                        .fetch_and_decompress_all(external_links.clone())
+                        .await
+                }).map_err(|e: crate::error::Error| {
+                    Error::with_message_and_status(
+                        format!("Failed to fetch external links: {}", e),
+                        e.status(),
+                    )
+                })?;
+
+                let reader = ArrowResultReader::from_external_links(
+                    manifest.as_ref(),
+                    external_links,
+                    chunk_data,
+                )
+                .map_err(|e| {
+                    Error::with_message_and_status(
+                        format!("Failed to parse external links results: {}", e),
+                        Status::InvalidData,
+                    )
+                })?;
+
+                for batch_result in reader {
+                    let batch = batch_result.map_err(|e| {
+                        Error::with_message_and_status(
+                            format!("Failed to read batch: {}", e),
+                            Status::InvalidData,
+                        )
+                    })?;
+                    batches.push(batch);
+                }
+            }
+        }
+
+        Ok(batches)
+    }
+
+    /// Get catalogs from the database.
+    fn get_catalogs(&self) -> adbc_core::error::Result<Vec<String>> {
+        let batches = self.execute_metadata_query("SHOW CATALOGS")?;
+
+        let mut catalogs = Vec::new();
+        for batch in batches {
+            if batch.num_columns() > 0 {
+                let col = batch.column(0);
+                if let Some(string_array) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                    for i in 0..string_array.len() {
+                        if !string_array.is_null(i) {
+                            catalogs.push(string_array.value(i).to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(catalogs)
+    }
+
+    /// Get schemas from a catalog.
+    fn get_schemas(&self, catalog: &str) -> adbc_core::error::Result<Vec<String>> {
+        let sql = format!("SHOW SCHEMAS IN `{}`", catalog);
+        let batches = self.execute_metadata_query(&sql)?;
+
+        let mut schemas = Vec::new();
+        for batch in batches {
+            if batch.num_columns() > 0 {
+                let col = batch.column(0);
+                if let Some(string_array) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                    for i in 0..string_array.len() {
+                        if !string_array.is_null(i) {
+                            schemas.push(string_array.value(i).to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(schemas)
+    }
+
+    /// Get tables from a schema.
+    fn get_tables(&self, catalog: &str, schema: &str) -> adbc_core::error::Result<Vec<(String, String)>> {
+        let sql = format!("SHOW TABLES IN `{}`.`{}`", catalog, schema);
+        let batches = self.execute_metadata_query(&sql)?;
+
+        let mut tables = Vec::new();
+        for batch in batches {
+            // SHOW TABLES returns columns: database, tableName, isTemporary
+            if batch.num_columns() >= 2 {
+                let table_col = batch.column(1); // tableName is the second column
+                if let Some(string_array) = table_col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                    for i in 0..string_array.len() {
+                        if !string_array.is_null(i) {
+                            // Get table type - default to TABLE
+                            // In Databricks, we can query INFORMATION_SCHEMA.TABLES for the type
+                            tables.push((string_array.value(i).to_string(), "TABLE".to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(tables)
+    }
+
+    /// Get columns from a table using INFORMATION_SCHEMA.
+    fn get_columns(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> adbc_core::error::Result<Vec<metadata::ColumnInfo>> {
+        let sql = format!(
+            "SELECT column_name, ordinal_position, data_type, is_nullable, comment
+             FROM `{}`.INFORMATION_SCHEMA.COLUMNS
+             WHERE table_schema = '{}' AND table_name = '{}'
+             ORDER BY ordinal_position",
+            catalog, schema, table
+        );
+
+        let batches = self.execute_metadata_query(&sql)?;
+        let mut columns = Vec::new();
+
+        for batch in batches {
+            if batch.num_columns() >= 4 {
+                let name_col = batch.column(0).as_any().downcast_ref::<arrow_array::StringArray>();
+                let ordinal_col = batch.column(1);
+                let type_col = batch.column(2).as_any().downcast_ref::<arrow_array::StringArray>();
+                let nullable_col = batch.column(3).as_any().downcast_ref::<arrow_array::StringArray>();
+                let comment_col = if batch.num_columns() > 4 {
+                    batch.column(4).as_any().downcast_ref::<arrow_array::StringArray>()
+                } else {
+                    None
+                };
+
+                if let (Some(name_arr), Some(type_arr)) = (name_col, type_col) {
+                    for i in 0..batch.num_rows() {
+                        let name = name_arr.value(i).to_string();
+                        let ordinal = if let Some(int_arr) = ordinal_col.as_any().downcast_ref::<arrow_array::Int32Array>() {
+                            int_arr.value(i)
+                        } else if let Some(int_arr) = ordinal_col.as_any().downcast_ref::<arrow_array::Int64Array>() {
+                            int_arr.value(i) as i32
+                        } else {
+                            (i + 1) as i32
+                        };
+                        let data_type = type_arr.value(i).to_string();
+                        let nullable = nullable_col
+                            .map(|arr| arr.value(i).eq_ignore_ascii_case("yes"))
+                            .unwrap_or(true);
+                        let remarks = comment_col.and_then(|arr| {
+                            if arr.is_null(i) {
+                                None
+                            } else {
+                                Some(arr.value(i).to_string())
+                            }
+                        });
+
+                        columns.push(metadata::ColumnInfo {
+                            name,
+                            ordinal_position: ordinal,
+                            data_type,
+                            nullable,
+                            remarks,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(columns)
+    }
 }
 
 impl Drop for DatabricksConnection {
@@ -374,52 +639,163 @@ impl Connection for DatabricksConnection {
 
     fn get_info(
         &self,
-        _codes: Option<HashSet<InfoCode>>,
+        codes: Option<HashSet<InfoCode>>,
     ) -> adbc_core::error::Result<impl arrow_array::RecordBatchReader + Send> {
-        // TODO: Implement get_info in Sprint 4
-        Err::<SingleBatchReader, _>(Error::with_message_and_status(
-            "get_info not yet implemented",
-            Status::NotImplemented,
-        ))
+        metadata::build_get_info_result(codes).map_err(|e| e.into())
     }
 
     fn get_objects(
         &self,
-        _depth: ObjectDepth,
-        _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: Option<&str>,
-        _table_type: Option<Vec<&str>>,
-        _column_name: Option<&str>,
+        depth: ObjectDepth,
+        catalog_filter: Option<&str>,
+        db_schema_filter: Option<&str>,
+        table_name_filter: Option<&str>,
+        table_type_filter: Option<Vec<&str>>,
+        column_name_filter: Option<&str>,
     ) -> adbc_core::error::Result<impl arrow_array::RecordBatchReader + Send> {
-        // TODO: Implement get_objects in Sprint 4
-        Err::<SingleBatchReader, _>(Error::with_message_and_status(
-            "get_objects not yet implemented",
-            Status::NotImplemented,
-        ))
+        // Helper function to check if a name matches a SQL-like pattern
+        fn matches_pattern(name: &str, pattern: Option<&str>) -> bool {
+            match pattern {
+                None => true,
+                Some(p) => {
+                    // Simple pattern matching - support % as wildcard
+                    if p.contains('%') {
+                        let parts: Vec<&str> = p.split('%').collect();
+                        if parts.len() == 2 {
+                            let (prefix, suffix) = (parts[0], parts[1]);
+                            name.starts_with(prefix) && name.ends_with(suffix)
+                        } else if p.starts_with('%') {
+                            name.ends_with(p.trim_start_matches('%'))
+                        } else if p.ends_with('%') {
+                            name.starts_with(p.trim_end_matches('%'))
+                        } else {
+                            name == p
+                        }
+                    } else {
+                        name == p
+                    }
+                }
+            }
+        }
+
+        let mut builder = metadata::GetObjectsBuilder::new();
+
+        // Get catalogs
+        let catalogs = self.get_catalogs()?;
+
+        for catalog in catalogs {
+            if !matches_pattern(&catalog, catalog_filter) {
+                continue;
+            }
+
+            let mut db_schemas = Vec::new();
+
+            if matches!(depth, ObjectDepth::Schemas | ObjectDepth::Tables | ObjectDepth::Columns | ObjectDepth::All) {
+                // Get schemas for this catalog
+                let schemas = self.get_schemas(&catalog).unwrap_or_default();
+
+                for schema in schemas {
+                    if !matches_pattern(&schema, db_schema_filter) {
+                        continue;
+                    }
+
+                    let mut tables = Vec::new();
+
+                    if matches!(depth, ObjectDepth::Tables | ObjectDepth::Columns | ObjectDepth::All) {
+                        // Get tables for this schema
+                        let table_list = self.get_tables(&catalog, &schema).unwrap_or_default();
+
+                        for (table_name, table_type) in table_list {
+                            if !matches_pattern(&table_name, table_name_filter) {
+                                continue;
+                            }
+
+                            // Filter by table type if specified
+                            if let Some(ref types) = table_type_filter {
+                                if !types.iter().any(|t| t.eq_ignore_ascii_case(&table_type)) {
+                                    continue;
+                                }
+                            }
+
+                            let mut columns = Vec::new();
+
+                            if matches!(depth, ObjectDepth::Columns | ObjectDepth::All) {
+                                // Get columns for this table
+                                let column_list = self.get_columns(&catalog, &schema, &table_name)
+                                    .unwrap_or_default();
+
+                                for col in column_list {
+                                    if !matches_pattern(&col.name, column_name_filter) {
+                                        continue;
+                                    }
+                                    columns.push(col);
+                                }
+                            }
+
+                            tables.push(metadata::TableInfo {
+                                name: table_name,
+                                table_type,
+                                columns,
+                            });
+                        }
+                    }
+
+                    db_schemas.push(metadata::DbSchemaInfo {
+                        name: Some(schema),
+                        tables,
+                    });
+                }
+            }
+
+            builder.add_catalog(catalog, db_schemas);
+        }
+
+        builder.build(depth).map_err(|e| e.into())
     }
 
     fn get_table_schema(
         &self,
-        _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: &str,
+        catalog: Option<&str>,
+        db_schema: Option<&str>,
+        table_name: &str,
     ) -> adbc_core::error::Result<Schema> {
-        // TODO: Implement get_table_schema in Sprint 4
-        Err(Error::with_message_and_status(
-            "get_table_schema not yet implemented",
-            Status::NotImplemented,
-        ))
+        // Use provided catalog or fall back to current catalog
+        let catalog = catalog
+            .or(self.current_catalog.as_deref())
+            .ok_or_else(|| {
+                Error::with_message_and_status(
+                    "Catalog must be specified or current catalog must be set",
+                    Status::InvalidArguments,
+                )
+            })?;
+
+        // Use provided schema or fall back to current schema
+        let db_schema = db_schema
+            .or(self.current_schema.as_deref())
+            .ok_or_else(|| {
+                Error::with_message_and_status(
+                    "Schema must be specified or current schema must be set",
+                    Status::InvalidArguments,
+                )
+            })?;
+
+        // Get columns from INFORMATION_SCHEMA
+        let columns = self.get_columns(catalog, db_schema, table_name)?;
+
+        if columns.is_empty() {
+            return Err(Error::with_message_and_status(
+                format!("Table not found: {}.{}.{}", catalog, db_schema, table_name),
+                Status::NotFound,
+            ));
+        }
+
+        Ok(metadata::build_table_schema(&columns))
     }
 
     fn get_table_types(
         &self,
     ) -> adbc_core::error::Result<impl arrow_array::RecordBatchReader + Send> {
-        // TODO: Implement get_table_types in Sprint 4
-        Err::<SingleBatchReader, _>(Error::with_message_and_status(
-            "get_table_types not yet implemented",
-            Status::NotImplemented,
-        ))
+        metadata::build_get_table_types_result().map_err(|e| e.into())
     }
 
     fn get_statistic_names(
@@ -1049,5 +1425,149 @@ mod tests {
         assert_eq!(reader_schema.fields().len(), 2);
         assert_eq!(reader_schema.field(0).name(), "col1");
         assert_eq!(reader_schema.field(1).name(), "col2");
+    }
+
+    // ==================== Metadata API Tests ====================
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_connection_get_info() {
+        use arrow_array::Array;
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(SessionResponse {
+                session_id: "info-session".to_string(),
+            }))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/info-session"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let runtime = create_test_runtime();
+        let conn = DatabricksConnection::new(config, runtime).unwrap();
+
+        // Get all info
+        let mut reader = conn.get_info(None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        assert!(batch.num_rows() > 0);
+        assert_eq!(batch.num_columns(), 2);
+
+        // Verify column names
+        assert_eq!(batch.schema().field(0).name(), "info_name");
+        assert_eq!(batch.schema().field(1).name(), "info_value");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_connection_get_info_filtered() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(SessionResponse {
+                session_id: "info-filter-session".to_string(),
+            }))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/info-filter-session"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let runtime = create_test_runtime();
+        let conn = DatabricksConnection::new(config, runtime).unwrap();
+
+        // Get filtered info
+        let mut codes = HashSet::new();
+        codes.insert(InfoCode::VendorName);
+        codes.insert(InfoCode::DriverName);
+
+        let mut reader = conn.get_info(Some(codes)).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_connection_get_table_types() {
+        use arrow_array::Array;
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(SessionResponse {
+                session_id: "types-session".to_string(),
+            }))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/types-session"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let runtime = create_test_runtime();
+        let conn = DatabricksConnection::new(config, runtime).unwrap();
+
+        let mut reader = conn.get_table_types().unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        assert_eq!(batch.num_columns(), 1);
+        assert!(batch.num_rows() > 0);
+        assert_eq!(batch.schema().field(0).name(), "table_type");
+
+        // Verify we have TABLE and VIEW types
+        let col = batch.column(0).as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+        let types: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+        assert!(types.contains(&"TABLE"));
+        assert!(types.contains(&"VIEW"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_connection_get_statistics_not_supported() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(SessionResponse {
+                session_id: "stats-session".to_string(),
+            }))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/stats-session"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let runtime = create_test_runtime();
+        let conn = DatabricksConnection::new(config, runtime).unwrap();
+
+        let result = conn.get_statistic_names();
+        match result {
+            Err(err) => assert_eq!(err.status, Status::NotImplemented),
+            Ok(_) => panic!("Expected error but got Ok"),
+        }
+
+        let result = conn.get_statistics(None, None, None, false);
+        match result {
+            Err(err) => assert_eq!(err.status, Status::NotImplemented),
+            Ok(_) => panic!("Expected error but got Ok"),
+        }
     }
 }
