@@ -228,6 +228,21 @@ pub fn count_query_rows(conn: &mut DatabricksConnection, sql: &str) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
+/// Count total rows from a RecordBatchReader.
+///
+/// This helper consumes the reader and counts all rows across all batches.
+///
+/// # Arguments
+///
+/// * `reader` - The RecordBatchReader to count rows from
+///
+/// # Returns
+///
+/// The total number of rows in all batches.
+pub fn count_reader_rows(reader: impl arrow_array::RecordBatchReader) -> usize {
+    reader.map(|batch_result| batch_result.unwrap().num_rows()).sum()
+}
+
 /// Macro for conditional test execution (like C# Skip.IfNot).
 ///
 /// This macro checks if the test configuration is available and skips

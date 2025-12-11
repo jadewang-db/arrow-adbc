@@ -75,11 +75,14 @@
 pub mod config;
 pub mod helpers;
 pub mod connection_tests;
+pub mod query_basic_tests;
+pub mod query_types_tests;
+pub mod query_large_tests;
 
 // Re-export commonly used items for convenience
 pub use config::E2EConfig;
 pub use helpers::{
-    can_execute_test_config, count_query_rows, create_statement_with_query, create_test_connection,
-    create_test_connection_with_catalog, create_test_database, create_test_driver,
-    execute_query_and_collect, get_test_config,
+    can_execute_test_config, count_query_rows, count_reader_rows, create_statement_with_query,
+    create_test_connection, create_test_connection_with_catalog, create_test_database,
+    create_test_driver, execute_query_and_collect, get_test_config,
 };
