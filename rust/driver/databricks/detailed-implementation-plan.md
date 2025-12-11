@@ -831,7 +831,22 @@ fn test_jitter_range() {
 
 ---
 
-## 1.6 DatabricksDriver Implementation
+## 1.6 DatabricksDriver Implementation [COMPLETED - 2024-12-11]
+
+### Status: COMPLETED
+
+Implementation notes:
+- Implemented `DatabricksDriver` struct with optional Tokio runtime handle
+- `new()` creates a driver without a runtime (runtime created lazily per database)
+- `with_runtime()` allows sharing a runtime across multiple databases
+- Implemented `Driver` trait with `new_database()` and `new_database_with_opts()`
+- Options are passed to the database via the `Optionable` trait
+- FFI export macro enabled via `ffi` feature flag
+- Comprehensive test suite covering:
+  - Driver creation (new, default, with_runtime)
+  - Database creation with various options
+  - Error handling for invalid options
+  - Multiple database creation from single driver
 
 ### Objective
 Implement the ADBC Driver trait as the entry point for creating database connections.
@@ -928,7 +943,35 @@ fn test_driver_with_opts() {
 
 ---
 
-## 1.7 DatabricksDatabase Implementation
+## 1.7 DatabricksDatabase Implementation [COMPLETED - 2024-12-11]
+
+### Status: COMPLETED
+
+Implementation notes:
+- Implemented `DatabaseConfig` struct in `options.rs` with all configuration fields
+- Implemented `HttpConfig` for HTTP client configuration (timeouts, retries)
+- `DatabricksDatabase` holds config, optional external runtime handle, and lazily-created runtime
+- `Runtime` enum supports both external `Handle` and owned `Tokio` runtime variants
+- `block_on` method handles async-to-sync bridge for both runtime types
+- Full `Optionable` trait implementation supporting all database options:
+  - `uri` - Workspace URL
+  - `databricks.warehouse_id` - SQL Warehouse ID
+  - `databricks.token` - Personal Access Token
+  - `databricks.catalog` - Default catalog (optional)
+  - `databricks.schema` - Default schema (optional)
+  - `databricks.http.connect_timeout` - Connect timeout in ms
+  - `databricks.http.read_timeout` - Read timeout in ms
+  - `databricks.fetch.concurrency` - Parallel fetchers
+  - `databricks.fetch.compression` - Compression format
+- Configuration validation ensures required options (uri, warehouse_id, token) are set
+- `Database` trait implementation with `new_connection()` and `new_connection_with_opts()`
+- Connections inherit default catalog/schema from database config
+- Comprehensive test suite (49 tests) covering:
+  - Runtime creation and block_on functionality
+  - All option setters and getters
+  - Default values verification
+  - Configuration validation error cases
+  - Connection creation with various options
 
 ### Objective
 Implement the Database trait with configuration management and Tokio runtime initialization.

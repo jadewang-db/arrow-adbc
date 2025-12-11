@@ -75,6 +75,7 @@ impl arrow_array::RecordBatchReader for SingleBatchReader {
 /// - Session created on `new_connection()`
 /// - Session kept alive automatically (statements refresh the idle timeout)
 /// - Session terminated on Connection drop
+#[derive(Debug)]
 pub struct DatabricksConnection {
     /// Database configuration.
     config: Arc<DatabaseConfig>,

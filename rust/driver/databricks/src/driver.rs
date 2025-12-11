@@ -70,3 +70,166 @@ impl Driver for DatabricksDriver {
 
 // Import Optionable for set_option method
 use adbc_core::Optionable;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::options::database;
+
+    #[test]
+    fn test_driver_new() {
+        let driver = DatabricksDriver::new();
+        assert!(driver.handle.is_none());
+    }
+
+    #[test]
+    fn test_driver_default() {
+        let driver = DatabricksDriver::default();
+        assert!(driver.handle.is_none());
+    }
+
+    #[test]
+    fn test_driver_with_runtime() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let driver = DatabricksDriver::with_runtime(runtime.handle().clone());
+        assert!(driver.handle.is_some());
+    }
+
+    #[test]
+    fn test_new_database() {
+        let mut driver = DatabricksDriver::new();
+        let db = driver.new_database();
+        assert!(db.is_ok());
+    }
+
+    #[test]
+    fn test_new_database_with_opts_uri() {
+        let mut driver = DatabricksDriver::new();
+        let opts = vec![(
+            OptionDatabase::Uri,
+            OptionValue::String("https://test.cloud.databricks.com".into()),
+        )];
+        let db = driver.new_database_with_opts(opts);
+        assert!(db.is_ok());
+
+        let db = db.unwrap();
+        let uri = db.get_option_string(OptionDatabase::Uri).unwrap();
+        assert_eq!(uri, "https://test.cloud.databricks.com");
+    }
+
+    #[test]
+    fn test_new_database_with_all_required_opts() {
+        let mut driver = DatabricksDriver::new();
+        let opts = vec![
+            (
+                OptionDatabase::Uri,
+                OptionValue::String("https://test.cloud.databricks.com".into()),
+            ),
+            (
+                OptionDatabase::Other(database::WAREHOUSE_ID.into()),
+                OptionValue::String("abc123def456".into()),
+            ),
+            (
+                OptionDatabase::Other(database::TOKEN.into()),
+                OptionValue::String("dapi123456".into()),
+            ),
+        ];
+        let db = driver.new_database_with_opts(opts);
+        assert!(db.is_ok());
+
+        let db = db.unwrap();
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Uri).unwrap(),
+            "https://test.cloud.databricks.com"
+        );
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(database::WAREHOUSE_ID.into()))
+                .unwrap(),
+            "abc123def456"
+        );
+    }
+
+    #[test]
+    fn test_new_database_with_optional_catalog_and_schema() {
+        let mut driver = DatabricksDriver::new();
+        let opts = vec![
+            (
+                OptionDatabase::Uri,
+                OptionValue::String("https://test.cloud.databricks.com".into()),
+            ),
+            (
+                OptionDatabase::Other(database::WAREHOUSE_ID.into()),
+                OptionValue::String("abc123".into()),
+            ),
+            (
+                OptionDatabase::Other(database::TOKEN.into()),
+                OptionValue::String("dapi123".into()),
+            ),
+            (
+                OptionDatabase::Other(database::CATALOG.into()),
+                OptionValue::String("main".into()),
+            ),
+            (
+                OptionDatabase::Other(database::SCHEMA.into()),
+                OptionValue::String("default".into()),
+            ),
+        ];
+        let db = driver.new_database_with_opts(opts);
+        assert!(db.is_ok());
+
+        let db = db.unwrap();
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(database::CATALOG.into()))
+                .unwrap(),
+            "main"
+        );
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(database::SCHEMA.into()))
+                .unwrap(),
+            "default"
+        );
+    }
+
+    #[test]
+    fn test_new_database_with_invalid_option_type() {
+        let mut driver = DatabricksDriver::new();
+        // URI must be a string, not an int
+        let opts = vec![(OptionDatabase::Uri, OptionValue::Int(123))];
+        let result = driver.new_database_with_opts(opts);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_database_with_unknown_option() {
+        let mut driver = DatabricksDriver::new();
+        let opts = vec![(
+            OptionDatabase::Other("unknown.option".into()),
+            OptionValue::String("value".into()),
+        )];
+        let result = driver.new_database_with_opts(opts);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multiple_databases_from_same_driver() {
+        let mut driver = DatabricksDriver::new();
+
+        let db1 = driver.new_database();
+        let db2 = driver.new_database();
+
+        assert!(db1.is_ok());
+        assert!(db2.is_ok());
+    }
+
+    #[test]
+    fn test_driver_with_shared_runtime() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut driver = DatabricksDriver::with_runtime(runtime.handle().clone());
+
+        let db1 = driver.new_database();
+        let db2 = driver.new_database();
+
+        assert!(db1.is_ok());
+        assert!(db2.is_ok());
+    }
+}

@@ -25,7 +25,11 @@ use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
 use adbc_core::{Database, Optionable};
 
 use crate::connection::DatabricksConnection;
-use crate::options::{database, DatabaseConfig, HttpConfig};
+use crate::options::{database, DatabaseConfig};
+
+// HttpConfig is used via DatabaseConfig but not directly in this module
+#[allow(unused_imports)]
+use crate::options::HttpConfig;
 
 /// Runtime wrapper for Tokio.
 pub enum Runtime {
@@ -307,5 +311,486 @@ impl Database for DatabricksDatabase {
             connection.set_option(key, value)?;
         }
         Ok(connection)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create a database with all required options set.
+    fn create_configured_database() -> DatabricksDatabase {
+        let mut db = DatabricksDatabase::new(None);
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("https://test.cloud.databricks.com".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(database::WAREHOUSE_ID.into()),
+            OptionValue::String("test-warehouse-123".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(database::TOKEN.into()),
+            OptionValue::String("dapi_test_token".into()),
+        )
+        .unwrap();
+        db
+    }
+
+    // ==================== Runtime Tests ====================
+
+    #[test]
+    fn test_runtime_new_creates_owned_runtime() {
+        let runtime = Runtime::new(None).unwrap();
+        assert!(matches!(runtime, Runtime::Tokio(_)));
+    }
+
+    #[test]
+    fn test_runtime_new_with_handle() {
+        let owned_runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = Runtime::new(Some(owned_runtime.handle().clone())).unwrap();
+        assert!(matches!(runtime, Runtime::Handle(_)));
+    }
+
+    #[test]
+    fn test_runtime_block_on_owned() {
+        let runtime = Runtime::new(None).unwrap();
+        let result = runtime.block_on(async { 42 });
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_runtime_block_on_handle() {
+        let owned_runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = Runtime::new(Some(owned_runtime.handle().clone())).unwrap();
+        let result = runtime.block_on(async { 123 });
+        assert_eq!(result, 123);
+    }
+
+    // ==================== Database Creation Tests ====================
+
+    #[test]
+    fn test_database_new() {
+        let db = DatabricksDatabase::new(None);
+        assert!(db.handle.is_none());
+        assert!(db.runtime.is_none());
+    }
+
+    #[test]
+    fn test_database_new_with_handle() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let db = DatabricksDatabase::new(Some(runtime.handle().clone()));
+        assert!(db.handle.is_some());
+    }
+
+    // ==================== URI Option Tests ====================
+
+    #[test]
+    fn test_set_option_uri() {
+        let mut db = DatabricksDatabase::new(None);
+        let result = db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("https://my-workspace.cloud.databricks.com".into()),
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Uri).unwrap(),
+            "https://my-workspace.cloud.databricks.com"
+        );
+    }
+
+    #[test]
+    fn test_set_option_uri_trims_trailing_slash() {
+        let mut db = DatabricksDatabase::new(None);
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("https://test.databricks.com/".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Uri).unwrap(),
+            "https://test.databricks.com"
+        );
+    }
+
+    #[test]
+    fn test_set_option_uri_wrong_type() {
+        let mut db = DatabricksDatabase::new(None);
+        let result = db.set_option(OptionDatabase::Uri, OptionValue::Int(123));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+    }
+
+    // ==================== Warehouse ID Option Tests ====================
+
+    #[test]
+    fn test_set_option_warehouse_id() {
+        let mut db = DatabricksDatabase::new(None);
+        let result = db.set_option(
+            OptionDatabase::Other(database::WAREHOUSE_ID.into()),
+            OptionValue::String("abc123def456".into()),
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(database::WAREHOUSE_ID.into()))
+                .unwrap(),
+            "abc123def456"
+        );
+    }
+
+    #[test]
+    fn test_set_option_warehouse_id_wrong_type() {
+        let mut db = DatabricksDatabase::new(None);
+        let result = db.set_option(
+            OptionDatabase::Other(database::WAREHOUSE_ID.into()),
+            OptionValue::Int(123),
+        );
+        assert!(result.is_err());
+    }
+
+    // ==================== Token Option Tests ====================
+
+    #[test]
+    fn test_set_option_token() {
+        let mut db = DatabricksDatabase::new(None);
+        let result = db.set_option(
+            OptionDatabase::Other(database::TOKEN.into()),
+            OptionValue::String("dapi_test_token_xyz".into()),
+        );
+        assert!(result.is_ok());
+        // Token is not retrievable via get_option_string for security
+        // It's stored in config but we verify by checking new_connection works
+    }
+
+    #[test]
+    fn test_set_option_token_wrong_type() {
+        let mut db = DatabricksDatabase::new(None);
+        let result = db.set_option(
+            OptionDatabase::Other(database::TOKEN.into()),
+            OptionValue::Int(123),
+        );
+        assert!(result.is_err());
+    }
+
+    // ==================== Catalog and Schema Option Tests ====================
+
+    #[test]
+    fn test_set_option_catalog() {
+        let mut db = DatabricksDatabase::new(None);
+        let result = db.set_option(
+            OptionDatabase::Other(database::CATALOG.into()),
+            OptionValue::String("main".into()),
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(database::CATALOG.into()))
+                .unwrap(),
+            "main"
+        );
+    }
+
+    #[test]
+    fn test_set_option_schema() {
+        let mut db = DatabricksDatabase::new(None);
+        let result = db.set_option(
+            OptionDatabase::Other(database::SCHEMA.into()),
+            OptionValue::String("default".into()),
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(database::SCHEMA.into()))
+                .unwrap(),
+            "default"
+        );
+    }
+
+    #[test]
+    fn test_get_option_catalog_not_set() {
+        let db = DatabricksDatabase::new(None);
+        let result = db.get_option_string(OptionDatabase::Other(database::CATALOG.into()));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status, Status::NotFound);
+    }
+
+    #[test]
+    fn test_get_option_schema_not_set() {
+        let db = DatabricksDatabase::new(None);
+        let result = db.get_option_string(OptionDatabase::Other(database::SCHEMA.into()));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status, Status::NotFound);
+    }
+
+    // ==================== HTTP Config Option Tests ====================
+
+    #[test]
+    fn test_set_option_http_connect_timeout() {
+        let mut db = DatabricksDatabase::new(None);
+        let result = db.set_option(
+            OptionDatabase::Other(database::HTTP_CONNECT_TIMEOUT.into()),
+            OptionValue::Int(5000),
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            db.get_option_int(OptionDatabase::Other(database::HTTP_CONNECT_TIMEOUT.into()))
+                .unwrap(),
+            5000
+        );
+    }
+
+    #[test]
+    fn test_set_option_http_read_timeout() {
+        let mut db = DatabricksDatabase::new(None);
+        let result = db.set_option(
+            OptionDatabase::Other(database::HTTP_READ_TIMEOUT.into()),
+            OptionValue::Int(60000),
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            db.get_option_int(OptionDatabase::Other(database::HTTP_READ_TIMEOUT.into()))
+                .unwrap(),
+            60000
+        );
+    }
+
+    #[test]
+    fn test_set_option_http_timeout_wrong_type() {
+        let mut db = DatabricksDatabase::new(None);
+        let result = db.set_option(
+            OptionDatabase::Other(database::HTTP_CONNECT_TIMEOUT.into()),
+            OptionValue::String("5000".into()),
+        );
+        assert!(result.is_err());
+    }
+
+    // ==================== Fetch Config Option Tests ====================
+
+    #[test]
+    fn test_set_option_fetch_concurrency() {
+        let mut db = DatabricksDatabase::new(None);
+        let result = db.set_option(
+            OptionDatabase::Other(database::FETCH_CONCURRENCY.into()),
+            OptionValue::Int(16),
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            db.get_option_int(OptionDatabase::Other(database::FETCH_CONCURRENCY.into()))
+                .unwrap(),
+            16
+        );
+    }
+
+    #[test]
+    fn test_set_option_fetch_compression() {
+        let mut db = DatabricksDatabase::new(None);
+        let result = db.set_option(
+            OptionDatabase::Other(database::FETCH_COMPRESSION.into()),
+            OptionValue::String("NONE".into()),
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(database::FETCH_COMPRESSION.into()))
+                .unwrap(),
+            "NONE"
+        );
+    }
+
+    #[test]
+    fn test_default_fetch_compression() {
+        let db = DatabricksDatabase::new(None);
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(database::FETCH_COMPRESSION.into()))
+                .unwrap(),
+            "LZ4_FRAME"
+        );
+    }
+
+    #[test]
+    fn test_default_fetch_concurrency() {
+        let db = DatabricksDatabase::new(None);
+        assert_eq!(
+            db.get_option_int(OptionDatabase::Other(database::FETCH_CONCURRENCY.into()))
+                .unwrap(),
+            8
+        );
+    }
+
+    #[test]
+    fn test_default_http_connect_timeout() {
+        let db = DatabricksDatabase::new(None);
+        assert_eq!(
+            db.get_option_int(OptionDatabase::Other(database::HTTP_CONNECT_TIMEOUT.into()))
+                .unwrap(),
+            10000 // 10 seconds in ms
+        );
+    }
+
+    #[test]
+    fn test_default_http_read_timeout() {
+        let db = DatabricksDatabase::new(None);
+        assert_eq!(
+            db.get_option_int(OptionDatabase::Other(database::HTTP_READ_TIMEOUT.into()))
+                .unwrap(),
+            300000 // 300 seconds in ms
+        );
+    }
+
+    // ==================== Unknown Option Tests ====================
+
+    #[test]
+    fn test_set_unknown_option() {
+        let mut db = DatabricksDatabase::new(None);
+        let result = db.set_option(
+            OptionDatabase::Other("unknown.option".into()),
+            OptionValue::String("value".into()),
+        );
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status, Status::NotFound);
+    }
+
+    #[test]
+    fn test_get_unknown_option_string() {
+        let db = DatabricksDatabase::new(None);
+        let result = db.get_option_string(OptionDatabase::Other("unknown.option".into()));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status, Status::NotFound);
+    }
+
+    #[test]
+    fn test_get_unknown_option_int() {
+        let db = DatabricksDatabase::new(None);
+        let result = db.get_option_int(OptionDatabase::Other("unknown.option".into()));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status, Status::NotFound);
+    }
+
+    #[test]
+    fn test_get_option_bytes_not_supported() {
+        let db = DatabricksDatabase::new(None);
+        let result = db.get_option_bytes(OptionDatabase::Uri);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status, Status::NotFound);
+    }
+
+    #[test]
+    fn test_get_option_double_not_supported() {
+        let db = DatabricksDatabase::new(None);
+        let result = db.get_option_double(OptionDatabase::Uri);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status, Status::NotFound);
+    }
+
+    // ==================== Configuration Validation Tests ====================
+
+    #[test]
+    fn test_validate_config_missing_uri() {
+        let db = DatabricksDatabase::new(None);
+        let result = db.new_connection();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains("uri"));
+    }
+
+    #[test]
+    fn test_validate_config_missing_warehouse_id() {
+        let mut db = DatabricksDatabase::new(None);
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("https://test.databricks.com".into()),
+        )
+        .unwrap();
+        let result = db.new_connection();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains(database::WAREHOUSE_ID));
+    }
+
+    #[test]
+    fn test_validate_config_missing_token() {
+        let mut db = DatabricksDatabase::new(None);
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("https://test.databricks.com".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(database::WAREHOUSE_ID.into()),
+            OptionValue::String("warehouse123".into()),
+        )
+        .unwrap();
+        let result = db.new_connection();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains(database::TOKEN));
+    }
+
+    // ==================== Connection Creation Tests ====================
+
+    #[test]
+    fn test_new_connection_with_valid_config() {
+        let db = create_configured_database();
+        let result = db.new_connection();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_new_connection_with_opts() {
+        let db = create_configured_database();
+        let opts = vec![(
+            OptionConnection::CurrentCatalog,
+            OptionValue::String("override_catalog".into()),
+        )];
+        let result = db.new_connection_with_opts(opts);
+        assert!(result.is_ok());
+
+        let conn = result.unwrap();
+        assert_eq!(
+            conn.get_option_string(OptionConnection::CurrentCatalog)
+                .unwrap(),
+            "override_catalog"
+        );
+    }
+
+    #[test]
+    fn test_new_connection_inherits_catalog_and_schema() {
+        let mut db = create_configured_database();
+        db.set_option(
+            OptionDatabase::Other(database::CATALOG.into()),
+            OptionValue::String("inherited_catalog".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(database::SCHEMA.into()),
+            OptionValue::String("inherited_schema".into()),
+        )
+        .unwrap();
+
+        let conn = db.new_connection().unwrap();
+        assert_eq!(
+            conn.get_option_string(OptionConnection::CurrentCatalog)
+                .unwrap(),
+            "inherited_catalog"
+        );
+        assert_eq!(
+            conn.get_option_string(OptionConnection::CurrentSchema)
+                .unwrap(),
+            "inherited_schema"
+        );
+    }
+
+    #[test]
+    fn test_multiple_connections_from_same_database() {
+        let db = create_configured_database();
+
+        let conn1 = db.new_connection();
+        let conn2 = db.new_connection();
+
+        assert!(conn1.is_ok());
+        assert!(conn2.is_ok());
     }
 }
