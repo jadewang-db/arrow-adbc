@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git stack create:*)",
+      "Bash(mkdir:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nfeat(rust/databricks): add project setup and Cargo configuration for ADBC driver\n\nThis commit implements work item 1.1 for the Databricks Rust ADBC driver:\n\n- Create the project directory structure following the design document\n- Add Cargo.toml with all required dependencies (arrow, tokio, reqwest, etc.)\n- Create lib.rs with module declarations and public exports\n- Create stub implementations for all core modules:\n  - driver.rs: DatabricksDriver implementing Driver trait\n  - database.rs: DatabricksDatabase implementing Database trait with options\n  - connection.rs: DatabricksConnection implementing Connection trait\n  - statement.rs: DatabricksStatement implementing Statement trait\n  - error.rs: Error types and ADBC status mapping\n  - options.rs: Driver-specific configuration options\n  - session.rs: Session management placeholder\n  - client/: SEA API client module with models and error types\n  - fetch/: Chunk fetching and LZ4 decompression utilities\n- Add README.md with usage documentation\n- Support both rustls-tls (default) and native-tls features\n- Support FFI export feature for C dynamic library\n\nThe project compiles successfully and all tests pass.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\nEOF\n)\")",
+      "Bash(git commit:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(rustup component add:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(find /Users/jade.wang/arrow-adbc -name *rust*design*.md -o -name *databricks*rust*.md)",
+      "Bash(find ~/adbc-databricks/csharp -type d -name *Databricks*)",
+      "Bash(if [ -z \"$DATABRICKS_TEST_CONFIG_FILE\" ])",
+      "Bash(then echo \"DATABRICKS_TEST_CONFIG_FILE is not set\")",
+      "Bash(else echo \"Config file path: $DATABRICKS_TEST_CONFIG_FILE\")",
+      "Bash(if [ -f \"$DATABRICKS_TEST_CONFIG_FILE\" ])",
+      "Bash(then echo \"Config file exists\")",
+      "Bash(else echo \"Config file does NOT exist\")",
+      "Bash(fi)",
+      "Bash(DATABRICKS_TEST_CONFIG_FILE=\"/Users/jade.wang/tmp/adbc_test_config.json\" cargo test:*)",
+      "Bash(git reset:*)"
+    ]
+  }
+}

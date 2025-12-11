@@ -47,14 +47,15 @@ pub enum Disposition {
     /// Results are returned inline in the response.
     Inline,
     /// Results are stored externally and links are provided.
+    /// The API will automatically use this for large results.
     ExternalLinks,
-    /// API decides based on result size.
-    InlineOrExternalLinks,
 }
 
 impl Default for Disposition {
     fn default() -> Self {
-        Self::InlineOrExternalLinks
+        // Use EXTERNAL_LINKS by default. The API will return inline results
+        // if they're small enough, or external links if they're large.
+        Self::ExternalLinks
     }
 }
 

@@ -206,7 +206,7 @@ impl DatabricksStatement {
             // Get session ID
             let session_id = session_manager.get_session_id().await?;
 
-            // Build the request - use InlineOrExternalLinks to support large results
+            // Build the request - use ExternalLinks (API handles inline for small results)
             let request = ExecuteStatementRequest {
                 warehouse_id: client.warehouse_id().to_string(),
                 statement: sql,
@@ -216,7 +216,7 @@ impl DatabricksStatement {
                 wait_timeout: Some(wait_timeout),
                 row_limit,
                 byte_limit,
-                disposition: Some(Disposition::InlineOrExternalLinks),
+                disposition: Some(Disposition::ExternalLinks),
                 format: Some(Format::ArrowStream),
                 compression: Some(Compression::Lz4Frame),
             };

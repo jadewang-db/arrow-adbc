@@ -281,7 +281,7 @@ impl DatabricksConnection {
                 wait_timeout: Some("10s".to_string()),
                 row_limit: Some(10000), // Limit metadata queries
                 byte_limit: None,
-                disposition: Some(Disposition::InlineOrExternalLinks),
+                disposition: Some(Disposition::ExternalLinks),
                 format: Some(Format::ArrowStream),
                 compression: Some(Compression::Lz4Frame),
             };
