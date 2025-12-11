@@ -59,6 +59,8 @@ pub enum Error {
         message: String,
         /// HTTP status code
         http_status: u16,
+        /// Optional Retry-After duration from the server (for 429 responses)
+        retry_after: Option<std::time::Duration>,
     },
 
     /// Arrow error.
@@ -159,6 +161,30 @@ impl Error {
             code: code.into(),
             message: message.into(),
             http_status,
+            retry_after: None,
+        }
+    }
+
+    /// Create a SEA API error with a Retry-After hint.
+    pub fn sea_api_with_retry_after(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        http_status: u16,
+        retry_after: Option<std::time::Duration>,
+    ) -> Self {
+        Error::SeaApi {
+            code: code.into(),
+            message: message.into(),
+            http_status,
+            retry_after,
+        }
+    }
+
+    /// Get the retry-after duration if this is a rate-limited error.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Error::SeaApi { retry_after, .. } => *retry_after,
+            _ => None,
         }
     }
 
@@ -207,6 +233,7 @@ impl From<SeaError> for Error {
             code: format!("{:?}", err.code),
             message: err.message,
             http_status: err.code.to_http_status(),
+            retry_after: None,
         }
     }
 }
@@ -220,77 +247,49 @@ mod tests {
 
     #[test]
     fn test_sea_error_400_maps_to_invalid_arguments() {
-        let err = Error::SeaApi {
-            code: "BAD_REQUEST".into(),
-            message: "Invalid SQL syntax".into(),
-            http_status: 400,
-        };
+        let err = Error::sea_api("BAD_REQUEST", "Invalid SQL syntax", 400);
         assert_eq!(err.status(), Status::InvalidArguments);
         assert!(!err.is_retryable());
     }
 
     #[test]
     fn test_sea_error_401_maps_to_unauthenticated() {
-        let err = Error::SeaApi {
-            code: "UNAUTHENTICATED".into(),
-            message: "Invalid token".into(),
-            http_status: 401,
-        };
+        let err = Error::sea_api("UNAUTHENTICATED", "Invalid token", 401);
         assert_eq!(err.status(), Status::Unauthenticated);
         assert!(!err.is_retryable());
     }
 
     #[test]
     fn test_sea_error_403_maps_to_unauthorized() {
-        let err = Error::SeaApi {
-            code: "PERMISSION_DENIED".into(),
-            message: "Access denied".into(),
-            http_status: 403,
-        };
+        let err = Error::sea_api("PERMISSION_DENIED", "Access denied", 403);
         assert_eq!(err.status(), Status::Unauthorized);
         assert!(!err.is_retryable());
     }
 
     #[test]
     fn test_sea_error_404_maps_to_not_found() {
-        let err = Error::SeaApi {
-            code: "NOT_FOUND".into(),
-            message: "Resource not found".into(),
-            http_status: 404,
-        };
+        let err = Error::sea_api("NOT_FOUND", "Resource not found", 404);
         assert_eq!(err.status(), Status::NotFound);
         assert!(!err.is_retryable());
     }
 
     #[test]
     fn test_sea_error_429_maps_to_io_and_is_retryable() {
-        let err = Error::SeaApi {
-            code: "REQUEST_LIMIT_EXCEEDED".into(),
-            message: "Rate limited".into(),
-            http_status: 429,
-        };
+        let err = Error::sea_api("REQUEST_LIMIT_EXCEEDED", "Rate limited", 429);
         assert_eq!(err.status(), Status::IO);
         assert!(err.is_retryable());
     }
 
     #[test]
     fn test_sea_error_500_maps_to_internal_and_is_retryable() {
-        let err = Error::SeaApi {
-            code: "INTERNAL_ERROR".into(),
-            message: "Internal server error".into(),
-            http_status: 500,
-        };
+        let err = Error::sea_api("INTERNAL_ERROR", "Internal server error", 500);
         assert_eq!(err.status(), Status::Internal);
         assert!(err.is_retryable());
     }
 
     #[test]
     fn test_sea_error_503_maps_to_io_and_is_retryable() {
-        let err = Error::SeaApi {
-            code: "TEMPORARILY_UNAVAILABLE".into(),
-            message: "Service unavailable".into(),
-            http_status: 503,
-        };
+        let err = Error::sea_api("TEMPORARILY_UNAVAILABLE", "Service unavailable", 503);
         assert_eq!(err.status(), Status::IO);
         assert!(err.is_retryable());
     }
@@ -363,21 +362,13 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        let err = Error::SeaApi {
-            code: "BAD_REQUEST".into(),
-            message: "Invalid SQL".into(),
-            http_status: 400,
-        };
+        let err = Error::sea_api("BAD_REQUEST", "Invalid SQL", 400);
         assert_eq!(err.to_string(), "SEA API error: BAD_REQUEST - Invalid SQL");
     }
 
     #[test]
     fn test_error_to_adbc_error_conversion() {
-        let err = Error::SeaApi {
-            code: "NOT_FOUND".into(),
-            message: "Table not found".into(),
-            http_status: 404,
-        };
+        let err = Error::sea_api("NOT_FOUND", "Table not found", 404);
         let adbc_err: adbc_core::error::Error = err.into();
         assert_eq!(adbc_err.status, Status::NotFound);
         assert!(adbc_err.message.contains("NOT_FOUND"));
@@ -386,13 +377,31 @@ mod tests {
 
     #[test]
     fn test_unknown_http_status_maps_to_unknown() {
-        let err = Error::SeaApi {
-            code: "UNKNOWN".into(),
-            message: "Unknown error".into(),
-            http_status: 418, // I'm a teapot
-        };
+        let err = Error::sea_api("UNKNOWN", "Unknown error", 418); // I'm a teapot
         assert_eq!(err.status(), Status::Unknown);
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_retry_after_accessor() {
+        use std::time::Duration;
+
+        // Error without retry_after
+        let err = Error::sea_api("REQUEST_LIMIT_EXCEEDED", "Rate limited", 429);
+        assert_eq!(err.retry_after(), None);
+
+        // Error with retry_after
+        let err = Error::sea_api_with_retry_after(
+            "REQUEST_LIMIT_EXCEEDED",
+            "Rate limited",
+            429,
+            Some(Duration::from_secs(30)),
+        );
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(30)));
+
+        // Non-SeaApi error
+        let err = Error::Timeout;
+        assert_eq!(err.retry_after(), None);
     }
 
     #[test]

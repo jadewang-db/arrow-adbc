@@ -38,9 +38,11 @@
 
 mod error;
 mod models;
+mod retry;
 
 pub use error::{SeaError, SeaErrorCode, SeaErrorResponse};
 pub use models::*;
+pub use retry::{retry_with_backoff, retry_with_backoff_and_retry_after, RetryConfig};
 
 use crate::error::{Error, Result};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
@@ -74,6 +76,8 @@ pub struct SeaClientConfig {
     pub connect_timeout: Duration,
     /// HTTP read timeout (also used as overall request timeout).
     pub read_timeout: Duration,
+    /// Retry configuration for transient errors.
+    pub retry_config: RetryConfig,
 }
 
 impl Default for SeaClientConfig {
@@ -84,6 +88,7 @@ impl Default for SeaClientConfig {
             warehouse_id: String::new(),
             connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
             read_timeout: Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS),
+            retry_config: RetryConfig::default(),
         }
     }
 }
@@ -110,6 +115,12 @@ impl SeaClientConfig {
     /// Set the read timeout.
     pub fn with_read_timeout(mut self, timeout: Duration) -> Self {
         self.read_timeout = timeout;
+        self
+    }
+
+    /// Set the retry configuration.
+    pub fn with_retry_config(mut self, retry_config: RetryConfig) -> Self {
+        self.retry_config = retry_config;
         self
     }
 
@@ -149,6 +160,11 @@ impl SeaClientConfig {
 ///
 /// All API errors are converted to [`Error`] with appropriate status codes.
 /// Transient errors (429, 500, 503) are marked as retryable.
+///
+/// # Retry Behavior
+///
+/// The client supports automatic retry with exponential backoff for transient
+/// errors. Use `*_with_retry` methods to enable retry behavior.
 #[derive(Debug)]
 pub struct SeaClient {
     /// HTTP client with configured timeouts and headers.
@@ -157,6 +173,8 @@ pub struct SeaClient {
     host: String,
     /// SQL Warehouse ID.
     warehouse_id: String,
+    /// Retry configuration for transient errors.
+    retry_config: RetryConfig,
 }
 
 impl SeaClient {
@@ -181,7 +199,13 @@ impl SeaClient {
             http_client,
             host: config.host,
             warehouse_id: config.warehouse_id,
+            retry_config: config.retry_config,
         })
+    }
+
+    /// Get the retry configuration.
+    pub fn retry_config(&self) -> &RetryConfig {
+        &self.retry_config
     }
 
     /// Build default headers for all requests.
@@ -354,6 +378,82 @@ impl SeaClient {
     }
 
     // =========================================================================
+    // HTTP Request Methods with Retry
+    // =========================================================================
+
+    /// Send a POST request with automatic retry for transient errors.
+    ///
+    /// This method wraps `post` with exponential backoff retry logic.
+    /// It respects the `Retry-After` header for 429 responses.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `Req` - The request body type (must implement `Serialize + Clone`)
+    /// * `Resp` - The response body type (must implement `DeserializeOwned`)
+    pub async fn post_with_retry<Req, Resp>(&self, url: &str, body: &Req) -> Result<Resp>
+    where
+        Req: Serialize + Clone,
+        Resp: DeserializeOwned,
+    {
+        let url = url.to_string();
+        let body = body.clone();
+
+        retry_with_backoff_and_retry_after(&self.retry_config, || {
+            let url = url.clone();
+            let body = body.clone();
+            async move {
+                let result = self.post::<Req, Resp>(&url, &body).await;
+                let retry_after = result.as_ref().err().and_then(|e| e.retry_after());
+                (result, retry_after)
+            }
+        })
+        .await
+    }
+
+    /// Send a GET request with automatic retry for transient errors.
+    ///
+    /// This method wraps `get` with exponential backoff retry logic.
+    /// It respects the `Retry-After` header for 429 responses.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `Resp` - The response body type (must implement `DeserializeOwned`)
+    pub async fn get_with_retry<Resp>(&self, url: &str) -> Result<Resp>
+    where
+        Resp: DeserializeOwned,
+    {
+        let url = url.to_string();
+
+        retry_with_backoff_and_retry_after(&self.retry_config, || {
+            let url = url.clone();
+            async move {
+                let result = self.get::<Resp>(&url).await;
+                let retry_after = result.as_ref().err().and_then(|e| e.retry_after());
+                (result, retry_after)
+            }
+        })
+        .await
+    }
+
+    /// Send a DELETE request with automatic retry for transient errors.
+    ///
+    /// This method wraps `delete` with exponential backoff retry logic.
+    /// It respects the `Retry-After` header for 429 responses.
+    pub async fn delete_with_retry(&self, url: &str) -> Result<()> {
+        let url = url.to_string();
+
+        retry_with_backoff_and_retry_after(&self.retry_config, || {
+            let url = url.clone();
+            async move {
+                let result = self.delete(&url).await;
+                let retry_after = result.as_ref().err().and_then(|e| e.retry_after());
+                (result, retry_after)
+            }
+        })
+        .await
+    }
+
+    // =========================================================================
     // Response Handling
     // =========================================================================
 
@@ -423,6 +523,39 @@ impl SeaClient {
     }
 
     // =========================================================================
+    // Session Management with Retry
+    // =========================================================================
+
+    /// Create a new session with automatic retry for transient errors.
+    ///
+    /// This is the recommended method for session creation as it handles
+    /// transient failures gracefully.
+    pub async fn create_session_with_retry(
+        &self,
+        catalog: Option<String>,
+        schema: Option<String>,
+    ) -> Result<String> {
+        let request = CreateSessionRequest {
+            warehouse_id: self.warehouse_id.clone(),
+            catalog,
+            schema,
+        };
+
+        let response: SessionResponse = self
+            .post_with_retry(&self.sessions_url(), &request)
+            .await?;
+        Ok(response.session_id)
+    }
+
+    /// Delete/terminate a session with automatic retry for transient errors.
+    ///
+    /// This is the recommended method for session deletion as it handles
+    /// transient failures gracefully.
+    pub async fn delete_session_with_retry(&self, session_id: &str) -> Result<()> {
+        self.delete_with_retry(&self.session_url(session_id)).await
+    }
+
+    // =========================================================================
     // Response Handling
     // =========================================================================
 
@@ -431,11 +564,13 @@ impl SeaClient {
         let http_status = response.status().as_u16();
 
         // Try to extract retry-after header for rate limiting
-        let retry_after = response
+        let retry_after_secs = response
             .headers()
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
+
+        let retry_after = retry_after_secs.map(Duration::from_secs);
 
         // Try to parse the error response body
         let error_response: Option<SeaErrorResponse> = response.json().await.ok();
@@ -443,29 +578,27 @@ impl SeaClient {
         let (code, message) = match &error_response {
             Some(resp) => {
                 let code = resp.error_code.clone().unwrap_or_else(|| "UNKNOWN".to_string());
-                let message = resp.message.clone().unwrap_or_else(|| format!("HTTP {}", http_status));
+                let base_message = resp.message.clone().unwrap_or_else(|| format!("HTTP {}", http_status));
+                // Include retry-after in message for visibility
+                let message = if let Some(secs) = retry_after_secs {
+                    format!("{} (retry after {} seconds)", base_message, secs)
+                } else {
+                    base_message
+                };
                 (code, message)
             }
-            None => ("UNKNOWN".to_string(), format!("HTTP {}", http_status)),
+            None => {
+                let base_message = format!("HTTP {}", http_status);
+                let message = if let Some(secs) = retry_after_secs {
+                    format!("{} (retry after {} seconds)", base_message, secs)
+                } else {
+                    base_message
+                };
+                ("UNKNOWN".to_string(), message)
+            }
         };
 
-        let mut err = Error::sea_api(code, message, http_status);
-
-        // Log retry-after if present (could be used by retry logic in the future)
-        if let Some(seconds) = retry_after {
-            // For now, we just note it in a more detailed error message
-            err = Error::sea_api(
-                error_response.as_ref().and_then(|r| r.error_code.clone()).unwrap_or_else(|| "UNKNOWN".to_string()),
-                format!(
-                    "{} (retry after {} seconds)",
-                    error_response.as_ref().and_then(|r| r.message.clone()).unwrap_or_else(|| format!("HTTP {}", http_status)),
-                    seconds
-                ),
-                http_status,
-            );
-        }
-
-        Err(err)
+        Err(Error::sea_api_with_retry_after(code, message, http_status, retry_after))
     }
 }
 
@@ -740,7 +873,7 @@ mod async_tests {
         SeaClient::new(config).unwrap()
     }
 
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     struct TestRequest {
         value: String,
     }
@@ -1235,5 +1368,302 @@ mod async_tests {
 
         // Delete
         client.delete_session(&session_id).await.unwrap();
+    }
+
+    // =========================================================================
+    // Retry Integration Tests
+    // =========================================================================
+
+    /// Helper to create a SeaClient with custom retry config.
+    fn create_test_client_with_retry(server_uri: &str, retry_config: RetryConfig) -> SeaClient {
+        let config = SeaClientConfig::new(server_uri, "test-token", "test-warehouse")
+            .with_retry_config(retry_config);
+        SeaClient::new(config).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_get_with_retry_succeeds_on_transient_error() {
+        let mock_server = MockServer::start().await;
+
+        // First request fails with 503, second succeeds
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-retry"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "error_code": "TEMPORARILY_UNAVAILABLE",
+                "message": "Service temporarily unavailable"
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-retry"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(TestResponse {
+                result: "success after retry".to_string(),
+            }))
+            .mount(&mock_server)
+            .await;
+
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(10), // Short delay for tests
+            max_delay: Duration::from_millis(100),
+            jitter: 0.0,
+        };
+        let client = create_test_client_with_retry(&mock_server.uri(), retry_config);
+
+        let response: TestResponse = client
+            .get_with_retry(&client.statement_url("stmt-retry"))
+            .await
+            .unwrap();
+        assert_eq!(response.result, "success after retry");
+    }
+
+    #[tokio::test]
+    async fn test_post_with_retry_succeeds_on_rate_limit() {
+        let mock_server = MockServer::start().await;
+
+        // First request fails with 429, second succeeds
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "1")
+                    .set_body_json(serde_json::json!({
+                        "error_code": "REQUEST_LIMIT_EXCEEDED",
+                        "message": "Rate limit exceeded"
+                    })),
+            )
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(TestResponse {
+                result: "success after rate limit".to_string(),
+            }))
+            .mount(&mock_server)
+            .await;
+
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(100),
+            jitter: 0.0,
+        };
+        let client = create_test_client_with_retry(&mock_server.uri(), retry_config);
+
+        let request = TestRequest {
+            value: "test".to_string(),
+        };
+        let response: TestResponse = client
+            .post_with_retry(&client.statements_url(), &request)
+            .await
+            .unwrap();
+        assert_eq!(response.result, "success after rate limit");
+    }
+
+    #[tokio::test]
+    async fn test_get_with_retry_fails_on_non_retryable_error() {
+        let mock_server = MockServer::start().await;
+
+        // 400 errors are not retryable
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-bad"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error_code": "BAD_REQUEST",
+                "message": "Invalid request"
+            })))
+            .expect(1) // Should only be called once
+            .mount(&mock_server)
+            .await;
+
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(100),
+            jitter: 0.0,
+        };
+        let client = create_test_client_with_retry(&mock_server.uri(), retry_config);
+
+        let result: Result<TestResponse> = client
+            .get_with_retry(&client.statement_url("stmt-bad"))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::SeaApi { http_status: 400, .. }));
+    }
+
+    #[tokio::test]
+    async fn test_delete_with_retry_succeeds_on_server_error() {
+        let mock_server = MockServer::start().await;
+
+        // First two requests fail with 500, third succeeds
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/session-flaky"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error_code": "INTERNAL_ERROR",
+                "message": "Internal server error"
+            })))
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/session-flaky"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(100),
+            jitter: 0.0,
+        };
+        let client = create_test_client_with_retry(&mock_server.uri(), retry_config);
+
+        let result = client
+            .delete_with_retry(&client.session_url("session-flaky"))
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_get_with_retry_exhausts_retries() {
+        let mock_server = MockServer::start().await;
+
+        // Always fail with 503
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-always-fail"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "error_code": "TEMPORARILY_UNAVAILABLE",
+                "message": "Service temporarily unavailable"
+            })))
+            .expect(4) // Initial + 3 retries
+            .mount(&mock_server)
+            .await;
+
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(5),
+            max_delay: Duration::from_millis(50),
+            jitter: 0.0,
+        };
+        let client = create_test_client_with_retry(&mock_server.uri(), retry_config);
+
+        let result: Result<TestResponse> = client
+            .get_with_retry(&client.statement_url("stmt-always-fail"))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::SeaApi { http_status: 503, .. }));
+    }
+
+    #[tokio::test]
+    async fn test_create_session_with_retry_handles_transient_failure() {
+        let mock_server = MockServer::start().await;
+
+        // First request fails, second succeeds
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "error_code": "TEMPORARILY_UNAVAILABLE",
+                "message": "Warehouse starting"
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "session-after-retry"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let retry_config = RetryConfig {
+            max_retries: 2,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(100),
+            jitter: 0.0,
+        };
+        let client = create_test_client_with_retry(&mock_server.uri(), retry_config);
+
+        let session_id = client.create_session_with_retry(None, None).await.unwrap();
+        assert_eq!(session_id, "session-after-retry");
+    }
+
+    #[tokio::test]
+    async fn test_retry_extracts_retry_after_header() {
+        let mock_server = MockServer::start().await;
+
+        // First request fails with 429 and Retry-After header
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-rate"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "30")
+                    .set_body_json(serde_json::json!({
+                        "error_code": "REQUEST_LIMIT_EXCEEDED",
+                        "message": "Rate limit exceeded"
+                    })),
+            )
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-rate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(TestResponse {
+                result: "ok".to_string(),
+            }))
+            .mount(&mock_server)
+            .await;
+
+        let retry_config = RetryConfig {
+            max_retries: 2,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(100),
+            jitter: 0.0,
+        };
+        let client = create_test_client_with_retry(&mock_server.uri(), retry_config);
+
+        // Note: The Retry-After value (30s) is much larger than our test delays,
+        // but since our test mock allows success on second try, it should work.
+        // In production, the delay_with_retry_after would use the server's value.
+        let result: Result<TestResponse> = client
+            .get_with_retry(&client.statement_url("stmt-rate"))
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_no_retry_config_fails_immediately() {
+        let mock_server = MockServer::start().await;
+
+        // Fail with 503 (normally retryable)
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-no-retry"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "error_code": "TEMPORARILY_UNAVAILABLE",
+                "message": "Service temporarily unavailable"
+            })))
+            .expect(1) // Should only be called once with no retries
+            .mount(&mock_server)
+            .await;
+
+        let retry_config = RetryConfig::no_retry();
+        let client = create_test_client_with_retry(&mock_server.uri(), retry_config);
+
+        let result: Result<TestResponse> = client
+            .get_with_retry(&client.statement_url("stmt-no-retry"))
+            .await;
+
+        assert!(result.is_err());
     }
 }

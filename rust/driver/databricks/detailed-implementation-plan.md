@@ -660,7 +660,9 @@ async fn test_session_lifecycle() {
 
 ---
 
-## 1.5 Retry Logic & Exponential Backoff
+## 1.5 Retry Logic & Exponential Backoff [COMPLETED]
+
+### Status: Completed
 
 ### Objective
 Implement retry strategy for transient errors with exponential backoff and jitter.
@@ -812,8 +814,20 @@ fn test_jitter_range() {
 ```
 
 ### Files Modified/Created
-- `driver/databricks/src/client/mod.rs` (add retry logic)
+- `driver/databricks/src/client/mod.rs` (add retry logic and `*_with_retry` methods)
+- `driver/databricks/src/client/retry.rs` (new file containing RetryConfig and retry functions)
+- `driver/databricks/src/error.rs` (add `retry_after` field to SeaApi error variant)
 - `driver/databricks/Cargo.toml` (add `rand` dependency)
+
+### Implementation Notes (2025-12-11)
+- Created dedicated `retry.rs` module for cleaner separation of concerns
+- Implemented two retry functions:
+  - `retry_with_backoff`: Simple retry for operations without Retry-After support
+  - `retry_with_backoff_and_retry_after`: Supports Retry-After header for 429 responses
+- Added `retry_after: Option<Duration>` field to `Error::SeaApi` to carry the server-specified retry delay
+- Added `*_with_retry` methods to SeaClient: `post_with_retry`, `get_with_retry`, `delete_with_retry`
+- Added session management with retry: `create_session_with_retry`, `delete_session_with_retry`
+- Comprehensive test coverage with wiremock integration tests for retry scenarios
 
 ---
 
