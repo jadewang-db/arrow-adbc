@@ -223,7 +223,7 @@ pub struct CreateSessionRequest {
 }
 
 /// Response from create session.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionResponse {
     /// Session ID.
     pub session_id: String,

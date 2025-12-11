@@ -370,6 +370,62 @@ impl SeaClient {
         }
     }
 
+    // =========================================================================
+    // Session Management
+    // =========================================================================
+
+    /// Create a new session with the SQL Warehouse.
+    ///
+    /// Sessions maintain connection state with the SQL Warehouse and enable
+    /// features like temporary tables and session-scoped configurations.
+    ///
+    /// # Arguments
+    ///
+    /// * `catalog` - Optional default catalog for the session
+    /// * `schema` - Optional default schema for the session
+    ///
+    /// # Returns
+    ///
+    /// The session ID on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session creation fails.
+    pub async fn create_session(
+        &self,
+        catalog: Option<String>,
+        schema: Option<String>,
+    ) -> Result<String> {
+        let request = CreateSessionRequest {
+            warehouse_id: self.warehouse_id.clone(),
+            catalog,
+            schema,
+        };
+
+        let response: SessionResponse = self.post(&self.sessions_url(), &request).await?;
+        Ok(response.session_id)
+    }
+
+    /// Delete/terminate a session.
+    ///
+    /// This should be called when the connection is closed to clean up
+    /// server-side resources.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The session ID to delete
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session deletion fails.
+    pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+        self.delete(&self.session_url(session_id)).await
+    }
+
+    // =========================================================================
+    // Response Handling
+    // =========================================================================
+
     /// Handle an error response by parsing the error body.
     async fn handle_error_response<T>(&self, response: reqwest::Response) -> Result<T> {
         let http_status = response.status().as_u16();
@@ -987,5 +1043,197 @@ mod async_tests {
         let client = create_test_client(&mock_server.uri());
         let result = client.delete(&client.session_url("session-456")).await;
         assert!(result.is_ok());
+    }
+
+    // =========================================================================
+    // Session Management Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_create_session_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .and(header("authorization", "Bearer test-token"))
+            .and(header("content-type", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "session-abc-123"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = create_test_client(&mock_server.uri());
+        let session_id = client.create_session(None, None).await.unwrap();
+        assert_eq!(session_id, "session-abc-123");
+    }
+
+    #[tokio::test]
+    async fn test_create_session_with_catalog_and_schema() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .and(body_json(&serde_json::json!({
+                "warehouse_id": "test-warehouse",
+                "catalog": "main",
+                "schema": "default"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "session-with-catalog"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = create_test_client(&mock_server.uri());
+        let session_id = client
+            .create_session(Some("main".to_string()), Some("default".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(session_id, "session-with-catalog");
+    }
+
+    #[tokio::test]
+    async fn test_create_session_without_optional_fields() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .and(body_json(&serde_json::json!({
+                "warehouse_id": "test-warehouse"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "session-minimal"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = create_test_client(&mock_server.uri());
+        let session_id = client.create_session(None, None).await.unwrap();
+        assert_eq!(session_id, "session-minimal");
+    }
+
+    #[tokio::test]
+    async fn test_create_session_error_unauthenticated() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error_code": "UNAUTHENTICATED",
+                "message": "Invalid or expired token"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = create_test_client(&mock_server.uri());
+        let result = client.create_session(None, None).await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::SeaApi { http_status: 401, .. }));
+    }
+
+    #[tokio::test]
+    async fn test_create_session_error_permission_denied() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error_code": "PERMISSION_DENIED",
+                "message": "User does not have access to warehouse"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = create_test_client(&mock_server.uri());
+        let result = client.create_session(None, None).await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::SeaApi { http_status: 403, .. }));
+    }
+
+    #[tokio::test]
+    async fn test_delete_session_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/session-to-delete"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let client = create_test_client(&mock_server.uri());
+        let result = client.delete_session("session-to-delete").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_delete_session_204_no_content() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/session-204"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&mock_server)
+            .await;
+
+        let client = create_test_client(&mock_server.uri());
+        let result = client.delete_session("session-204").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_delete_session_not_found() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/nonexistent-session"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error_code": "NOT_FOUND",
+                "message": "Session not found"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = create_test_client(&mock_server.uri());
+        let result = client.delete_session("nonexistent-session").await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::SeaApi { http_status: 404, .. }));
+    }
+
+    #[tokio::test]
+    async fn test_session_lifecycle() {
+        let mock_server = MockServer::start().await;
+
+        // Create session
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "lifecycle-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Delete session
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/lifecycle-session"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let client = create_test_client(&mock_server.uri());
+
+        // Create
+        let session_id = client
+            .create_session(Some("main".to_string()), Some("default".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(session_id, "lifecycle-session");
+
+        // Delete
+        client.delete_session(&session_id).await.unwrap();
     }
 }
