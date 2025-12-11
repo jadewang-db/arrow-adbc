@@ -17,7 +17,7 @@
 
 //! DatabricksDatabase implementation.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adbc_core::error::{Error, Status};
@@ -32,11 +32,23 @@ use crate::options::{database, DatabaseConfig};
 use crate::options::HttpConfig;
 
 /// Runtime wrapper for Tokio.
+///
+/// Provides a unified interface for executing async operations, either using
+/// an externally provided runtime handle or an internally managed runtime.
 pub enum Runtime {
     /// External runtime handle.
     Handle(tokio::runtime::Handle),
     /// Owned runtime.
     Tokio(tokio::runtime::Runtime),
+}
+
+impl std::fmt::Debug for Runtime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Runtime::Handle(_) => write!(f, "Runtime::Handle(...)"),
+            Runtime::Tokio(_) => write!(f, "Runtime::Tokio(...)"),
+        }
+    }
 }
 
 impl Runtime {
@@ -72,7 +84,8 @@ pub struct DatabricksDatabase {
     /// Tokio runtime handle.
     handle: Option<tokio::runtime::Handle>,
     /// Shared runtime (created lazily on first connection).
-    runtime: Option<Arc<Runtime>>,
+    /// Uses Mutex for interior mutability since the Database trait uses &self.
+    runtime: Mutex<Option<Arc<Runtime>>>,
 }
 
 impl DatabricksDatabase {
@@ -81,13 +94,17 @@ impl DatabricksDatabase {
         Self {
             config: DatabaseConfig::default(),
             handle,
-            runtime: None,
+            runtime: Mutex::new(None),
         }
     }
 
     /// Get or create the shared runtime.
-    fn get_runtime(&mut self) -> adbc_core::error::Result<Arc<Runtime>> {
-        if let Some(ref runtime) = self.runtime {
+    fn get_runtime(&self) -> adbc_core::error::Result<Arc<Runtime>> {
+        let mut guard = self.runtime.lock().map_err(|_| {
+            Error::with_message_and_status("Failed to acquire runtime lock", Status::Internal)
+        })?;
+
+        if let Some(ref runtime) = *guard {
             return Ok(runtime.clone());
         }
 
@@ -95,7 +112,7 @@ impl DatabricksDatabase {
             Error::with_message_and_status(format!("Failed to create runtime: {}", e), Status::IO)
         })?;
         let runtime = Arc::new(runtime);
-        self.runtime = Some(runtime.clone());
+        *guard = Some(runtime.clone());
         Ok(runtime)
     }
 
@@ -296,9 +313,8 @@ impl Database for DatabricksDatabase {
 
     fn new_connection(&self) -> adbc_core::error::Result<Self::ConnectionType> {
         self.validate_config()?;
-        // For now, create a placeholder connection
-        // Full implementation will be in a later work item
-        DatabricksConnection::new(Arc::new(self.config.clone()))
+        let runtime = self.get_runtime()?;
+        DatabricksConnection::new(Arc::new(self.config.clone()), runtime)
     }
 
     fn new_connection_with_opts(
@@ -306,7 +322,8 @@ impl Database for DatabricksDatabase {
         opts: impl IntoIterator<Item = (OptionConnection, OptionValue)>,
     ) -> adbc_core::error::Result<Self::ConnectionType> {
         self.validate_config()?;
-        let mut connection = DatabricksConnection::new(Arc::new(self.config.clone()))?;
+        let runtime = self.get_runtime()?;
+        let mut connection = DatabricksConnection::new(Arc::new(self.config.clone()), runtime)?;
         for (key, value) in opts {
             connection.set_option(key, value)?;
         }
@@ -375,7 +392,7 @@ mod tests {
     fn test_database_new() {
         let db = DatabricksDatabase::new(None);
         assert!(db.handle.is_none());
-        assert!(db.runtime.is_none());
+        assert!(db.runtime.lock().unwrap().is_none());
     }
 
     #[test]
@@ -730,67 +747,44 @@ mod tests {
     }
 
     // ==================== Connection Creation Tests ====================
+    // Note: Connection creation tests are primarily in connection.rs since they require
+    // a mock server for session creation. Tests here focus on validation logic.
 
     #[test]
-    fn test_new_connection_with_valid_config() {
-        let db = create_configured_database();
-        let result = db.new_connection();
-        assert!(result.is_ok());
+    fn test_get_runtime_creates_runtime_lazily() {
+        let db = DatabricksDatabase::new(None);
+        // Runtime should not exist initially
+        assert!(db.runtime.lock().unwrap().is_none());
+
+        // Getting runtime should create it
+        let runtime_result = db.get_runtime();
+        assert!(runtime_result.is_ok());
+
+        // Now runtime should exist
+        assert!(db.runtime.lock().unwrap().is_some());
     }
 
     #[test]
-    fn test_new_connection_with_opts() {
-        let db = create_configured_database();
-        let opts = vec![(
-            OptionConnection::CurrentCatalog,
-            OptionValue::String("override_catalog".into()),
-        )];
-        let result = db.new_connection_with_opts(opts);
-        assert!(result.is_ok());
+    fn test_get_runtime_returns_same_runtime() {
+        let db = DatabricksDatabase::new(None);
 
-        let conn = result.unwrap();
-        assert_eq!(
-            conn.get_option_string(OptionConnection::CurrentCatalog)
-                .unwrap(),
-            "override_catalog"
-        );
+        let runtime1 = db.get_runtime().unwrap();
+        let runtime2 = db.get_runtime().unwrap();
+
+        // Both should be the same Arc (same pointer)
+        assert!(Arc::ptr_eq(&runtime1, &runtime2));
     }
 
     #[test]
-    fn test_new_connection_inherits_catalog_and_schema() {
-        let mut db = create_configured_database();
-        db.set_option(
-            OptionDatabase::Other(database::CATALOG.into()),
-            OptionValue::String("inherited_catalog".into()),
-        )
-        .unwrap();
-        db.set_option(
-            OptionDatabase::Other(database::SCHEMA.into()),
-            OptionValue::String("inherited_schema".into()),
-        )
-        .unwrap();
+    fn test_get_runtime_with_external_handle() {
+        let external_runtime = tokio::runtime::Runtime::new().unwrap();
+        let db = DatabricksDatabase::new(Some(external_runtime.handle().clone()));
 
-        let conn = db.new_connection().unwrap();
-        assert_eq!(
-            conn.get_option_string(OptionConnection::CurrentCatalog)
-                .unwrap(),
-            "inherited_catalog"
-        );
-        assert_eq!(
-            conn.get_option_string(OptionConnection::CurrentSchema)
-                .unwrap(),
-            "inherited_schema"
-        );
-    }
-
-    #[test]
-    fn test_multiple_connections_from_same_database() {
-        let db = create_configured_database();
-
-        let conn1 = db.new_connection();
-        let conn2 = db.new_connection();
-
-        assert!(conn1.is_ok());
-        assert!(conn2.is_ok());
+        let runtime = db.get_runtime().unwrap();
+        // Should wrap the handle
+        runtime.block_on(async {
+            // Verify the runtime works
+            42
+        });
     }
 }

@@ -1610,6 +1610,30 @@ fn test_connection_autocommit() {
 ### Files Modified/Created
 - `driver/databricks/src/connection.rs` (add Optionable impl)
 
+### Implementation Notes (Updated 2024)
+
+**Work Items 2.1 and 2.2 Completed:**
+
+Key implementation decisions:
+
+1. **Runtime Management**: The `DatabricksDatabase` uses `Mutex<Option<Arc<Runtime>>>` for interior mutability since the `Database` trait uses `&self`. The runtime is created lazily on first connection.
+
+2. **Test Runtime Handling**: Tests use `#[tokio::test(flavor = "multi_thread")]` to ensure `block_in_place` works correctly when using the Runtime's handle. The test helper `create_test_runtime()` uses `tokio::runtime::Handle::current()` to reuse the test runtime context.
+
+3. **Session Lifecycle**: Session is created immediately in `DatabricksConnection::new()` (blocking call) and terminated in the `Drop` implementation. Session termination errors are logged but not propagated since `Drop` cannot return errors.
+
+4. **Option Validation**: Setting autocommit to "false" returns `Status::NotImplemented` (not `InvalidArguments`) since Databricks doesn't support transactions. Setting string options with non-string values returns `Status::InvalidArguments`.
+
+5. **Current Catalog/Schema**: Both are passed through to new statements. Getting an unset catalog/schema returns `Status::NotFound`.
+
+6. **Connection-level Cancel**: Returns `Ok(())` as a no-op since individual statement cancellation is handled at the statement level.
+
+**Tests Added:**
+- Optionable trait tests (autocommit, catalog, schema, type validation, unknown options)
+- Connection lifecycle tests (session creation, termination on drop, session ID consistency)
+- Connection trait tests (new_statement, cancel, commit/rollback errors)
+- SingleBatchReader tests
+
 ---
 
 ## 2.3 SEA Client - Execute Statement

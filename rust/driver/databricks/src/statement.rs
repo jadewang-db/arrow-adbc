@@ -25,7 +25,10 @@ use adbc_core::{Optionable, PartitionedResult, Statement};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 
+use crate::client::SeaClient;
+use crate::database::Runtime;
 use crate::options::DatabaseConfig;
+use crate::session::SessionManager;
 
 /// A single batch reader for returning statement results.
 #[derive(Debug)]
@@ -70,6 +73,15 @@ impl RecordBatchReader for StatementResultReader {
 
 /// Executes SQL statements and returns results.
 pub struct DatabricksStatement {
+    /// SEA client for API calls.
+    #[allow(dead_code)]
+    client: Arc<SeaClient>,
+    /// Session manager for session ID.
+    #[allow(dead_code)]
+    session_manager: Arc<SessionManager>,
+    /// Tokio runtime for async operations.
+    #[allow(dead_code)]
+    runtime: Arc<Runtime>,
     /// Database configuration.
     #[allow(dead_code)]
     config: Arc<DatabaseConfig>,
@@ -92,11 +104,17 @@ pub struct DatabricksStatement {
 impl DatabricksStatement {
     /// Create a new statement.
     pub(crate) fn new(
+        client: Arc<SeaClient>,
+        session_manager: Arc<SessionManager>,
+        runtime: Arc<Runtime>,
         config: Arc<DatabaseConfig>,
         current_catalog: Option<String>,
         current_schema: Option<String>,
     ) -> Self {
         Self {
+            client,
+            session_manager,
+            runtime,
             config,
             current_catalog,
             current_schema,
@@ -105,13 +123,31 @@ impl DatabricksStatement {
             statement_id: None,
         }
     }
+
+    /// Get the SEA client.
+    #[allow(dead_code)]
+    pub(crate) fn client(&self) -> Arc<SeaClient> {
+        self.client.clone()
+    }
+
+    /// Get the session manager.
+    #[allow(dead_code)]
+    pub(crate) fn session_manager(&self) -> Arc<SessionManager> {
+        self.session_manager.clone()
+    }
+
+    /// Get the runtime.
+    #[allow(dead_code)]
+    pub(crate) fn runtime(&self) -> Arc<Runtime> {
+        self.runtime.clone()
+    }
 }
 
 impl Optionable for DatabricksStatement {
     type Option = OptionStatement;
 
     fn set_option(&mut self, key: Self::Option, _value: OptionValue) -> adbc_core::error::Result<()> {
-        // TODO: Implement statement options
+        // TODO: Implement statement options in Sprint 2.3
         Err(Error::with_message_and_status(
             format!("Unrecognized option: {:?}", key),
             Status::NotFound,
@@ -165,7 +201,7 @@ impl Statement for DatabricksStatement {
     }
 
     fn execute(&mut self) -> adbc_core::error::Result<impl RecordBatchReader + Send> {
-        // TODO: Implement execute
+        // TODO: Implement execute in Sprint 2.3
         Err::<StatementResultReader, _>(Error::with_message_and_status(
             "execute not yet implemented",
             Status::NotImplemented,
@@ -173,7 +209,7 @@ impl Statement for DatabricksStatement {
     }
 
     fn execute_update(&mut self) -> adbc_core::error::Result<Option<i64>> {
-        // TODO: Implement execute_update
+        // TODO: Implement execute_update in Sprint 4
         Err(Error::with_message_and_status(
             "execute_update not yet implemented",
             Status::NotImplemented,
@@ -189,9 +225,9 @@ impl Statement for DatabricksStatement {
     }
 
     fn execute_partitions(&mut self) -> adbc_core::error::Result<PartitionedResult> {
-        // TODO: Implement execute_partitions
+        // Partitioned execution not supported
         Err(Error::with_message_and_status(
-            "execute_partitions not yet implemented",
+            "Partitioned execution not supported",
             Status::NotImplemented,
         ))
     }
@@ -205,9 +241,9 @@ impl Statement for DatabricksStatement {
     }
 
     fn prepare(&mut self) -> adbc_core::error::Result<()> {
-        // TODO: Implement prepare
+        // TODO: Implement prepare in Phase 2
         Err(Error::with_message_and_status(
-            "prepare not yet implemented",
+            "Prepared statements not yet implemented",
             Status::NotImplemented,
         ))
     }
@@ -226,7 +262,7 @@ impl Statement for DatabricksStatement {
     }
 
     fn cancel(&mut self) -> adbc_core::error::Result<()> {
-        // TODO: Implement cancel
+        // TODO: Implement cancel in Sprint 2.3
         Err(Error::with_message_and_status(
             "cancel not yet implemented",
             Status::NotImplemented,
