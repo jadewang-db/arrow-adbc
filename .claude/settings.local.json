@@ -21,7 +21,8 @@
       "Bash(else echo \"Config file does NOT exist\")",
       "Bash(fi)",
       "Bash(DATABRICKS_TEST_CONFIG_FILE=\"/Users/jade.wang/tmp/adbc_test_config.json\" cargo test:*)",
-      "Bash(git reset:*)"
+      "Bash(git reset:*)",
+      "Bash(find:*)"
     ]
   }
 }

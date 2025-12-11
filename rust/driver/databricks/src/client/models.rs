@@ -49,13 +49,17 @@ pub enum Disposition {
     /// Results are stored externally and links are provided.
     /// The API will automatically use this for large results.
     ExternalLinks,
+    /// Let the API choose between inline or external links based on result size.
+    /// This is the optimal mode - requires User-Agent header with DatabricksJDBCDriverOSS prefix.
+    InlineOrExternalLinks,
 }
 
 impl Default for Disposition {
     fn default() -> Self {
-        // Use EXTERNAL_LINKS by default. The API will return inline results
-        // if they're small enough, or external links if they're large.
-        Self::ExternalLinks
+        // Use INLINE_OR_EXTERNAL_LINKS by default for optimal behavior.
+        // The API will return inline results for small results and external links for large ones.
+        // Note: This requires the User-Agent header to be set with DatabricksJDBCDriverOSS prefix.
+        Self::InlineOrExternalLinks
     }
 }
 

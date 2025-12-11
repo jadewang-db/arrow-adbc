@@ -227,7 +227,10 @@ impl SeaClient {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         // User-Agent header
-        let user_agent = format!("adbc-driver-databricks/{}", DRIVER_VERSION);
+        // Use DatabricksJDBCDriverOSS prefix for server-side feature compatibility
+        // (e.g., INLINE_OR_EXTERNAL_LINKS disposition support).
+        // This matches the C# driver's User-Agent format.
+        let user_agent = format!("DatabricksJDBCDriverOSS/{} (ADBC)", DRIVER_VERSION);
         headers.insert(
             USER_AGENT,
             HeaderValue::from_str(&user_agent).map_err(|e| {
