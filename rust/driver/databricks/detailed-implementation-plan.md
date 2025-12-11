@@ -3026,22 +3026,1167 @@ impl Statement for DatabricksStatement {
 
 # Sprint 5: Testing, Polish & Release Preparation
 
-## 5.1-5.8 Testing & Release Items
+## 5.1 Unit Test Suite
 
-### Unit Test Suite
-- Mock HTTP responses using wiremock
-- Test all error mappings
-- Test retry logic timing
-- Test type conversions
+### Objective
+Comprehensive unit tests for all components using mocking where appropriate.
 
-### Integration Test Suite
-- Environment-based configuration
-- Skip without credentials
-- Test connection lifecycle
-- Test query execution (small/large)
-- Test metadata APIs
+### Actions
 
-### Connection String Parsing
+1. **Error Mapping Tests** (`tests/unit/error_tests.rs`)
+   - All SEA error codes → ADBC status
+   - Retryable error detection
+   - Error message preservation
+
+2. **Retry Logic Tests** (`tests/unit/retry_tests.rs`)
+   - Exponential backoff timing
+   - Jitter range validation
+   - Max retries enforcement
+   - Retry-After header handling
+
+3. **Type Conversion Tests** (`tests/unit/type_mapping_tests.rs`)
+   - All Spark SQL types → Arrow types
+   - DECIMAL precision/scale
+   - Complex types (ARRAY, MAP, STRUCT)
+   - Edge cases (NULL, empty strings)
+
+4. **Mock HTTP Tests** (`tests/unit/client_tests.rs`)
+   - Use wiremock to simulate SEA API responses
+   - Test polling behavior
+   - Test error response parsing
+   - Test URL construction
+
+### Expected Results
+- All unit tests pass
+- Code coverage > 80% for core modules
+- Fast execution (< 5 seconds total)
+
+---
+
+## 5.2 Integration Test Suite
+
+### Objective
+Integration tests against local mock server or lightweight test environment.
+
+### Actions
+
+1. **Connection Lifecycle** (`tests/integration/connection_tests.rs`)
+   - Session creation and termination
+   - Connection options
+   - Multiple connections from same database
+
+2. **Query Execution** (`tests/integration/query_tests.rs`)
+   - Simple SELECT queries
+   - Large result sets (mocked external links)
+   - Empty result sets
+   - Query cancellation
+
+3. **Metadata APIs** (`tests/integration/metadata_tests.rs`)
+   - get_info
+   - get_objects (all depths)
+   - get_table_schema
+   - get_table_types
+
+### Expected Results
+- All integration tests pass
+- Can run without real Databricks connection
+- Reasonable execution time (< 30 seconds)
+
+---
+
+## 5.3 E2E Test Infrastructure Setup
+
+### Objective
+Establish infrastructure for running E2E tests against a live Databricks SQL Warehouse, following the C# test configuration pattern.
+
+### Actions
+
+1. **Create E2E test configuration struct** (`tests/e2e/config.rs`)
+
+Following the C# pattern, use a JSON configuration file pointed to by an environment variable:
+
+   ```rust
+   use serde::{Deserialize, Serialize};
+   use std::fs;
+   use std::path::Path;
+
+   /// Test configuration for E2E tests (matches C# DatabricksTestConfiguration)
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   pub struct E2EConfig {
+       /// Hostname (e.g., "https://my-workspace.cloud.databricks.com")
+       #[serde(rename = "hostName")]
+       pub host_name: Option<String>,
+
+       /// Warehouse path (e.g., "/sql/1.0/warehouses/abc123")
+       #[serde(default)]
+       pub path: Option<String>,
+
+       /// Personal Access Token
+       #[serde(default)]
+       pub token: Option<String>,
+
+       /// Authentication type (e.g., "token")
+       #[serde(rename = "auth_type", default)]
+       pub auth_type: Option<String>,
+
+       /// Driver type
+       #[serde(rename = "type", default)]
+       pub driver_type: Option<String>,
+
+       /// Catalog name
+       #[serde(default)]
+       pub catalog: Option<String>,
+
+       /// Schema/database name
+       #[serde(rename = "dbSchema", default)]
+       pub schema: Option<String>,
+
+       /// Test query
+       #[serde(default)]
+       pub query: String,
+
+       /// Expected results count
+       #[serde(rename = "expectedResults", default)]
+       pub expected_results: i64,
+
+       /// Metadata for tests
+       #[serde(default)]
+       pub metadata: TestMetadata,
+
+       /// HTTP options (TLS, proxy, etc.)
+       #[serde(rename = "http_options", default)]
+       pub http_options: Option<HttpOptions>,
+
+       /// OAuth grant type
+       #[serde(rename = "grant_type", skip_serializing_if = "Option::is_none")]
+       pub oauth_grant_type: Option<String>,
+
+       /// OAuth client ID
+       #[serde(rename = "client_id", skip_serializing_if = "Option::is_none")]
+       pub oauth_client_id: Option<String>,
+
+       /// OAuth client secret
+       #[serde(rename = "client_secret", skip_serializing_if = "Option::is_none")]
+       pub oauth_client_secret: Option<String>,
+
+       /// OAuth scope
+       #[serde(skip_serializing_if = "Option::is_none")]
+       pub scope: Option<String>,
+   }
+
+   #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+   pub struct TestMetadata {
+       #[serde(default)]
+       pub catalog: String,
+
+       #[serde(default)]
+       pub schema: String,
+
+       #[serde(default)]
+       pub table: String,
+
+       #[serde(rename = "expectedColumnCount", default)]
+       pub expected_column_count: i32,
+   }
+
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   pub struct HttpOptions {
+       #[serde(default)]
+       pub tls: Option<TlsOptions>,
+
+       #[serde(default)]
+       pub proxy: Option<ProxyOptions>,
+   }
+
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   pub struct TlsOptions {
+       pub enabled: Option<bool>,
+       pub disable_server_certificate_validation: Option<bool>,
+       pub allow_self_signed: Option<bool>,
+       pub allow_hostname_mismatch: Option<bool>,
+       pub trusted_certificate_path: Option<String>,
+   }
+
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   pub struct ProxyOptions {
+       pub use_proxy: Option<String>,
+       pub proxy_host: Option<String>,
+       pub proxy_port: Option<u16>,
+       pub proxy_auth: Option<String>,
+       pub proxy_uid: Option<String>,
+       pub proxy_pwd: Option<String>,
+       pub proxy_ignore_list: Option<String>,
+   }
+
+   impl E2EConfig {
+       /// Load configuration from file path specified in environment variable
+       /// Following C# pattern: DATABRICKS_TEST_CONFIG_FILE
+       pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+           let config_path = std::env::var("DATABRICKS_TEST_CONFIG_FILE")
+               .map_err(|_| {
+                   "DATABRICKS_TEST_CONFIG_FILE environment variable not set"
+               })?;
+
+           Self::from_file(&config_path)
+       }
+
+       /// Load configuration from a JSON file
+       pub fn from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+           if !Path::new(path).exists() {
+               return Err(format!("Configuration file not found: {}", path).into());
+           }
+
+           let content = fs::read_to_string(path)?;
+           let config: E2EConfig = serde_json::from_str(&content)?;
+
+           // Validate required fields
+           config.validate()?;
+
+           Ok(config)
+       }
+
+       /// Validate required configuration fields
+       fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+           if self.host_name.is_none() {
+               return Err("hostName is required in configuration".into());
+           }
+           if self.token.is_none() {
+               return Err("token is required in configuration".into());
+           }
+           Ok(())
+       }
+
+       /// Check if configuration is available (for conditional test execution)
+       pub fn can_execute() -> bool {
+           if let Ok(config_path) = std::env::var("DATABRICKS_TEST_CONFIG_FILE") {
+               Path::new(&config_path).exists()
+           } else {
+               false
+           }
+       }
+
+       /// Extract warehouse ID from path (e.g., "/sql/1.0/warehouses/abc123" -> "abc123")
+       pub fn warehouse_id(&self) -> Option<String> {
+           self.path.as_ref().and_then(|path| {
+               path.split('/').last().map(|s| s.to_string())
+           })
+       }
+   }
+   ```
+
+2. **Create test helper functions** (`tests/e2e/helpers.rs`)
+
+Following the C# pattern with lazy config loading and test skipping:
+
+   ```rust
+   use super::config::E2EConfig;
+   use crate::{DatabricksDriver, DatabricksDatabase, DatabricksConnection};
+   use adbc_core::{Driver, Database, Optionable};
+   use adbc_core::options::{OptionDatabase, OptionConnection, OptionValue};
+   use once_cell::sync::Lazy;
+   use std::sync::Mutex;
+
+   /// Lazy-loaded test configuration (matches C# pattern)
+   static TEST_CONFIG: Lazy<Mutex<Option<E2EConfig>>> = Lazy::new(|| {
+       Mutex::new(E2EConfig::from_env().ok())
+   });
+
+   /// Check if E2E tests can execute (matches C# Utils.CanExecuteTestConfig)
+   pub fn can_execute_test_config() -> bool {
+       E2EConfig::can_execute()
+   }
+
+   /// Get test configuration or panic with helpful message
+   pub fn get_test_config() -> E2EConfig {
+       TEST_CONFIG.lock().unwrap()
+           .clone()
+           .expect(
+               "Cannot load test configuration from environment variable \
+                DATABRICKS_TEST_CONFIG_FILE. The execution of this test will be skipped. \
+                Set DATABRICKS_TEST_CONFIG_FILE to point to a valid JSON configuration file."
+           )
+   }
+
+   /// Create a test driver with configuration from JSON file
+   pub fn create_test_driver() -> DatabricksDriver {
+       DatabricksDriver::new()
+   }
+
+   /// Create a test database with configuration
+   pub fn create_test_database() -> DatabricksDatabase {
+       let config = get_test_config();
+       let mut driver = create_test_driver();
+
+       let host = config.host_name.as_ref()
+           .expect("hostName required in test config");
+       let warehouse_id = config.warehouse_id()
+           .expect("path with warehouse ID required in test config");
+       let token = config.token.as_ref()
+           .expect("token required in test config");
+
+       let mut options = vec![
+           (OptionDatabase::Uri, OptionValue::String(host.clone())),
+           (OptionDatabase::Other("databricks.warehouse_id".into()),
+            OptionValue::String(warehouse_id)),
+           (OptionDatabase::Other("databricks.token".into()),
+            OptionValue::String(token.clone())),
+       ];
+
+       // Add optional catalog
+       if let Some(catalog) = &config.catalog {
+           options.push((
+               OptionDatabase::Other("databricks.catalog".into()),
+               OptionValue::String(catalog.clone())
+           ));
+       }
+
+       // Add optional schema
+       if let Some(schema) = &config.schema {
+           options.push((
+               OptionDatabase::Other("databricks.schema".into()),
+               OptionValue::String(schema.clone())
+           ));
+       }
+
+       driver.new_database_with_opts(options)
+           .expect("Failed to create test database")
+   }
+
+   /// Create a test connection
+   pub fn create_test_connection() -> DatabricksConnection {
+       let mut db = create_test_database();
+       db.new_connection().expect("Failed to create test connection")
+   }
+
+   /// Create a test connection with specific catalog and schema
+   pub fn create_test_connection_with_catalog(
+       catalog: &str,
+       schema: &str
+   ) -> DatabricksConnection {
+       let mut db = create_test_database();
+       db.new_connection_with_opts([
+           (OptionConnection::CurrentCatalog, OptionValue::String(catalog.to_string())),
+           (OptionConnection::CurrentDbSchema, OptionValue::String(schema.to_string())),
+       ]).expect("Failed to create test connection")
+   }
+
+   /// Macro for conditional test execution (like C# Skip.IfNot)
+   #[macro_export]
+   macro_rules! skip_if_no_config {
+       () => {
+           if !can_execute_test_config() {
+               println!("Skipping test: DATABRICKS_TEST_CONFIG_FILE not set or file not found");
+               return;
+           }
+       };
+   }
+   ```
+
+3. **Create test data setup script** (`tests/e2e/setup.sql`)
+   ```sql
+   -- Setup script for E2E tests
+   CREATE CATALOG IF NOT EXISTS e2e_tests;
+   CREATE SCHEMA IF NOT EXISTS e2e_tests.rust_adbc_driver;
+   USE e2e_tests.rust_adbc_driver;
+
+   -- Test table with various data types
+   CREATE OR REPLACE TABLE test_types (
+       col_boolean BOOLEAN,
+       col_tinyint TINYINT,
+       col_smallint SMALLINT,
+       col_int INT,
+       col_bigint BIGINT,
+       col_float FLOAT,
+       col_double DOUBLE,
+       col_decimal DECIMAL(10,2),
+       col_string STRING,
+       col_binary BINARY,
+       col_date DATE,
+       col_timestamp TIMESTAMP,
+       col_array ARRAY<INT>,
+       col_struct STRUCT<a: INT, b: STRING>,
+       col_map MAP<STRING, INT>
+   );
+
+   INSERT INTO test_types VALUES (
+       true, 127, 32767, 2147483647, 9223372036854775807,
+       3.14, 2.718281828, 123.45,
+       'Hello, World! 🌍', X'DEADBEEF',
+       DATE '2024-12-08', TIMESTAMP '2024-12-08 12:34:56',
+       ARRAY(1, 2, 3), STRUCT(42, 'answer'), MAP('key1', 100, 'key2', 200)
+   );
+
+   -- Large table for testing external links
+   CREATE OR REPLACE TABLE test_large AS
+   SELECT
+       id,
+       CONCAT('row_', CAST(id AS STRING)) AS text,
+       RAND() AS random_value
+   FROM RANGE(0, 1000000);
+   ```
+
+4. **Create example test configuration file** (`tests/e2e/databricks.json`)
+
+Following the C# configuration file format:
+
+   ```json
+   {
+       "hostName": "https://your-workspace.cloud.databricks.com",
+       "path": "/sql/1.0/warehouses/abc123def456",
+       "token": "dapi1234567890abcdef",
+       "auth_type": "token",
+       "type": "databricks",
+       "catalog": "e2e_tests",
+       "dbSchema": "rust_adbc_driver",
+       "query": "",
+       "expectedResults": 0,
+       "metadata": {
+           "catalog": "e2e_tests",
+           "schema": "rust_adbc_driver",
+           "table": "test_types",
+           "expectedColumnCount": 15
+       },
+       "http_options": {
+           "tls": {
+               "enabled": null,
+               "disable_server_certificate_validation": null,
+               "allow_self_signed": null,
+               "allow_hostname_mismatch": null,
+               "trusted_certificate_path": null
+           }
+       }
+   }
+   ```
+
+5. **Add setup instructions** (`tests/e2e/README.md`)
+   ```markdown
+   # E2E Tests Setup
+
+   ## Prerequisites
+   - Databricks workspace with Unity Catalog
+   - SQL Warehouse (Serverless or Classic)
+   - Personal Access Token
+
+   ## Configuration File Setup (Recommended - matches C# pattern)
+
+   1. Copy the example configuration file:
+      ```bash
+      cp tests/e2e/databricks.json tests/e2e/databricks.local.json
+      ```
+
+   2. Edit `databricks.local.json` with your actual values:
+      ```json
+      {
+          "hostName": "https://your-workspace.cloud.databricks.com",
+          "path": "/sql/1.0/warehouses/YOUR_WAREHOUSE_ID",
+          "token": "YOUR_PAT_TOKEN",
+          "auth_type": "token",
+          "type": "databricks",
+          "catalog": "e2e_tests",
+          "dbSchema": "rust_adbc_driver"
+      }
+      ```
+
+   3. Set the environment variable to point to your config file:
+      ```bash
+      export DATABRICKS_TEST_CONFIG_FILE="$(pwd)/tests/e2e/databricks.local.json"
+      ```
+
+   4. Add `*.local.json` to `.gitignore` to prevent committing credentials
+
+   ## Alternative: Environment Variable Setup (Legacy)
+
+   If you prefer, you can still use individual environment variables:
+   ```bash
+   export DATABRICKS_HOST="https://your-workspace.cloud.databricks.com"
+   export DATABRICKS_WAREHOUSE_ID="abc123def456"
+   export DATABRICKS_TOKEN="dapi1234567890"
+   export DATABRICKS_E2E_CATALOG="e2e_tests"
+   export DATABRICKS_E2E_SCHEMA="rust_adbc_driver"
+   ```
+
+   Note: The JSON configuration file approach is preferred as it matches the C# driver pattern
+   and allows for more complex configuration options.
+
+   ## Test Data Setup
+
+   1. Run the setup script to create test catalog, schema, and tables:
+      ```bash
+      # Option 1: Using databricks CLI
+      databricks sql exec -f tests/e2e/setup.sql
+
+      # Option 2: Manual execution in SQL Warehouse
+      # Copy and execute the contents of tests/e2e/setup.sql in your SQL Warehouse
+      ```
+
+   ## Running Tests
+
+   ### Run all E2E tests
+   ```bash
+   cargo test --release --ignored
+   ```
+
+   ### Run specific E2E test
+   ```bash
+   cargo test --release --ignored test_e2e_query_select_one
+   ```
+
+   ### Run with verbose output
+   ```bash
+   cargo test --release --ignored -- --nocapture --test-threads=1
+   ```
+
+   ## Troubleshooting
+
+   ### Test skipped with "DATABRICKS_TEST_CONFIG_FILE not set"
+   - Ensure the environment variable is set and points to a valid JSON file
+   - Check that the file exists and is readable
+   - Verify JSON syntax is valid
+
+   ### Configuration validation errors
+   - Ensure `hostName` and `token` are provided
+   - Check that `path` contains a valid warehouse ID
+   - Verify catalog and schema exist in your workspace
+
+   ### Connection errors
+   - Verify your PAT token is valid and not expired
+   - Check warehouse is running (not stopped)
+   - Ensure firewall/network allows connection to Databricks workspace
+   - Verify workspace URL is correct (including https://)
+   ```
+
+### Expected Results
+- E2E test infrastructure ready
+- Test data created in Databricks
+- Environment variable configuration working
+- Helper functions available
+
+---
+
+## 5.4 E2E Test Suite - Connection & Session
+
+### Objective
+Validate connection lifecycle and session management end-to-end.
+
+### Actions
+
+1. **Connection Lifecycle Tests** (`tests/e2e/connection_tests.rs`)
+
+Following the C# pattern with configuration checks:
+
+   ```rust
+   use super::helpers::*;
+   use adbc_core::{Connection, Statement};
+
+   #[test]
+   #[ignore] // Run with cargo test --ignored
+   fn test_e2e_connection_open_creates_session() {
+       // Skip if configuration not available (like C# Skip.IfNot)
+       skip_if_no_config!();
+
+       let mut conn = create_test_connection();
+
+       // Verify connection is established
+       // In actual implementation, might have a method to get session ID
+       assert!(conn.is_open()); // Example check
+   }
+
+   #[test]
+   #[ignore]
+   fn test_e2e_connection_close_terminates_session() {
+       skip_if_no_config!();
+
+       let session_id = {
+           let mut conn = create_test_connection();
+           // Get session ID before dropping
+           // conn.session_id().unwrap()
+           "test_session".to_string() // Placeholder
+       }; // Connection dropped, session terminated
+
+       // Verify session no longer active (would need API to check)
+       // For now, just verify no errors during drop
+       assert!(!session_id.is_empty());
+   }
+
+   #[test]
+   #[ignore]
+   fn test_e2e_connection_set_catalog_changes_context() {
+       skip_if_no_config!();
+
+       // Create connection with specific catalog
+       let mut conn = create_test_connection_with_catalog("main", "default");
+
+       let mut stmt = conn.new_statement().unwrap();
+       stmt.set_sql_query("SELECT current_catalog()").unwrap();
+       let mut reader = stmt.execute().unwrap();
+       let batch = reader.next().unwrap().unwrap();
+
+       // Verify catalog is "main"
+       assert_eq!(batch.num_rows(), 1);
+
+       // Verify the returned catalog name
+       let array = batch.column(0).as_any()
+           .downcast_ref::<StringArray>().unwrap();
+       assert_eq!(array.value(0), "main");
+   }
+
+   #[test]
+   #[ignore]
+   fn test_e2e_connection_timeout_handles_gracefully() {
+       skip_if_no_config!();
+
+       // Test connection timeout behavior
+       // This would require setting a very short timeout
+       let mut conn = create_test_connection();
+
+       // Attempt operation with timeout
+       // Verify appropriate error is returned
+       assert!(conn.is_open());
+   }
+   ```
+
+### Expected Results
+- Connection opens successfully
+- Session ID is valid
+- Connection close terminates session
+- Catalog/schema options work
+
+---
+
+## 5.5 E2E Test Suite - Query Execution
+
+### Objective
+Validate all query execution paths with real data.
+
+### Actions
+
+1. **Basic Query Tests** (`tests/e2e/query_basic_tests.rs`)
+   ```rust
+   #[test]
+   #[ignore]
+   fn test_e2e_query_select_one() {
+       let mut conn = create_test_connection();
+       let mut stmt = conn.new_statement().unwrap();
+
+       stmt.set_sql_query("SELECT 1 AS one").unwrap();
+       let mut reader = stmt.execute().unwrap();
+
+       let batch = reader.next().unwrap().unwrap();
+       assert_eq!(batch.num_rows(), 1);
+       assert_eq!(batch.num_columns(), 1);
+
+       let array = batch.column(0).as_any()
+           .downcast_ref::<Int32Array>().unwrap();
+       assert_eq!(array.value(0), 1);
+   }
+
+   #[test]
+   #[ignore]
+   fn test_e2e_query_empty_result() {
+       let mut conn = create_test_connection();
+       let mut stmt = conn.new_statement().unwrap();
+
+       stmt.set_sql_query("SELECT * FROM range(0, 0)").unwrap();
+       let reader = stmt.execute().unwrap();
+
+       assert_eq!(reader.schema().fields().len(), 1);
+       let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
+       assert!(batches.is_empty() || batches[0].num_rows() == 0);
+   }
+
+   #[test]
+   #[ignore]
+   fn test_e2e_query_syntax_error() {
+       let mut conn = create_test_connection();
+       let mut stmt = conn.new_statement().unwrap();
+
+       stmt.set_sql_query("INVALID SQL SYNTAX").unwrap();
+       let result = stmt.execute();
+
+       assert!(result.is_err());
+       // Verify error is InvalidArguments
+   }
+   ```
+
+2. **Data Type Tests** (`tests/e2e/query_types_tests.rs`)
+
+   ```rust
+   use super::helpers::*;
+   use adbc_core::{Connection, Statement};
+   use arrow::array::*;
+
+   #[test]
+   #[ignore]
+   fn test_e2e_types_all_types() {
+       skip_if_no_config!();
+
+       let config = get_test_config();
+       let mut conn = create_test_connection();
+       let mut stmt = conn.new_statement().unwrap();
+
+       // Use catalog and schema from config
+       let catalog = config.metadata.catalog;
+       let schema = config.metadata.schema;
+
+       stmt.set_sql_query(&format!(
+           "SELECT * FROM {}.{}.test_types",
+           catalog, schema
+       )).unwrap();
+
+       let mut reader = stmt.execute().unwrap();
+       let batch = reader.next().unwrap().unwrap();
+
+       // Verify all columns present (from config)
+       assert_eq!(batch.num_columns(), config.metadata.expected_column_count as usize);
+       assert_eq!(batch.num_rows(), 1);
+
+       // Verify specific types
+       let bool_col = batch.column(0).as_any()
+           .downcast_ref::<BooleanArray>().unwrap();
+       assert_eq!(bool_col.value(0), true);
+
+       let string_col = batch.column(8).as_any()
+           .downcast_ref::<StringArray>().unwrap();
+       assert_eq!(string_col.value(0), "Hello, World! 🌍");
+
+       // Verify decimal type
+       let decimal_col = batch.column(7).as_any()
+           .downcast_ref::<Decimal128Array>().unwrap();
+       assert!(!decimal_col.is_null(0));
+   }
+
+   #[test]
+   #[ignore]
+   fn test_e2e_types_numeric_all_sizes() {
+       skip_if_no_config!();
+
+       let mut conn = create_test_connection();
+       let mut stmt = conn.new_statement().unwrap();
+
+       stmt.set_sql_query(
+           "SELECT \
+            CAST(127 AS TINYINT) as tinyint_col, \
+            CAST(32767 AS SMALLINT) as smallint_col, \
+            CAST(2147483647 AS INT) as int_col, \
+            CAST(9223372036854775807 AS BIGINT) as bigint_col, \
+            CAST(3.14 AS FLOAT) as float_col, \
+            CAST(2.718281828 AS DOUBLE) as double_col"
+       ).unwrap();
+
+       let mut reader = stmt.execute().unwrap();
+       let batch = reader.next().unwrap().unwrap();
+
+       assert_eq!(batch.num_columns(), 6);
+       assert_eq!(batch.num_rows(), 1);
+
+       // Verify each numeric type
+       let tinyint_col = batch.column(0).as_any()
+           .downcast_ref::<Int8Array>().unwrap();
+       assert_eq!(tinyint_col.value(0), 127);
+
+       let int_col = batch.column(2).as_any()
+           .downcast_ref::<Int32Array>().unwrap();
+       assert_eq!(int_col.value(0), 2147483647);
+
+       let bigint_col = batch.column(3).as_any()
+           .downcast_ref::<Int64Array>().unwrap();
+       assert_eq!(bigint_col.value(0), 9223372036854775807);
+
+       let float_col = batch.column(4).as_any()
+           .downcast_ref::<Float32Array>().unwrap();
+       assert!((float_col.value(0) - 3.14).abs() < 0.01);
+
+       let double_col = batch.column(5).as_any()
+           .downcast_ref::<Float64Array>().unwrap();
+       assert!((double_col.value(0) - 2.718281828).abs() < 0.00001);
+   }
+   ```
+
+3. **Large Result Tests** (`tests/e2e/query_large_tests.rs`)
+   ```rust
+   #[test]
+   #[ignore]
+   fn test_e2e_result_large_query() {
+       let (_, config) = create_test_driver();
+       let mut conn = create_test_connection();
+       let mut stmt = conn.new_statement().unwrap();
+
+       stmt.set_sql_query(&format!(
+           "SELECT * FROM {}.{}.test_large",
+           config.catalog, config.schema
+       )).unwrap();
+
+       let reader = stmt.execute().unwrap();
+       let mut total_rows = 0;
+       for batch in reader {
+           let batch = batch.unwrap();
+           total_rows += batch.num_rows();
+       }
+
+       assert_eq!(total_rows, 1000000);
+   }
+
+   #[test]
+   #[ignore]
+   fn test_e2e_result_inline_small() {
+       let mut conn = create_test_connection();
+       let mut stmt = conn.new_statement().unwrap();
+
+       // Small result should be inline
+       stmt.set_sql_query("SELECT * FROM range(0, 100)").unwrap();
+       let reader = stmt.execute().unwrap();
+
+       let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
+       let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+       assert_eq!(total_rows, 100);
+   }
+   ```
+
+### Expected Results
+- All basic queries execute correctly
+- All data types handled properly
+- Large results stream efficiently
+- Inline vs external links work as expected
+
+---
+
+## 5.6 E2E Test Suite - Statement Management
+
+### Objective
+Test statement lifecycle, reuse, cancellation, and concurrent execution.
+
+### Actions
+
+1. **Statement Management Tests** (`tests/e2e/statement_tests.rs`)
+   ```rust
+   #[test]
+   #[ignore]
+   fn test_e2e_statement_reuse() {
+       let mut conn = create_test_connection();
+       let mut stmt = conn.new_statement().unwrap();
+
+       // Execute first query
+       stmt.set_sql_query("SELECT 1").unwrap();
+       let reader1 = stmt.execute().unwrap();
+       let count1: usize = reader1.count();
+       assert_eq!(count1, 1);
+
+       // Reuse same statement for second query
+       stmt.set_sql_query("SELECT 2").unwrap();
+       let reader2 = stmt.execute().unwrap();
+       let count2: usize = reader2.count();
+       assert_eq!(count2, 1);
+   }
+
+   #[test]
+   #[ignore]
+   fn test_e2e_statement_cancel() {
+       let mut conn = create_test_connection();
+       let mut stmt = conn.new_statement().unwrap();
+
+       // Start long-running query
+       stmt.set_sql_query("SELECT count(*) FROM range(0, 10000000000)").unwrap();
+
+       // Execute in background
+       let handle = std::thread::spawn(move || {
+           stmt.execute()
+       });
+
+       // Give it time to start
+       std::thread::sleep(Duration::from_secs(1));
+
+       // Cancel would need access to statement - this is a simplified test
+       // In practice, might need different API design for safe cancellation
+   }
+
+   #[test]
+   #[ignore]
+   fn test_e2e_statement_concurrent() {
+       let mut conn = create_test_connection();
+
+       let mut stmt1 = conn.new_statement().unwrap();
+       let mut stmt2 = conn.new_statement().unwrap();
+
+       stmt1.set_sql_query("SELECT 1").unwrap();
+       stmt2.set_sql_query("SELECT 2").unwrap();
+
+       let reader1 = stmt1.execute().unwrap();
+       let reader2 = stmt2.execute().unwrap();
+
+       let count1: usize = reader1.count();
+       let count2: usize = reader2.count();
+
+       assert_eq!(count1, 1);
+       assert_eq!(count2, 1);
+   }
+
+   #[test]
+   #[ignore]
+   fn test_e2e_execute_update_insert() {
+       let (_, config) = create_test_driver();
+       let mut conn = create_test_connection();
+       let mut stmt = conn.new_statement().unwrap();
+
+       // Create temp table
+       stmt.set_sql_query(&format!(
+           "CREATE TEMP TABLE test_insert (id INT, name STRING)"
+       )).unwrap();
+       stmt.execute_update().unwrap();
+
+       // Insert data
+       stmt.set_sql_query(
+           "INSERT INTO test_insert VALUES (1, 'Alice'), (2, 'Bob')"
+       ).unwrap();
+       let affected = stmt.execute_update().unwrap();
+
+       // May return Some(2) or None depending on implementation
+       assert!(affected.is_none() || affected == Some(2));
+   }
+   ```
+
+### Expected Results
+- Statement can be reused for multiple queries
+- Cancellation stops execution
+- Concurrent statements work independently
+- execute_update returns correct affected rows
+
+---
+
+## 5.7 E2E Test Suite - Metadata APIs
+
+### Objective
+Validate all metadata retrieval operations.
+
+### Actions
+
+1. **Metadata Tests** (`tests/e2e/metadata_tests.rs`)
+   ```rust
+   #[test]
+   #[ignore]
+   fn test_e2e_metadata_get_info() {
+       let mut conn = create_test_connection();
+
+       let reader = conn.get_info(None).unwrap();
+       let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
+
+       assert!(!batches.is_empty());
+       // Verify driver name, version present
+   }
+
+   #[test]
+   #[ignore]
+   fn test_e2e_metadata_get_objects_catalogs() {
+       let mut conn = create_test_connection();
+
+       let reader = conn.get_objects(
+           ObjectDepth::Catalogs,
+           None, None, None, None, None
+       ).unwrap();
+
+       let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
+       assert!(!batches.is_empty());
+       // Should include at least e2e_tests catalog
+   }
+
+   #[test]
+   #[ignore]
+   fn test_e2e_metadata_get_table_schema() {
+       let (_, config) = create_test_driver();
+       let mut conn = create_test_connection();
+
+       let schema = conn.get_table_schema(
+           Some(&config.catalog),
+           Some(&config.schema),
+           "test_types"
+       ).unwrap();
+
+       assert_eq!(schema.fields().len(), 15);
+       assert_eq!(schema.field(0).name(), "col_boolean");
+   }
+
+   #[test]
+   #[ignore]
+   fn test_e2e_metadata_get_table_types() {
+       let mut conn = create_test_connection();
+
+       let reader = conn.get_table_types().unwrap();
+       let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
+
+       assert!(!batches.is_empty());
+       // Should include TABLE, VIEW, etc.
+   }
+   ```
+
+### Expected Results
+- get_info returns driver information
+- get_objects retrieves catalog hierarchy
+- get_table_schema returns correct schema
+- get_table_types lists available types
+
+---
+
+## 5.8 E2E Test Suite - Error Handling
+
+### Objective
+Validate error handling with real error conditions.
+
+### Actions
+
+1. **Error Handling Tests** (`tests/e2e/error_tests.rs`)
+   ```rust
+   #[test]
+   #[ignore]
+   fn test_e2e_error_invalid_warehouse() {
+       let (mut driver, config) = create_test_driver();
+       let mut db = driver.new_database_with_opts([
+           (OptionDatabase::Uri, config.host.into()),
+           (OptionDatabase::Other("databricks.warehouse_id".into()),
+            "invalid_warehouse_id".into()),
+           (OptionDatabase::Other("databricks.token".into()),
+            config.token.into()),
+       ]).unwrap();
+
+       let result = db.new_connection();
+       assert!(result.is_err());
+       // Verify appropriate error type
+   }
+
+   #[test]
+   #[ignore]
+   fn test_e2e_error_table_not_found() {
+       let mut conn = create_test_connection();
+       let mut stmt = conn.new_statement().unwrap();
+
+       stmt.set_sql_query("SELECT * FROM nonexistent_table").unwrap();
+       let result = stmt.execute();
+
+       assert!(result.is_err());
+       // Verify NotFound status
+   }
+
+   #[test]
+   #[ignore]
+   fn test_e2e_error_insufficient_permissions() {
+       // Would require setup with restricted permissions
+       // Skip for now or implement with specific test user
+   }
+   ```
+
+### Expected Results
+- Invalid credentials produce Unauthenticated error
+- Invalid warehouse produces appropriate error
+- Missing tables produce NotFound error
+- Permission errors produce Unauthorized error
+
+---
+
+## 5.9 CI/CD Integration for E2E Tests
+
+### Objective
+Integrate E2E tests into CI/CD pipeline.
+
+### Actions
+
+1. **Create GitHub Actions workflow** (`.github/workflows/e2e-tests.yml`)
+   ```yaml
+   name: E2E Tests
+
+   on:
+     push:
+       branches: [main]
+     pull_request:
+       branches: [main]
+     schedule:
+       - cron: '0 0 * * *'  # Daily at midnight
+
+   jobs:
+     e2e-tests:
+       runs-on: ubuntu-latest
+       env:
+         DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+         DATABRICKS_WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+         DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+         DATABRICKS_E2E_CATALOG: e2e_tests
+         DATABRICKS_E2E_SCHEMA: rust_adbc_driver_ci
+
+       steps:
+         - uses: actions/checkout@v4
+
+         - name: Setup Rust
+           uses: actions-rs/toolchain@v1
+           with:
+             toolchain: stable
+             override: true
+
+         - name: Cache cargo registry
+           uses: actions/cache@v3
+           with:
+             path: ~/.cargo/registry
+             key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+         - name: Cache cargo index
+           uses: actions/cache@v3
+           with:
+             path: ~/.cargo/git
+             key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+         - name: Cache target directory
+           uses: actions/cache@v3
+           with:
+             path: target
+             key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+
+         - name: Run E2E Tests
+           run: |
+             cd rust/driver/databricks
+             cargo test --release --ignored -- --test-threads=1 --nocapture
+
+         - name: Upload test results
+           if: always()
+           uses: actions/upload-artifact@v3
+           with:
+             name: e2e-test-results
+             path: target/release/deps/*.log
+   ```
+
+2. **Setup CI secrets**
+   - Add DATABRICKS_HOST to GitHub secrets
+   - Add DATABRICKS_WAREHOUSE_ID
+   - Add DATABRICKS_TOKEN
+   - Ensure warehouse is auto-resume enabled
+
+3. **Create test report script** (`scripts/e2e_report.sh`)
+   ```bash
+   #!/bin/bash
+   # Generate E2E test report
+
+   cargo test --release --ignored -- --nocapture 2>&1 | tee e2e_test_output.txt
+
+   # Parse results
+   PASSED=$(grep "test result:" e2e_test_output.txt | grep -oP '\d+ passed')
+   FAILED=$(grep "test result:" e2e_test_output.txt | grep -oP '\d+ failed')
+
+   echo "E2E Test Summary"
+   echo "================"
+   echo "Passed: $PASSED"
+   echo "Failed: $FAILED"
+   ```
+
+### Expected Results
+- E2E tests run automatically on PR
+- Test failures block merge
+- Daily test runs catch regressions
+- Test results accessible in CI
+
+---
+
+## 5.10 Connection String Parsing
+
+### Objective
+Support connection string format for easy configuration.
+
+### Actions
+
 ```rust
 // databricks://<host>/<warehouse_id>?token=<pat>&catalog=<cat>&schema=<sch>
 pub fn parse_connection_string(uri: &str) -> Result<DatabaseConfig> {
@@ -3099,3 +4244,17 @@ adbc_ffi::export_driver!(DatabricksDriverInit, DatabricksDriver);
 | `src/fetch/decompress.rs` | 3 | LZ4 decompression |
 | `tests/unit/*.rs` | 5 | Unit tests |
 | `tests/integration/*.rs` | 5 | Integration tests |
+| `tests/e2e/config.rs` | 5 | E2E test configuration (JSON deserialize) |
+| `tests/e2e/helpers.rs` | 5 | E2E test helper functions with lazy config |
+| `tests/e2e/databricks.json` | 5 | Example E2E test configuration file |
+| `tests/e2e/setup.sql` | 5 | E2E test data setup script |
+| `tests/e2e/README.md` | 5 | E2E test documentation and setup guide |
+| `tests/e2e/connection_tests.rs` | 5 | E2E connection lifecycle tests |
+| `tests/e2e/query_basic_tests.rs` | 5 | E2E basic query tests |
+| `tests/e2e/query_types_tests.rs` | 5 | E2E data type tests |
+| `tests/e2e/query_large_tests.rs` | 5 | E2E large result tests |
+| `tests/e2e/statement_tests.rs` | 5 | E2E statement management tests |
+| `tests/e2e/metadata_tests.rs` | 5 | E2E metadata API tests |
+| `tests/e2e/error_tests.rs` | 5 | E2E error handling tests |
+| `.github/workflows/e2e-tests.yml` | 5 | GitHub Actions E2E test workflow |
+| `scripts/e2e_report.sh` | 5 | E2E test report generator |

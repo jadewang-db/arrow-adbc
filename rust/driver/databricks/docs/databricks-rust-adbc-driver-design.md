@@ -730,6 +730,424 @@ wiremock = "0.6"
 | `Latency_SmallQuery_InlineResult` | < 500ms |
 | `Concurrency_MultipleStatements_NoContention` | Linear scaling |
 
+### 9.4 E2E Test Strategy
+
+End-to-end tests validate the entire driver stack against a real Databricks SQL Warehouse. These tests ensure that all components work together correctly in production-like scenarios.
+
+#### 9.4.1 Test Infrastructure
+
+```mermaid
+flowchart TB
+    subgraph "Test Environment"
+        TEST[E2E Test Suite]
+        ENV[Environment Config]
+    end
+
+    subgraph "Driver Stack"
+        DRIVER[DatabricksDriver]
+        DB[DatabricksDatabase]
+        CONN[DatabricksConnection]
+        STMT[DatabricksStatement]
+    end
+
+    subgraph "Databricks"
+        WH[SQL Warehouse]
+        CATALOG[Unity Catalog]
+        STORAGE[Cloud Storage]
+    end
+
+    TEST --> ENV
+    ENV --> DRIVER
+    DRIVER --> DB --> CONN --> STMT
+    STMT --> WH
+    WH --> CATALOG
+    WH --> STORAGE
+```
+
+**Test Prerequisites:**
+- Live Databricks workspace with Unity Catalog enabled
+- SQL Warehouse (Serverless or Classic)
+- Personal Access Token with appropriate permissions
+- Test catalog and schema (e.g., `e2e_tests.rust_adbc_driver`)
+
+**Configuration:**
+```rust
+/// E2E test configuration from environment
+pub struct E2EConfig {
+    pub host: String,                    // DATABRICKS_HOST
+    pub warehouse_id: String,            // DATABRICKS_WAREHOUSE_ID
+    pub token: String,                   // DATABRICKS_TOKEN
+    pub catalog: String,                 // DATABRICKS_E2E_CATALOG (default: "e2e_tests")
+    pub schema: String,                  // DATABRICKS_E2E_SCHEMA (default: "rust_adbc_driver")
+}
+```
+
+#### 9.4.2 E2E Test Categories
+
+##### Connection Lifecycle Tests
+
+| Test Name | Description | Validation |
+|-----------|-------------|------------|
+| `e2e_connection_open_creates_session` | Open connection creates session in warehouse | Session ID returned, session active |
+| `e2e_connection_close_terminates_session` | Close connection terminates session | Session no longer active |
+| `e2e_connection_set_catalog_changes_context` | Set catalog option changes active catalog | Queries run in correct catalog |
+| `e2e_connection_set_schema_changes_context` | Set schema option changes active schema | Queries run in correct schema |
+| `e2e_connection_timeout_handles_gracefully` | Connection timeout handled correctly | Appropriate error returned |
+
+##### Basic Query Execution Tests
+
+| Test Name | Description | Validation |
+|-----------|-------------|------------|
+| `e2e_query_select_one_returns_result` | Execute `SELECT 1` | Single row, single column with value 1 |
+| `e2e_query_empty_result_returns_schema` | Execute query with 0 rows | Empty RecordBatch with correct schema |
+| `e2e_query_null_values_handled` | Query with NULL values | Null bitmaps correctly set |
+| `e2e_query_unicode_strings_preserved` | Query with emoji/unicode | Unicode characters preserved |
+| `e2e_query_syntax_error_returns_error` | Invalid SQL syntax | ADBC InvalidArguments error |
+
+##### Data Type Coverage Tests
+
+| Test Name | Description | Validation |
+|-----------|-------------|------------|
+| `e2e_types_numeric_all_sizes` | INT8, INT16, INT32, INT64, FLOAT, DOUBLE | Correct Arrow types and values |
+| `e2e_types_decimal_precision_scale` | DECIMAL(10,2), DECIMAL(38,10) | Decimal128 with correct precision |
+| `e2e_types_string_binary` | STRING, BINARY | Utf8 and Binary arrays |
+| `e2e_types_temporal` | DATE, TIMESTAMP, TIMESTAMP_NTZ | Correct Arrow temporal types |
+| `e2e_types_complex_array` | ARRAY<INT>, ARRAY<STRING> | ListArray with correct children |
+| `e2e_types_complex_struct` | STRUCT<a: INT, b: STRING> | StructArray with fields |
+| `e2e_types_complex_map` | MAP<STRING, INT> | MapArray with key/value types |
+
+##### Large Result Handling Tests
+
+| Test Name | Description | Validation |
+|-----------|-------------|------------|
+| `e2e_result_inline_small_query` | Query < 16MB result | INLINE disposition, single batch |
+| `e2e_result_external_large_query` | Query > 16MB result | EXTERNAL_LINKS, multiple chunks |
+| `e2e_result_external_parallel_fetch` | Large result with 10+ chunks | Chunks fetched in parallel, ordered |
+| `e2e_result_millions_rows` | Query returning 10M rows | All rows retrieved, memory efficient |
+| `e2e_result_wide_table` | Query with 1000 columns | Schema and data correct |
+
+##### Compression Tests
+
+| Test Name | Description | Validation |
+|-----------|-------------|------------|
+| `e2e_compression_lz4_decompression` | Large result with LZ4_FRAME | Correct decompression, data intact |
+| `e2e_compression_none_fallback` | Query with compression=NONE | Uncompressed data handled |
+
+##### Metadata Query Tests
+
+| Test Name | Description | Validation |
+|-----------|-------------|------------|
+| `e2e_metadata_get_info_driver_version` | Get driver info codes | Driver name, version, vendor |
+| `e2e_metadata_get_objects_catalogs` | List all catalogs | Correct catalog list |
+| `e2e_metadata_get_objects_schemas` | List schemas in catalog | Correct schema list |
+| `e2e_metadata_get_objects_tables` | List tables in schema | Correct table list with types |
+| `e2e_metadata_get_table_schema` | Get schema for specific table | Arrow schema matches table |
+| `e2e_metadata_get_table_types` | Get supported table types | TABLE, VIEW, etc. |
+
+##### Statement Management Tests
+
+| Test Name | Description | Validation |
+|-----------|-------------|------------|
+| `e2e_statement_reuse_multiple_queries` | Execute multiple queries on same statement | All queries succeed |
+| `e2e_statement_cancel_running_query` | Cancel long-running query | Statement cancelled, error returned |
+| `e2e_statement_concurrent_statements` | Multiple statements on same connection | All execute independently |
+| `e2e_statement_execute_update_insert` | Execute INSERT statement | Row count returned |
+| `e2e_statement_execute_update_create_table` | Execute CREATE TABLE | Success, no row count |
+
+##### Error Handling Tests
+
+| Test Name | Description | Validation |
+|-----------|-------------|------------|
+| `e2e_error_invalid_warehouse_id` | Connect with invalid warehouse | Appropriate ADBC error |
+| `e2e_error_invalid_token` | Connect with invalid token | Unauthenticated error |
+| `e2e_error_insufficient_permissions` | Query restricted table | Unauthorized error |
+| `e2e_error_table_not_found` | Query non-existent table | NotFound error |
+| `e2e_error_network_timeout` | Simulate network timeout | IO error with retry |
+| `e2e_error_expired_url_refresh` | Delayed chunk fetch with expiration | URL refreshed, data retrieved |
+
+##### Session Management Tests
+
+| Test Name | Description | Validation |
+|-----------|-------------|------------|
+| `e2e_session_temp_table_isolated` | Create temp table, query in same session | Temp table accessible |
+| `e2e_session_temp_table_not_shared` | Create temp table, new connection | Temp table not visible |
+| `e2e_session_use_catalog_persists` | USE CATALOG in statement | Subsequent queries use catalog |
+| `e2e_session_use_schema_persists` | USE SCHEMA in statement | Subsequent queries use schema |
+
+##### Parameterized Query Tests (Phase 2)
+
+| Test Name | Description | Validation |
+|-----------|-------------|------------|
+| `e2e_params_bind_scalar_values` | Bind scalar parameters | Parameters substituted correctly |
+| `e2e_params_bind_arrow_batch` | Bind RecordBatch | Batch uploaded, query uses values |
+| `e2e_params_prepared_statement_reuse` | Prepare and execute multiple times | Efficient reuse |
+
+#### 9.4.3 E2E Test Implementation Pattern
+
+```rust
+#[cfg(test)]
+mod e2e_tests {
+    use super::*;
+    use adbc_core::{Driver, Database, Connection, Statement};
+
+    /// Load E2E configuration from environment
+    fn get_e2e_config() -> E2EConfig {
+        E2EConfig {
+            host: std::env::var("DATABRICKS_HOST")
+                .expect("DATABRICKS_HOST must be set"),
+            warehouse_id: std::env::var("DATABRICKS_WAREHOUSE_ID")
+                .expect("DATABRICKS_WAREHOUSE_ID must be set"),
+            token: std::env::var("DATABRICKS_TOKEN")
+                .expect("DATABRICKS_TOKEN must be set"),
+            catalog: std::env::var("DATABRICKS_E2E_CATALOG")
+                .unwrap_or_else(|_| "e2e_tests".to_string()),
+            schema: std::env::var("DATABRICKS_E2E_SCHEMA")
+                .unwrap_or_else(|_| "rust_adbc_driver".to_string()),
+        }
+    }
+
+    /// Create test connection with proper cleanup
+    fn create_test_connection() -> Result<impl Connection> {
+        let config = get_e2e_config();
+        let mut driver = DatabricksDriver::new();
+        let mut db = driver.new_database_with_opts([
+            (OptionDatabase::Uri, config.host.into()),
+            (OptionDatabase::Username, config.warehouse_id.into()),
+            (OptionDatabase::Password, config.token.into()),
+        ])?;
+        db.new_connection()
+    }
+
+    #[test]
+    #[ignore] // Run only with --ignored flag
+    fn e2e_query_select_one_returns_result() -> Result<()> {
+        let mut conn = create_test_connection()?;
+        let mut stmt = conn.new_statement()?;
+
+        stmt.set_sql_query("SELECT 1 AS one")?;
+        let mut reader = stmt.execute()?;
+
+        // Read first batch
+        let batch = reader.next()
+            .expect("Expected at least one batch")
+            .expect("Failed to read batch");
+
+        // Validate schema
+        assert_eq!(batch.schema().fields().len(), 1);
+        assert_eq!(batch.schema().field(0).name(), "one");
+
+        // Validate data
+        assert_eq!(batch.num_rows(), 1);
+        let array = batch.column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Expected Int32Array");
+        assert_eq!(array.value(0), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn e2e_result_external_large_query() -> Result<()> {
+        let mut conn = create_test_connection()?;
+        let mut stmt = conn.new_statement()?;
+
+        // Generate large result (>16MB to trigger EXTERNAL_LINKS)
+        stmt.set_sql_query(
+            "SELECT
+                id,
+                CONCAT('row_', CAST(id AS STRING)) AS text,
+                RAND() AS random_value
+            FROM RANGE(0, 1000000)"
+        )?;
+
+        let mut reader = stmt.execute()?;
+
+        let mut total_rows = 0;
+        while let Some(batch) = reader.next().transpose()? {
+            total_rows += batch.num_rows();
+
+            // Validate each batch has correct schema
+            assert_eq!(batch.schema().fields().len(), 3);
+        }
+
+        assert_eq!(total_rows, 1000000);
+        Ok(())
+    }
+}
+```
+
+#### 9.4.4 Test Data Setup
+
+**Test Catalog/Schema Creation:**
+```sql
+-- Setup script for E2E tests
+CREATE CATALOG IF NOT EXISTS e2e_tests;
+CREATE SCHEMA IF NOT EXISTS e2e_tests.rust_adbc_driver;
+
+USE e2e_tests.rust_adbc_driver;
+
+-- Test table with various data types
+CREATE TABLE IF NOT EXISTS test_types (
+    col_boolean BOOLEAN,
+    col_tinyint TINYINT,
+    col_smallint SMALLINT,
+    col_int INT,
+    col_bigint BIGINT,
+    col_float FLOAT,
+    col_double DOUBLE,
+    col_decimal DECIMAL(10,2),
+    col_string STRING,
+    col_binary BINARY,
+    col_date DATE,
+    col_timestamp TIMESTAMP,
+    col_array ARRAY<INT>,
+    col_struct STRUCT<a: INT, b: STRING>,
+    col_map MAP<STRING, INT>
+);
+
+-- Insert test data
+INSERT INTO test_types VALUES (
+    true,
+    127,
+    32767,
+    2147483647,
+    9223372036854775807,
+    3.14,
+    2.718281828,
+    123.45,
+    'Hello, World! 🌍',
+    X'DEADBEEF',
+    DATE '2024-12-08',
+    TIMESTAMP '2024-12-08 12:34:56',
+    ARRAY(1, 2, 3),
+    STRUCT(42, 'answer'),
+    MAP('key1', 100, 'key2', 200)
+);
+```
+
+#### 9.4.5 CI/CD Integration
+
+```mermaid
+flowchart LR
+    subgraph "CI Pipeline"
+        BUILD[Build Rust Crate]
+        UNIT[Unit Tests]
+        INTEGRATION[Integration Tests]
+        E2E[E2E Tests]
+    end
+
+    subgraph "Test Infrastructure"
+        WH[Databricks Warehouse<br/>Serverless]
+        SECRETS[CI Secrets<br/>PAT Token]
+    end
+
+    BUILD --> UNIT
+    UNIT --> INTEGRATION
+    INTEGRATION --> E2E
+    E2E --> WH
+    E2E --> SECRETS
+```
+
+**CI Configuration (GitHub Actions Example):**
+```yaml
+name: E2E Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  e2e-tests:
+    runs-on: ubuntu-latest
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+      DATABRICKS_E2E_CATALOG: e2e_tests
+      DATABRICKS_E2E_SCHEMA: rust_adbc_driver_ci
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Run E2E Tests
+        run: |
+          cd rust/driver/databricks
+          cargo test --release --ignored -- --test-threads=1
+```
+
+#### 9.4.6 E2E Test Execution
+
+**Running E2E Tests Locally:**
+```bash
+# Set environment variables
+export DATABRICKS_HOST="https://my-workspace.cloud.databricks.com"
+export DATABRICKS_WAREHOUSE_ID="abc123def456"
+export DATABRICKS_TOKEN="dapi1234567890"
+export DATABRICKS_E2E_CATALOG="e2e_tests"
+export DATABRICKS_E2E_SCHEMA="rust_adbc_driver"
+
+# Run E2E tests
+cd rust/driver/databricks
+cargo test --release --ignored
+
+# Run specific E2E test
+cargo test --release --ignored e2e_query_select_one_returns_result
+
+# Run with verbose output
+cargo test --release --ignored -- --nocapture --test-threads=1
+```
+
+#### 9.4.7 Test Success Criteria
+
+| Criterion | Requirement |
+|-----------|-------------|
+| **Pass Rate** | 100% of E2E tests must pass |
+| **Coverage** | All ADBC trait methods exercised |
+| **Data Types** | All Spark SQL -> Arrow type mappings verified |
+| **Result Sizes** | Both INLINE and EXTERNAL_LINKS paths tested |
+| **Error Cases** | All error mappings verified with real errors |
+| **Performance** | Large result tests complete within reasonable time (< 60s for 10M rows) |
+
+#### 9.4.8 Troubleshooting E2E Test Failures
+
+```mermaid
+flowchart TB
+    FAIL[E2E Test Failure]
+
+    FAIL --> AUTH{Authentication<br/>Error?}
+    FAIL --> CONN{Connection<br/>Error?}
+    FAIL --> DATA{Data<br/>Mismatch?}
+    FAIL --> PERF{Timeout?}
+
+    AUTH -->|Yes| CHECK_TOKEN[Check PAT token validity]
+    AUTH -->|Yes| CHECK_PERMS[Check warehouse permissions]
+
+    CONN -->|Yes| CHECK_WH[Verify warehouse running]
+    CONN -->|Yes| CHECK_NET[Check network connectivity]
+
+    DATA -->|Yes| CHECK_SCHEMA[Verify test data setup]
+    DATA -->|Yes| CHECK_TYPES[Verify type mapping]
+
+    PERF -->|Yes| CHECK_SIZE[Check result size]
+    PERF -->|Yes| CHECK_CONC[Check concurrency settings]
+```
+
+**Common Issues:**
+- **Token Expired**: PAT tokens expire; rotate regularly
+- **Warehouse Stopped**: Auto-stop disabled warehouses may stop
+- **Schema Missing**: Test catalog/schema not created
+- **Network Timeout**: Increase timeout for large results
+- **Concurrent Access**: Some tests require `--test-threads=1`
+
 ---
 
 ## 10. Future Enhancements
