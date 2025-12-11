@@ -52,12 +52,12 @@
     html_favicon_url = "https://raw.githubusercontent.com/apache/arrow/refs/heads/main/docs/source/_static/favicon.ico"
 )]
 
-mod client;
+pub mod client;
 mod connection;
 mod database;
 mod driver;
 mod error;
-mod fetch;
+pub mod fetch;
 mod metadata;
 mod options;
 mod session;

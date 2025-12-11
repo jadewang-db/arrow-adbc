@@ -340,7 +340,7 @@ fn column_info_to_field(col: &ColumnInfo) -> Field {
 /// Convert Spark SQL type name to Arrow DataType.
 ///
 /// Maps common Spark SQL types to their Arrow equivalents.
-fn spark_type_to_arrow(spark_type: &str) -> DataType {
+pub fn spark_type_to_arrow(spark_type: &str) -> DataType {
     // Normalize the type name for matching
     let type_upper = spark_type.to_uppercase();
 
