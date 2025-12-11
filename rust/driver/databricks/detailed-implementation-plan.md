@@ -3338,6 +3338,34 @@ Integration tests against local mock server or lightweight test environment.
 - Can run without real Databricks connection
 - Reasonable execution time (< 30 seconds)
 
+### Implementation Notes (Completed)
+
+**Files Created:**
+- `tests/integration_tests.rs` - Main entry point for integration test module
+- `tests/integration/mod.rs` - Integration test module exports
+- `tests/integration/test_utils.rs` - Shared test utilities and mock helpers
+- `tests/integration/connection_tests.rs` - Connection lifecycle tests (19 tests)
+- `tests/integration/query_tests.rs` - Query execution tests (22 tests)
+- `tests/integration/metadata_tests.rs` - Metadata API tests (18 tests)
+
+**Test Count:** 59 integration tests total
+
+**Key Implementation Details:**
+1. Used `wiremock` crate for HTTP mock server
+2. Created reusable helpers for session setup and Arrow IPC generation
+3. Tests cover both success and error paths
+4. Handles LZ4 compressed responses and external links
+5. Tests run in ~1 second without real Databricks connection
+
+**Running Tests:**
+```bash
+# Run all integration tests
+cargo test --package adbc_driver_databricks --test integration_tests
+
+# Run specific test module
+cargo test --package adbc_driver_databricks --test integration_tests connection_tests
+```
+
 ---
 
 ## 5.3 E2E Test Infrastructure Setup
