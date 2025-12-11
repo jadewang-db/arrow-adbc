@@ -38,7 +38,7 @@ pub fn decompress_lz4_frame(data: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = FrameDecoder::new(data);
     let mut decompressed = Vec::new();
     decoder.read_to_end(&mut decompressed).map_err(|e| {
-        crate::error::Error::Internal(format!("LZ4 decompression failed: {}", e))
+        crate::error::Error::internal(format!("LZ4 decompression failed: {}", e))
     })?;
     Ok(decompressed)
 }

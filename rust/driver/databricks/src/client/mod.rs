@@ -23,7 +23,7 @@
 mod error;
 mod models;
 
-pub use error::SeaError;
+pub use error::{SeaError, SeaErrorCode, SeaErrorResponse};
 pub use models::*;
 
 /// SEA (Statement Execution API) client for Databricks.
