@@ -15,7 +15,6 @@ use arrow_array::{BooleanArray, Decimal128Array, StringArray};
 use super::helpers::*;
 
 #[test]
-#[ignore]
 fn test_e2e_types_numeric_all_sizes() {
     skip_if_no_config!();
 
@@ -59,7 +58,6 @@ fn test_e2e_types_numeric_all_sizes() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_types_boolean() {
     skip_if_no_config!();
 
@@ -80,7 +78,6 @@ fn test_e2e_types_boolean() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_types_string() {
     skip_if_no_config!();
 
@@ -101,7 +98,6 @@ fn test_e2e_types_string() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_types_decimal() {
     skip_if_no_config!();
 
@@ -133,7 +129,6 @@ fn test_e2e_types_decimal() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_types_date() {
     skip_if_no_config!();
 
@@ -158,7 +153,6 @@ fn test_e2e_types_date() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_types_timestamp() {
     skip_if_no_config!();
 
@@ -186,7 +180,6 @@ fn test_e2e_types_timestamp() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_types_array() {
     skip_if_no_config!();
 
@@ -211,7 +204,6 @@ fn test_e2e_types_array() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_types_struct() {
     skip_if_no_config!();
 
@@ -236,7 +228,6 @@ fn test_e2e_types_struct() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_types_map() {
     skip_if_no_config!();
 
@@ -261,7 +252,6 @@ fn test_e2e_types_map() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_types_null_in_all_types() {
     skip_if_no_config!();
 
@@ -288,7 +278,6 @@ fn test_e2e_types_null_in_all_types() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_types_negative_numbers() {
     skip_if_no_config!();
 

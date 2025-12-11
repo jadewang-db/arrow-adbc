@@ -69,7 +69,6 @@ use e2e::helpers::*;
 /// This is the most basic E2E test - it validates that the configuration
 /// is correct and we can successfully create a session.
 #[test]
-#[ignore]
 fn e2e_basic_connection() {
     skip_if_no_config!();
 
@@ -84,7 +83,6 @@ fn e2e_basic_connection() {
 /// This validates the basic query execution path without any
 /// complex data types or large results.
 #[test]
-#[ignore]
 fn e2e_query_select_one() {
     skip_if_no_config!();
 
@@ -108,7 +106,6 @@ fn e2e_query_select_one() {
 
 /// Test that we can execute a query returning multiple rows.
 #[test]
-#[ignore]
 fn e2e_query_multiple_rows() {
     skip_if_no_config!();
 
@@ -124,7 +121,6 @@ fn e2e_query_multiple_rows() {
 
 /// Test that we can execute a query returning multiple columns.
 #[test]
-#[ignore]
 fn e2e_query_multiple_columns() {
     skip_if_no_config!();
 
@@ -142,7 +138,6 @@ fn e2e_query_multiple_columns() {
 
 /// Test that we can execute a query returning an empty result set.
 #[test]
-#[ignore]
 fn e2e_query_empty_result() {
     skip_if_no_config!();
 
@@ -156,7 +151,6 @@ fn e2e_query_empty_result() {
 
 /// Test that we can create multiple statements on the same connection.
 #[test]
-#[ignore]
 fn e2e_multiple_statements() {
     skip_if_no_config!();
 
@@ -177,7 +171,6 @@ fn e2e_multiple_statements() {
 
 /// Test that we can reuse a statement with different queries.
 #[test]
-#[ignore]
 fn e2e_statement_reuse() {
     skip_if_no_config!();
 
@@ -202,7 +195,6 @@ fn e2e_statement_reuse() {
 
 /// Test that NULL values are handled correctly.
 #[test]
-#[ignore]
 fn e2e_null_values() {
     skip_if_no_config!();
 
@@ -223,7 +215,6 @@ fn e2e_null_values() {
 
 /// Test string values with special characters.
 #[test]
-#[ignore]
 fn e2e_string_special_chars() {
     skip_if_no_config!();
 
@@ -239,7 +230,6 @@ fn e2e_string_special_chars() {
 
 /// Test unicode string values.
 #[test]
-#[ignore]
 fn e2e_unicode_strings() {
     skip_if_no_config!();
 

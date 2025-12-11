@@ -12,7 +12,6 @@ use arrow_array::{Int32Array, StringArray};
 use super::helpers::*;
 
 #[test]
-#[ignore]
 fn test_e2e_query_select_one() {
     skip_if_no_config!();
 
@@ -31,7 +30,6 @@ fn test_e2e_query_select_one() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_query_multiple_rows() {
     skip_if_no_config!();
 
@@ -49,7 +47,6 @@ fn test_e2e_query_multiple_rows() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_query_multiple_columns() {
     skip_if_no_config!();
 
@@ -71,7 +68,6 @@ fn test_e2e_query_multiple_columns() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_query_empty_result() {
     skip_if_no_config!();
 
@@ -87,7 +83,6 @@ fn test_e2e_query_empty_result() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_query_null_values() {
     skip_if_no_config!();
 
@@ -110,7 +105,6 @@ fn test_e2e_query_null_values() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_query_string_special_characters() {
     skip_if_no_config!();
 
@@ -128,7 +122,6 @@ fn test_e2e_query_string_special_characters() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_query_unicode_strings() {
     skip_if_no_config!();
 
@@ -146,7 +139,6 @@ fn test_e2e_query_unicode_strings() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_query_syntax_error() {
     skip_if_no_config!();
 
@@ -160,7 +152,6 @@ fn test_e2e_query_syntax_error() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_query_table_not_found() {
     skip_if_no_config!();
 
@@ -174,7 +165,6 @@ fn test_e2e_query_table_not_found() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_query_with_where_clause() {
     skip_if_no_config!();
 
@@ -192,7 +182,6 @@ fn test_e2e_query_with_where_clause() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_query_with_aggregation() {
     skip_if_no_config!();
 
@@ -210,7 +199,6 @@ fn test_e2e_query_with_aggregation() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_query_with_group_by() {
     skip_if_no_config!();
 
@@ -230,7 +218,6 @@ fn test_e2e_query_with_group_by() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_query_with_order_by() {
     skip_if_no_config!();
 

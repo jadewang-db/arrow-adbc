@@ -10,7 +10,6 @@ use adbc_core::{Connection, Statement};
 use super::helpers::*;
 
 #[test]
-#[ignore]
 fn test_e2e_result_inline_small() {
     skip_if_no_config!();
 
@@ -26,7 +25,6 @@ fn test_e2e_result_inline_small() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_result_medium_1k_rows() {
     skip_if_no_config!();
 
@@ -41,7 +39,6 @@ fn test_e2e_result_medium_1k_rows() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_result_medium_10k_rows() {
     skip_if_no_config!();
 
@@ -56,7 +53,6 @@ fn test_e2e_result_medium_10k_rows() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_result_large_100k_rows() {
     skip_if_no_config!();
 
@@ -71,7 +67,6 @@ fn test_e2e_result_large_100k_rows() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_result_large_1m_rows() {
     skip_if_no_config!();
 
@@ -87,7 +82,6 @@ fn test_e2e_result_large_1m_rows() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_result_wide_table() {
     skip_if_no_config!();
 
@@ -113,7 +107,6 @@ fn test_e2e_result_wide_table() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_result_streaming_multiple_batches() {
     skip_if_no_config!();
 
@@ -139,7 +132,6 @@ fn test_e2e_result_streaming_multiple_batches() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_result_with_string_data() {
     skip_if_no_config!();
 
@@ -158,7 +150,6 @@ fn test_e2e_result_with_string_data() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_result_all_batch_sizes_match_schema() {
     skip_if_no_config!();
 
@@ -187,7 +178,6 @@ fn test_e2e_result_all_batch_sizes_match_schema() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_result_compression_handling() {
     skip_if_no_config!();
 
@@ -206,7 +196,6 @@ fn test_e2e_result_compression_handling() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_result_row_limit_option() {
     skip_if_no_config!();
 

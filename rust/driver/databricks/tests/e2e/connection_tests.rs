@@ -13,7 +13,6 @@ use arrow_array::cast::AsArray;
 use super::helpers::*;
 
 #[test]
-#[ignore] // Run with cargo test --ignored
 fn test_e2e_connection_open_creates_session() {
     // Skip if configuration not available
     skip_if_no_config!();
@@ -26,7 +25,6 @@ fn test_e2e_connection_open_creates_session() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_connection_close_terminates_session() {
     skip_if_no_config!();
 
@@ -42,7 +40,6 @@ fn test_e2e_connection_close_terminates_session() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_connection_set_catalog_changes_context() {
     skip_if_no_config!();
 
@@ -69,7 +66,6 @@ fn test_e2e_connection_set_catalog_changes_context() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_connection_set_schema_changes_context() {
     skip_if_no_config!();
 
@@ -97,7 +93,6 @@ fn test_e2e_connection_set_schema_changes_context() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_connection_autocommit_always_true() {
     skip_if_no_config!();
 
@@ -113,7 +108,6 @@ fn test_e2e_connection_autocommit_always_true() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_connection_multiple_from_same_database() {
     skip_if_no_config!();
 
@@ -139,7 +133,6 @@ fn test_e2e_connection_multiple_from_same_database() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_connection_independent_catalog_schema_per_connection() {
     skip_if_no_config!();
 
@@ -169,7 +162,6 @@ fn test_e2e_connection_independent_catalog_schema_per_connection() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_connection_commit_not_supported() {
     skip_if_no_config!();
 
@@ -181,7 +173,6 @@ fn test_e2e_connection_commit_not_supported() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_connection_rollback_not_supported() {
     skip_if_no_config!();
 
@@ -193,7 +184,6 @@ fn test_e2e_connection_rollback_not_supported() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_connection_reuse_after_query() {
     skip_if_no_config!();
 
@@ -217,7 +207,6 @@ fn test_e2e_connection_reuse_after_query() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_connection_use_catalog_statement() {
     skip_if_no_config!();
 
@@ -247,7 +236,6 @@ fn test_e2e_connection_use_catalog_statement() {
 }
 
 #[test]
-#[ignore]
 fn test_e2e_connection_use_schema_statement() {
     skip_if_no_config!();
 
