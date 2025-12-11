@@ -74,6 +74,7 @@
 
 pub mod config;
 pub mod helpers;
+pub mod connection_tests;
 
 // Re-export commonly used items for convenience
 pub use config::E2EConfig;
