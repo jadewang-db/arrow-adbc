@@ -254,72 +254,136 @@ impl Optionable for DatabricksConnection {
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         match key {
+            OptionConnection::AutoCommit => {
+                // AutoCommit must be true for Databricks (no transaction support)
+                let autocommit = match value {
+                    OptionValue::String(s) => s,
+                    OptionValue::Int(i) => i.to_string(),
+                    _ => {
+                        return Err(Error::with_message_and_status(
+                            "autocommit must be a string or int",
+                            Status::InvalidArguments,
+                        ));
+                    }
+                };
+                // Accept "true", "1", or empty string (which means enable)
+                if autocommit != "true" && autocommit != "1" && !autocommit.is_empty() {
+                    return Err(Error::with_message_and_status(
+                        "Databricks requires autocommit=true; transactions are not supported",
+                        Status::InvalidArguments,
+                    ));
+                }
+                Ok(())
+            }
             OptionConnection::CurrentCatalog => {
                 if let OptionValue::String(s) = value {
                     self.current_catalog = Some(s);
+                    Ok(())
                 } else {
-                    return Err(Error::with_message_and_status(
+                    Err(Error::with_message_and_status(
                         "current_catalog must be a string",
                         Status::InvalidArguments,
-                    ));
+                    ))
                 }
             }
             OptionConnection::CurrentSchema => {
                 if let OptionValue::String(s) = value {
                     self.current_schema = Some(s);
+                    Ok(())
                 } else {
-                    return Err(Error::with_message_and_status(
+                    Err(Error::with_message_and_status(
                         "current_schema must be a string",
+                        Status::InvalidArguments,
+                    ))
+                }
+            }
+            OptionConnection::ReadOnly => {
+                // Databricks connections do not support read-only mode
+                let readonly = match value {
+                    OptionValue::String(s) => s,
+                    OptionValue::Int(i) => i.to_string(),
+                    _ => {
+                        return Err(Error::with_message_and_status(
+                            "read_only must be a string or int",
+                            Status::InvalidArguments,
+                        ));
+                    }
+                };
+                // Only allow setting to "false" or "0"
+                if readonly != "false" && readonly != "0" && !readonly.is_empty() {
+                    return Err(Error::with_message_and_status(
+                        "Databricks does not support read-only mode",
                         Status::InvalidArguments,
                     ));
                 }
+                Ok(())
             }
-            OptionConnection::AutoCommit => {
-                // Always autocommit, ignore setting
+            OptionConnection::IsolationLevel => {
+                // Databricks doesn't support transaction isolation levels
+                Err(Error::with_message_and_status(
+                    "Databricks does not support transaction isolation levels",
+                    Status::NotImplemented,
+                ))
             }
-            _ => {
-                return Err(Error::with_message_and_status(
-                    format!("Unknown option: {:?}", key),
-                    Status::InvalidArguments,
-                ));
-            }
+            OptionConnection::Other(ref key) => Err(Error::with_message_and_status(
+                format!("Unknown connection option: {}", key),
+                Status::NotImplemented,
+            )),
+            // Handle any future OptionConnection variants
+            _ => Err(Error::with_message_and_status(
+                format!("Unsupported connection option: {:?}", key),
+                Status::NotImplemented,
+            )),
         }
-        Ok(())
     }
 
-    fn get_option_bytes(&self, _key: Self::Option) -> Result<Vec<u8>> {
+    fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
         Err(Error::with_message_and_status(
-            "get_option_bytes not implemented",
+            format!("Option {:?} is not a byte array", key),
             Status::NotImplemented,
         ))
     }
 
-    fn get_option_double(&self, _key: Self::Option) -> Result<f64> {
+    fn get_option_double(&self, key: Self::Option) -> Result<f64> {
         Err(Error::with_message_and_status(
-            "get_option_double not implemented",
+            format!("Option {:?} is not a double", key),
             Status::NotImplemented,
         ))
     }
 
-    fn get_option_int(&self, _key: Self::Option) -> Result<i64> {
-        Err(Error::with_message_and_status(
-            "get_option_int not implemented",
-            Status::NotImplemented,
-        ))
+    fn get_option_int(&self, key: Self::Option) -> Result<i64> {
+        match key {
+            OptionConnection::AutoCommit => Ok(1), // true = 1
+            OptionConnection::ReadOnly => Ok(0),   // false = 0
+            _ => Err(Error::with_message_and_status(
+                format!("Option {:?} is not an integer", key),
+                Status::NotImplemented,
+            )),
+        }
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         match key {
+            OptionConnection::AutoCommit => Ok("true".to_string()),
             OptionConnection::CurrentCatalog => self.current_catalog.clone().ok_or_else(|| {
-                Error::with_message_and_status("current_catalog not set", Status::InvalidArguments)
+                Error::with_message_and_status("Current catalog not set", Status::NotFound)
             }),
             OptionConnection::CurrentSchema => self.current_schema.clone().ok_or_else(|| {
-                Error::with_message_and_status("current_schema not set", Status::InvalidArguments)
+                Error::with_message_and_status("Current schema not set", Status::NotFound)
             }),
-            OptionConnection::AutoCommit => Ok("true".to_string()),
+            OptionConnection::ReadOnly => Ok("false".to_string()),
+            OptionConnection::IsolationLevel => Err(Error::with_message_and_status(
+                "Databricks does not support transaction isolation levels",
+                Status::NotImplemented,
+            )),
+            OptionConnection::Other(ref key) => Err(Error::with_message_and_status(
+                format!("Unknown connection option: {}", key),
+                Status::NotFound,
+            )),
+            // Handle any future OptionConnection variants
             _ => Err(Error::with_message_and_status(
-                format!("Unknown option: {:?}", key),
-                Status::InvalidArguments,
+                format!("Unsupported connection option: {:?}", key),
+                Status::NotFound,
             )),
         }
     }
@@ -772,6 +836,467 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.status, Status::InvalidArguments);
         assert!(err.message.contains("must be a string"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_autocommit_set_true_succeeds() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "autocommit-set-true-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut conn = DatabricksConnection::new(config, runtime).unwrap();
+            // Setting autocommit to "true" should succeed
+            conn.set_option(
+                OptionConnection::AutoCommit,
+                OptionValue::String("true".into()),
+            )
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(result.is_ok(), "Setting autocommit to true should succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_autocommit_set_false_fails() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "autocommit-set-false-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut conn = DatabricksConnection::new(config, runtime).unwrap();
+            // Setting autocommit to "false" should fail
+            conn.set_option(
+                OptionConnection::AutoCommit,
+                OptionValue::String("false".into()),
+            )
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(result.is_err(), "Setting autocommit to false should fail");
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(
+            err.message.contains("autocommit=true"),
+            "Error message should mention autocommit: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_autocommit_get_int() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "autocommit-int-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = DatabricksConnection::new(config, runtime).unwrap();
+            conn.get_option_int(OptionConnection::AutoCommit)
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(result.is_ok(), "get_option_int for AutoCommit should succeed");
+        assert_eq!(result.unwrap(), 1, "AutoCommit should return 1 (true)");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_readonly_set_false_succeeds() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "readonly-set-false-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut conn = DatabricksConnection::new(config, runtime).unwrap();
+            // Setting read_only to "false" should succeed
+            conn.set_option(
+                OptionConnection::ReadOnly,
+                OptionValue::String("false".into()),
+            )
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(result.is_ok(), "Setting read_only to false should succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_readonly_set_true_fails() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "readonly-set-true-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut conn = DatabricksConnection::new(config, runtime).unwrap();
+            // Setting read_only to "true" should fail
+            conn.set_option(
+                OptionConnection::ReadOnly,
+                OptionValue::String("true".into()),
+            )
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(result.is_err(), "Setting read_only to true should fail");
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(
+            err.message.contains("read-only"),
+            "Error message should mention read-only: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_readonly_get_string() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "readonly-get-string-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = DatabricksConnection::new(config, runtime).unwrap();
+            conn.get_option_string(OptionConnection::ReadOnly)
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(result.is_ok(), "get_option_string for ReadOnly should succeed");
+        assert_eq!(result.unwrap(), "false", "ReadOnly should return 'false'");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_readonly_get_int() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "readonly-get-int-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = DatabricksConnection::new(config, runtime).unwrap();
+            conn.get_option_int(OptionConnection::ReadOnly)
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(result.is_ok(), "get_option_int for ReadOnly should succeed");
+        assert_eq!(result.unwrap(), 0, "ReadOnly should return 0 (false)");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_isolation_level_not_supported() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "isolation-level-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let (set_result, get_result) = tokio::task::spawn_blocking(move || {
+            let mut conn = DatabricksConnection::new(config, runtime).unwrap();
+            let set_res = conn.set_option(
+                OptionConnection::IsolationLevel,
+                OptionValue::String("READ_COMMITTED".into()),
+            );
+            let get_res = conn.get_option_string(OptionConnection::IsolationLevel);
+            (set_res, get_res)
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        // set_option should fail with NotImplemented
+        assert!(set_result.is_err(), "Setting IsolationLevel should fail");
+        let set_err = set_result.unwrap_err();
+        assert_eq!(set_err.status, Status::NotImplemented);
+        assert!(
+            set_err.message.contains("isolation level"),
+            "Error message should mention isolation level: {}",
+            set_err.message
+        );
+
+        // get_option_string should fail with NotImplemented
+        assert!(get_result.is_err(), "Getting IsolationLevel should fail");
+        let get_err = get_result.unwrap_err();
+        assert_eq!(get_err.status, Status::NotImplemented);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_unknown_option_fails() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "unknown-opt-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let (set_result, get_result) = tokio::task::spawn_blocking(move || {
+            let mut conn = DatabricksConnection::new(config, runtime).unwrap();
+            let set_res = conn.set_option(
+                OptionConnection::Other("unknown.option".into()),
+                OptionValue::String("value".into()),
+            );
+            let get_res = conn.get_option_string(OptionConnection::Other("unknown.option".into()));
+            (set_res, get_res)
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        // set_option should fail for unknown option
+        assert!(set_result.is_err(), "Setting unknown option should fail");
+        let set_err = set_result.unwrap_err();
+        assert_eq!(set_err.status, Status::NotImplemented);
+        assert!(
+            set_err.message.contains("Unknown") || set_err.message.contains("unknown"),
+            "Error message should mention unknown option: {}",
+            set_err.message
+        );
+
+        // get_option_string should fail for unknown option
+        assert!(get_result.is_err(), "Getting unknown option should fail");
+        let get_err = get_result.unwrap_err();
+        assert_eq!(get_err.status, Status::NotFound);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_get_option_bytes_not_supported() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "bytes-opt-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = DatabricksConnection::new(config, runtime).unwrap();
+            conn.get_option_bytes(OptionConnection::AutoCommit)
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(result.is_err(), "get_option_bytes should fail");
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_get_option_double_not_supported() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "double-opt-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = DatabricksConnection::new(config, runtime).unwrap();
+            conn.get_option_double(OptionConnection::AutoCommit)
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(result.is_err(), "get_option_double should fail");
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_catalog_not_set_returns_not_found() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "catalog-not-set-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Create config without default catalog
+        let config = Arc::new(DatabaseConfig {
+            host: mock_server.uri(),
+            warehouse_id: "test_warehouse".to_string(),
+            token: "test_token".to_string(),
+            default_catalog: None,
+            default_schema: None,
+            http_config: crate::options::HttpConfig::default(),
+            fetch_concurrency: 8,
+        });
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = DatabricksConnection::new(config, runtime).unwrap();
+            conn.get_option_string(OptionConnection::CurrentCatalog)
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(result.is_err(), "get_option_string for unset catalog should fail");
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotFound);
+        assert!(
+            err.message.contains("not set") || err.message.contains("Not set"),
+            "Error message should indicate not set: {}",
+            err.message
+        );
     }
 
     // ============================================================================

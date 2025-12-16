@@ -1612,3 +1612,365 @@ fn test_e2e_connection_options() {
     println!();
     println!("=== DatabricksConnection Options E2E Test PASSED ===");
 }
+
+// ============================================================================
+// Work Item 2.2: DatabricksConnection Optionable Trait E2E Tests
+// ============================================================================
+
+/// Test DatabricksConnection Optionable trait - comprehensive option handling.
+///
+/// This validates all connection-level options according to ADBC spec:
+/// - AutoCommit: always true (Databricks doesn't support transactions)
+/// - ReadOnly: always false (Databricks doesn't support read-only mode)
+/// - CurrentCatalog: settable and gettable
+/// - CurrentSchema: settable and gettable
+/// - IsolationLevel: not supported (returns NotImplemented)
+#[test]
+#[ignore]
+fn test_e2e_connection_optionable_comprehensive() {
+    use adbc_core::error::Status;
+    use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
+    use adbc_core::{Database, Driver, Optionable};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== DatabricksConnection Optionable Comprehensive E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+
+    // =========================================================================
+    // Test 1: AutoCommit
+    // =========================================================================
+    println!("Test 1: AutoCommit option");
+
+    // get_option_string should return "true"
+    let autocommit_str = conn
+        .get_option_string(OptionConnection::AutoCommit)
+        .expect("get_option_string for AutoCommit should succeed");
+    assert_eq!(autocommit_str, "true", "AutoCommit should be 'true'");
+    println!("  get_option_string(AutoCommit) = '{}'", autocommit_str);
+
+    // get_option_int should return 1
+    let autocommit_int = conn
+        .get_option_int(OptionConnection::AutoCommit)
+        .expect("get_option_int for AutoCommit should succeed");
+    assert_eq!(autocommit_int, 1, "AutoCommit int should be 1 (true)");
+    println!("  get_option_int(AutoCommit) = {}", autocommit_int);
+
+    // Setting autocommit to "true" should succeed
+    conn.set_option(
+        OptionConnection::AutoCommit,
+        OptionValue::String("true".into()),
+    )
+    .expect("Setting AutoCommit to 'true' should succeed");
+    println!("  set_option(AutoCommit, 'true') succeeded");
+
+    // Setting autocommit to "false" should fail
+    let set_false_result = conn.set_option(
+        OptionConnection::AutoCommit,
+        OptionValue::String("false".into()),
+    );
+    assert!(
+        set_false_result.is_err(),
+        "Setting AutoCommit to 'false' should fail"
+    );
+    let err = set_false_result.unwrap_err();
+    assert_eq!(
+        err.status,
+        Status::InvalidArguments,
+        "Error should be InvalidArguments"
+    );
+    println!("  set_option(AutoCommit, 'false') correctly failed: {}", err.message);
+
+    // =========================================================================
+    // Test 2: ReadOnly
+    // =========================================================================
+    println!();
+    println!("Test 2: ReadOnly option");
+
+    // get_option_string should return "false"
+    let readonly_str = conn
+        .get_option_string(OptionConnection::ReadOnly)
+        .expect("get_option_string for ReadOnly should succeed");
+    assert_eq!(readonly_str, "false", "ReadOnly should be 'false'");
+    println!("  get_option_string(ReadOnly) = '{}'", readonly_str);
+
+    // get_option_int should return 0
+    let readonly_int = conn
+        .get_option_int(OptionConnection::ReadOnly)
+        .expect("get_option_int for ReadOnly should succeed");
+    assert_eq!(readonly_int, 0, "ReadOnly int should be 0 (false)");
+    println!("  get_option_int(ReadOnly) = {}", readonly_int);
+
+    // Setting read_only to "false" should succeed
+    conn.set_option(
+        OptionConnection::ReadOnly,
+        OptionValue::String("false".into()),
+    )
+    .expect("Setting ReadOnly to 'false' should succeed");
+    println!("  set_option(ReadOnly, 'false') succeeded");
+
+    // Setting read_only to "true" should fail
+    let set_true_result = conn.set_option(
+        OptionConnection::ReadOnly,
+        OptionValue::String("true".into()),
+    );
+    assert!(
+        set_true_result.is_err(),
+        "Setting ReadOnly to 'true' should fail"
+    );
+    let err = set_true_result.unwrap_err();
+    assert_eq!(
+        err.status,
+        Status::InvalidArguments,
+        "Error should be InvalidArguments"
+    );
+    println!("  set_option(ReadOnly, 'true') correctly failed: {}", err.message);
+
+    // =========================================================================
+    // Test 3: IsolationLevel (not supported)
+    // =========================================================================
+    println!();
+    println!("Test 3: IsolationLevel option (not supported)");
+
+    // get_option_string should fail with NotImplemented
+    let get_isolation_result = conn.get_option_string(OptionConnection::IsolationLevel);
+    assert!(
+        get_isolation_result.is_err(),
+        "Getting IsolationLevel should fail"
+    );
+    let err = get_isolation_result.unwrap_err();
+    assert_eq!(
+        err.status,
+        Status::NotImplemented,
+        "Error should be NotImplemented"
+    );
+    println!("  get_option_string(IsolationLevel) correctly failed: {}", err.message);
+
+    // set_option should fail with NotImplemented
+    let set_isolation_result = conn.set_option(
+        OptionConnection::IsolationLevel,
+        OptionValue::String("READ_COMMITTED".into()),
+    );
+    assert!(
+        set_isolation_result.is_err(),
+        "Setting IsolationLevel should fail"
+    );
+    let err = set_isolation_result.unwrap_err();
+    assert_eq!(
+        err.status,
+        Status::NotImplemented,
+        "Error should be NotImplemented"
+    );
+    println!("  set_option(IsolationLevel, 'READ_COMMITTED') correctly failed: {}", err.message);
+
+    // =========================================================================
+    // Test 4: CurrentCatalog
+    // =========================================================================
+    println!();
+    println!("Test 4: CurrentCatalog option");
+
+    // Set catalog to a test value
+    conn.set_option(
+        OptionConnection::CurrentCatalog,
+        OptionValue::String("test_catalog_e2e".into()),
+    )
+    .expect("Setting CurrentCatalog should succeed");
+    println!("  set_option(CurrentCatalog, 'test_catalog_e2e') succeeded");
+
+    // Get catalog should return the set value
+    let catalog = conn
+        .get_option_string(OptionConnection::CurrentCatalog)
+        .expect("get_option_string for CurrentCatalog should succeed");
+    assert_eq!(catalog, "test_catalog_e2e", "Catalog should match set value");
+    println!("  get_option_string(CurrentCatalog) = '{}'", catalog);
+
+    // =========================================================================
+    // Test 5: CurrentSchema
+    // =========================================================================
+    println!();
+    println!("Test 5: CurrentSchema option");
+
+    // Set schema to a test value
+    conn.set_option(
+        OptionConnection::CurrentSchema,
+        OptionValue::String("test_schema_e2e".into()),
+    )
+    .expect("Setting CurrentSchema should succeed");
+    println!("  set_option(CurrentSchema, 'test_schema_e2e') succeeded");
+
+    // Get schema should return the set value
+    let schema = conn
+        .get_option_string(OptionConnection::CurrentSchema)
+        .expect("get_option_string for CurrentSchema should succeed");
+    assert_eq!(schema, "test_schema_e2e", "Schema should match set value");
+    println!("  get_option_string(CurrentSchema) = '{}'", schema);
+
+    // =========================================================================
+    // Test 6: Unknown/Other options
+    // =========================================================================
+    println!();
+    println!("Test 6: Unknown option handling");
+
+    // Setting unknown option should fail
+    let set_unknown_result = conn.set_option(
+        OptionConnection::Other("unknown.custom.option".into()),
+        OptionValue::String("value".into()),
+    );
+    assert!(
+        set_unknown_result.is_err(),
+        "Setting unknown option should fail"
+    );
+    let err = set_unknown_result.unwrap_err();
+    assert_eq!(
+        err.status,
+        Status::NotImplemented,
+        "Error should be NotImplemented"
+    );
+    println!("  set_option(Other('unknown.custom.option'), ...) correctly failed");
+
+    // Getting unknown option should fail
+    let get_unknown_result =
+        conn.get_option_string(OptionConnection::Other("unknown.custom.option".into()));
+    assert!(
+        get_unknown_result.is_err(),
+        "Getting unknown option should fail"
+    );
+    let err = get_unknown_result.unwrap_err();
+    assert_eq!(err.status, Status::NotFound, "Error should be NotFound");
+    println!("  get_option_string(Other('unknown.custom.option')) correctly failed");
+
+    // =========================================================================
+    // Test 7: get_option_bytes and get_option_double (not supported)
+    // =========================================================================
+    println!();
+    println!("Test 7: Unsupported option types");
+
+    // get_option_bytes should fail
+    let bytes_result = conn.get_option_bytes(OptionConnection::AutoCommit);
+    assert!(bytes_result.is_err(), "get_option_bytes should fail");
+    assert_eq!(
+        bytes_result.unwrap_err().status,
+        Status::NotImplemented,
+        "Error should be NotImplemented"
+    );
+    println!("  get_option_bytes correctly returned NotImplemented");
+
+    // get_option_double should fail
+    let double_result = conn.get_option_double(OptionConnection::AutoCommit);
+    assert!(double_result.is_err(), "get_option_double should fail");
+    assert_eq!(
+        double_result.unwrap_err().status,
+        Status::NotImplemented,
+        "Error should be NotImplemented"
+    );
+    println!("  get_option_double correctly returned NotImplemented");
+
+    println!();
+    println!("=== DatabricksConnection Optionable Comprehensive E2E Test PASSED ===");
+    println!("All connection option behaviors verified successfully!");
+}
+
+/// Test that connection options set via catalog from config are accessible.
+///
+/// This validates:
+/// - Database default catalog/schema are inherited by connection
+/// - Connection get_option_string returns inherited values
+#[test]
+#[ignore]
+fn test_e2e_connection_inherits_database_catalog_schema() {
+    use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
+    use adbc_core::{Database, Driver, Optionable};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    // Skip if no catalog configured
+    if config.metadata.catalog.is_empty() {
+        println!("Skipping: No catalog configured in test metadata");
+        return;
+    }
+
+    println!("=== Connection Inherits Database Catalog/Schema E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!("Expected Catalog: {}", config.metadata.catalog);
+    println!("Expected Schema: {}", config.metadata.schema);
+    println!();
+
+    // Create driver and database with catalog/schema options
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.catalog".into()),
+                OptionValue::String(config.metadata.catalog.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.schema".into()),
+                OptionValue::String(config.metadata.schema.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    // Create connection - should inherit catalog/schema from database
+    let conn = db.new_connection().expect("Failed to create connection");
+
+    // Verify connection has inherited catalog
+    let conn_catalog = conn
+        .get_option_string(OptionConnection::CurrentCatalog)
+        .expect("Should be able to get current catalog");
+    assert_eq!(
+        conn_catalog, config.metadata.catalog,
+        "Connection catalog should match database config"
+    );
+    println!("  Connection CurrentCatalog: {}", conn_catalog);
+
+    // Verify connection has inherited schema
+    let conn_schema = conn
+        .get_option_string(OptionConnection::CurrentSchema)
+        .expect("Should be able to get current schema");
+    assert_eq!(
+        conn_schema, config.metadata.schema,
+        "Connection schema should match database config"
+    );
+    println!("  Connection CurrentSchema: {}", conn_schema);
+
+    println!();
+    println!("=== Connection Inherits Database Catalog/Schema E2E Test PASSED ===");
+}
