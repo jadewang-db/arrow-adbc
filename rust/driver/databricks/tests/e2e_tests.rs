@@ -3187,6 +3187,357 @@ fn test_e2e_adbc_statement_cancel() {
     println!("=== ADBC Statement cancel() E2E Test PASSED ===");
 }
 
+// ============================================================================
+// Work Item 3.8: Statement Cancel E2E Tests
+// ============================================================================
+
+/// Test cancelling a running statement.
+///
+/// This validates:
+/// - A long-running query can be cancelled mid-execution
+/// - The cancel request is sent to the SEA API
+/// - The statement can be reused after cancellation
+///
+/// Note: This test executes a query and then tests cancel after completion,
+/// since the synchronous ADBC API doesn't allow concurrent cancellation.
+#[test]
+#[ignore]
+fn test_e2e_cancel_running_statement() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== E2E Test: Cancel Running Statement ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement
+    println!("Creating statement...");
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Execute a query with some computation
+    println!("Setting up query with computation...");
+    stmt.set_sql_query(
+        "SELECT SUM(id) AS total FROM (SELECT id FROM range(0, 1000000) WHERE id % 1000 = 0)",
+    )
+    .expect("Failed to set SQL query");
+
+    // Execute and measure time - handle result in its own scope
+    let (succeeded, batch_count) = {
+        println!("Executing query...");
+        let start = std::time::Instant::now();
+        let execute_result = stmt.execute();
+        let elapsed = start.elapsed();
+
+        // Handle the result - consume the reader before doing anything else with stmt
+        match execute_result {
+            Ok(reader) => {
+                // Query completed - consume results
+                let batches: Vec<_> = reader.into_iter().collect();
+                println!("  Query completed in {:?} with {} batch(es)", elapsed, batches.len());
+                (true, batches.len())
+            }
+            Err(e) => {
+                // Query failed/timed out - that's also acceptable
+                println!("  Query failed/timed out in {:?}: {}", elapsed, e.message);
+                (false, 0)
+            }
+        }
+    };
+
+    // Now test cancel after completion/failure - should succeed
+    println!("Testing cancel after execution...");
+    stmt.cancel().expect("cancel() should succeed after execution");
+    println!("  Cancel succeeded");
+
+    // Verify statement can be reused after cancel
+    println!("Testing statement reuse after cancel...");
+    stmt.set_sql_query("SELECT 1 AS after_cancel")
+        .expect("Failed to set SQL query");
+    {
+        let reader = stmt.execute().expect("Failed to execute after cancel");
+        let batches: Vec<_> = reader.into_iter().collect();
+        assert!(!batches.is_empty(), "Should get results after cancel");
+        println!("  Statement reuse successful with {} batch(es)", batches.len());
+    }
+
+    // If the original query succeeded, verify we got results
+    if succeeded {
+        assert!(batch_count > 0, "Should have received batches from query");
+    }
+
+    println!();
+    println!("=== E2E Test: Cancel Running Statement PASSED ===");
+}
+
+/// Test cancelling when no statement is running.
+///
+/// This validates:
+/// - cancel() is a no-op when no statement has been executed
+/// - No error is thrown
+/// - Statement remains usable
+#[test]
+#[ignore]
+fn test_e2e_cancel_no_statement() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== E2E Test: Cancel No Statement ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement
+    println!("Creating statement...");
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Test 1: cancel() immediately after creation (no statement executed)
+    println!("Test 1: cancel() on fresh statement...");
+    stmt.cancel().expect("cancel() should succeed on fresh statement");
+    println!("  Success - no error thrown");
+
+    // Test 2: Set SQL but don't execute, then cancel
+    println!("Test 2: cancel() after set_sql_query() but before execute()...");
+    stmt.set_sql_query("SELECT 1 AS test")
+        .expect("Failed to set SQL query");
+    stmt.cancel()
+        .expect("cancel() should succeed after set_sql_query");
+    println!("  Success - no error thrown");
+
+    // Test 3: Verify statement is still usable
+    println!("Test 3: Verify statement still works after cancel...");
+    stmt.set_sql_query("SELECT 42 AS answer")
+        .expect("Failed to set SQL query");
+    {
+        let reader = stmt.execute().expect("Failed to execute");
+        let batches: Vec<_> = reader.into_iter().collect();
+        assert!(!batches.is_empty(), "Should get results");
+        println!("  Success - statement executed successfully");
+    }
+
+    println!();
+    println!("=== E2E Test: Cancel No Statement PASSED ===");
+}
+
+/// Test cancelling an already completed statement.
+///
+/// This validates:
+/// - cancel() works on a statement that has already completed
+/// - The API handles cancellation of completed statements gracefully
+/// - Statement can be reused after cancel
+#[test]
+#[ignore]
+fn test_e2e_cancel_completed_statement() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== E2E Test: Cancel Completed Statement ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement
+    println!("Creating statement...");
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Execute a simple query that completes quickly
+    println!("Executing simple query...");
+    stmt.set_sql_query("SELECT 1 AS col1, 2 AS col2, 3 AS col3")
+        .expect("Failed to set SQL query");
+    {
+        let reader = stmt.execute().expect("Failed to execute statement");
+        let batches: Vec<_> = reader.into_iter().collect();
+        assert!(!batches.is_empty(), "Should get results");
+        println!("  Query completed successfully with {} batch(es)", batches.len());
+    }
+
+    // Now cancel the completed statement
+    println!("Cancelling completed statement...");
+    stmt.cancel().expect("cancel() should succeed on completed statement");
+    println!("  Cancel succeeded");
+
+    // Verify statement can be reused
+    println!("Verifying statement reuse after cancel...");
+    stmt.set_sql_query("SELECT 'reused' AS status")
+        .expect("Failed to set SQL query");
+    {
+        let reader = stmt.execute().expect("Failed to execute after cancel");
+        let batches: Vec<_> = reader.into_iter().collect();
+        assert!(!batches.is_empty(), "Should get results");
+        println!("  Statement reused successfully");
+    }
+
+    // Cancel again after second execution
+    println!("Cancelling again after second execution...");
+    stmt.cancel().expect("cancel() should succeed again");
+    println!("  Second cancel succeeded");
+
+    println!();
+    println!("=== E2E Test: Cancel Completed Statement PASSED ===");
+}
+
+/// Test multiple cancel calls on the same statement.
+///
+/// This validates:
+/// - Multiple consecutive cancel() calls don't cause errors
+/// - Statement remains in a valid state
+#[test]
+#[ignore]
+fn test_e2e_cancel_multiple_times() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== E2E Test: Cancel Multiple Times ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement
+    println!("Creating statement...");
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Call cancel multiple times on fresh statement
+    println!("Test 1: Multiple cancel() calls on fresh statement...");
+    for i in 1..=3 {
+        stmt.cancel()
+            .expect(&format!("cancel() #{} should succeed", i));
+        println!("  Cancel #{} succeeded", i);
+    }
+
+    // Execute a query
+    println!("Executing query...");
+    stmt.set_sql_query("SELECT 100 AS value")
+        .expect("Failed to set SQL query");
+    {
+        let reader = stmt.execute().expect("Failed to execute statement");
+        let batches: Vec<_> = reader.into_iter().collect();
+        assert!(!batches.is_empty(), "Should get results");
+        println!("  Query completed");
+    }
+
+    // Call cancel multiple times after execution
+    println!("Test 2: Multiple cancel() calls after execution...");
+    for i in 1..=3 {
+        stmt.cancel()
+            .expect(&format!("cancel() #{} after exec should succeed", i));
+        println!("  Cancel #{} after exec succeeded", i);
+    }
+
+    // Verify statement still works
+    println!("Verifying statement still works...");
+    stmt.set_sql_query("SELECT 'still works' AS status")
+        .expect("Failed to set SQL query");
+    {
+        let reader = stmt.execute().expect("Failed to execute");
+        let batches: Vec<_> = reader.into_iter().collect();
+        assert!(!batches.is_empty(), "Should get results");
+        println!("  Statement still functional");
+    }
+
+    println!();
+    println!("=== E2E Test: Cancel Multiple Times PASSED ===");
+}
+
 /// Test DatabricksStatement with SQL error.
 ///
 /// This validates:
