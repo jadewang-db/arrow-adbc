@@ -4853,3 +4853,438 @@ fn test_e2e_execute_inline_comprehensive() {
     println!("=== Work Item 2.8: Comprehensive Inline Execution E2E Test PASSED ===");
     println!("All 6 sub-tests completed successfully!");
 }
+
+// ============================================================================
+// Work Item 4.7: get_table_schema() E2E Tests
+// ============================================================================
+
+/// Test get_table_schema() retrieves schema for a system table.
+///
+/// This validates:
+/// - get_table_schema() successfully connects to Databricks
+/// - Correctly executes DESCRIBE TABLE query
+/// - Parses result into Arrow Schema
+/// - Returns proper field names and types
+#[test]
+#[ignore]
+fn test_e2e_get_table_schema_system_table() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 4.7: get_table_schema() System Table E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let conn = db.new_connection().expect("Failed to create connection");
+
+    // Test with a system catalog table that always exists
+    // system.information_schema.tables is available in all Databricks workspaces
+    println!("Retrieving schema for system.information_schema.tables...");
+    let schema = conn
+        .get_table_schema(Some("system"), Some("information_schema"), "tables")
+        .expect("Failed to get table schema");
+
+    println!("  Schema retrieved successfully!");
+    println!("  Number of fields: {}", schema.fields().len());
+
+    // Verify we got a non-empty schema
+    assert!(
+        schema.fields().len() > 0,
+        "Schema should have at least one field"
+    );
+
+    // Print all fields for debugging
+    println!("  Fields:");
+    for (i, field) in schema.fields().iter().enumerate() {
+        println!("    [{}] {}: {:?}", i, field.name(), field.data_type());
+    }
+
+    // Verify expected columns exist (these are standard in information_schema.tables)
+    let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+    // Check for common columns in information_schema.tables
+    let expected_columns = ["table_catalog", "table_schema", "table_name", "table_type"];
+    for col in &expected_columns {
+        assert!(
+            field_names.contains(col),
+            "Expected column '{}' not found in schema. Available columns: {:?}",
+            col,
+            field_names
+        );
+    }
+
+    println!();
+    println!("=== Work Item 4.7: get_table_schema() System Table E2E Test PASSED ===");
+}
+
+/// Test get_table_schema() with explicit catalog and schema from config.
+///
+/// This test uses the table configured in the test config file.
+#[test]
+#[ignore]
+fn test_e2e_get_table_schema_configured_table() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    // Skip if no test table is configured
+    if config.metadata.table.is_empty() {
+        println!("Skipping test: no test table configured in metadata");
+        return;
+    }
+
+    println!("=== Work Item 4.7: get_table_schema() Configured Table E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!("Test table: {}", config.get_full_table_name());
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let conn = db.new_connection().expect("Failed to create connection");
+
+    // Get schema for the configured table
+    println!(
+        "Retrieving schema for {}.{}.{}...",
+        config.metadata.catalog, config.metadata.schema, config.metadata.table
+    );
+    let schema = conn
+        .get_table_schema(
+            Some(&config.metadata.catalog),
+            Some(&config.metadata.schema),
+            &config.metadata.table,
+        )
+        .expect("Failed to get table schema");
+
+    println!("  Schema retrieved successfully!");
+    println!("  Number of fields: {}", schema.fields().len());
+
+    // Verify we got a non-empty schema
+    assert!(
+        schema.fields().len() > 0,
+        "Schema should have at least one field"
+    );
+
+    // Print all fields for debugging
+    println!("  Fields:");
+    for (i, field) in schema.fields().iter().enumerate() {
+        println!("    [{}] {}: {:?}", i, field.name(), field.data_type());
+    }
+
+    // If expected column count is specified, verify it
+    if config.metadata.expected_column_count > 0 {
+        assert_eq!(
+            schema.fields().len() as i32,
+            config.metadata.expected_column_count,
+            "Expected {} columns, got {}",
+            config.metadata.expected_column_count,
+            schema.fields().len()
+        );
+        println!(
+            "  Column count matches expected: {}",
+            config.metadata.expected_column_count
+        );
+    }
+
+    println!();
+    println!("=== Work Item 4.7: get_table_schema() Configured Table E2E Test PASSED ===");
+}
+
+/// Test get_table_schema() uses connection defaults for catalog/schema.
+///
+/// This validates that when catalog/schema are None, the connection's
+/// current_catalog and current_schema are used.
+#[test]
+#[ignore]
+fn test_e2e_get_table_schema_uses_connection_defaults() {
+    use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Optionable};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 4.7: get_table_schema() Uses Connection Defaults E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver and database with default catalog/schema
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.catalog".into()),
+                OptionValue::String("system".into()),
+            ),
+            (
+                OptionDatabase::Other("databricks.schema".into()),
+                OptionValue::String("information_schema".into()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let conn = db.new_connection().expect("Failed to create connection");
+
+    // Verify current catalog/schema are set
+    let current_catalog = conn
+        .get_option_string(OptionConnection::CurrentCatalog)
+        .expect("Failed to get current catalog");
+    let current_schema = conn
+        .get_option_string(OptionConnection::CurrentSchema)
+        .expect("Failed to get current schema");
+
+    println!("Connection defaults:");
+    println!("  Current catalog: {}", current_catalog);
+    println!("  Current schema: {}", current_schema);
+
+    // Get schema WITHOUT specifying catalog/schema - should use defaults
+    println!();
+    println!("Retrieving schema for 'tables' using connection defaults...");
+    let schema = conn
+        .get_table_schema(None, None, "tables")
+        .expect("Failed to get table schema with defaults");
+
+    println!("  Schema retrieved successfully!");
+    println!("  Number of fields: {}", schema.fields().len());
+
+    // Verify we got a non-empty schema
+    assert!(
+        schema.fields().len() > 0,
+        "Schema should have at least one field"
+    );
+
+    // Print some fields
+    println!("  Sample fields:");
+    for (i, field) in schema.fields().iter().take(5).enumerate() {
+        println!("    [{}] {}: {:?}", i, field.name(), field.data_type());
+    }
+
+    println!();
+    println!("=== Work Item 4.7: get_table_schema() Uses Connection Defaults E2E Test PASSED ===");
+}
+
+/// Test get_table_schema() error handling for non-existent table.
+///
+/// This validates that appropriate errors are returned for invalid tables.
+#[test]
+#[ignore]
+fn test_e2e_get_table_schema_nonexistent_table() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 4.7: get_table_schema() Nonexistent Table E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let conn = db.new_connection().expect("Failed to create connection");
+
+    // Try to get schema for a non-existent table
+    println!("Attempting to get schema for non-existent table...");
+    let result = conn.get_table_schema(
+        Some("nonexistent_catalog_xyz"),
+        Some("nonexistent_schema_xyz"),
+        "nonexistent_table_xyz",
+    );
+
+    // Should return an error
+    assert!(
+        result.is_err(),
+        "get_table_schema() should fail for non-existent table"
+    );
+
+    let err = result.unwrap_err();
+    println!("  Got expected error: {}", err.message);
+    println!("  Error status: {:?}", err.status);
+
+    println!();
+    println!("=== Work Item 4.7: get_table_schema() Nonexistent Table E2E Test PASSED ===");
+}
+
+/// Test get_table_schema() with various data types using system tables.
+///
+/// This test uses a system table that has various types to validate
+/// that get_table_schema correctly maps them to Arrow types.
+#[test]
+#[ignore]
+fn test_e2e_get_table_schema_type_mapping() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_schema::DataType;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 4.7: get_table_schema() Type Mapping E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let conn = db.new_connection().expect("Failed to create connection");
+
+    // Use system.information_schema.columns which has various types
+    // including strings, timestamps, and more
+    println!("Retrieving schema for system.information_schema.columns...");
+    let schema = conn
+        .get_table_schema(Some("system"), Some("information_schema"), "columns")
+        .expect("Failed to get table schema");
+
+    println!("  Schema retrieved successfully!");
+    println!("  Number of fields: {}", schema.fields().len());
+
+    // Print all fields
+    println!("  Fields:");
+    for (i, field) in schema.fields().iter().enumerate() {
+        println!("    [{}] {}: {:?}", i, field.name(), field.data_type());
+    }
+
+    // Verify we got fields with different types
+    let field_map: std::collections::HashMap<&str, &DataType> = schema
+        .fields()
+        .iter()
+        .map(|f| (f.name().as_str(), f.data_type()))
+        .collect();
+
+    // Check for expected columns in information_schema.columns
+    // These columns should exist and have specific types
+
+    // String columns
+    assert!(
+        field_map.contains_key("table_catalog"),
+        "Should have table_catalog column"
+    );
+    assert_eq!(
+        field_map.get("table_catalog"),
+        Some(&&DataType::Utf8),
+        "table_catalog should be String/Utf8"
+    );
+
+    assert!(
+        field_map.contains_key("column_name"),
+        "Should have column_name column"
+    );
+    assert_eq!(
+        field_map.get("column_name"),
+        Some(&&DataType::Utf8),
+        "column_name should be String/Utf8"
+    );
+
+    // Ordinal position is typically INT or BIGINT
+    if let Some(ordinal_type) = field_map.get("ordinal_position") {
+        match ordinal_type {
+            DataType::Int32 | DataType::Int64 | DataType::Decimal128(_, _) => {
+                println!("  ordinal_position type verified: {:?}", ordinal_type);
+            }
+            _ => {
+                println!(
+                    "  ordinal_position has unexpected type: {:?} (this may be valid for this Databricks version)",
+                    ordinal_type
+                );
+            }
+        }
+    }
+
+    // Verify we have a reasonable number of columns
+    assert!(
+        schema.fields().len() >= 5,
+        "information_schema.columns should have at least 5 columns"
+    );
+
+    println!();
+    println!("=== Work Item 4.7: get_table_schema() Type Mapping E2E Test PASSED ===");
+}

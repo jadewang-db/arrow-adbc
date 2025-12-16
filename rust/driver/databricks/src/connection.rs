@@ -59,7 +59,8 @@ use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::Schema;
 use tokio::runtime::Runtime;
 
-use crate::client::{SeaClient, SeaClientConfig};
+use crate::client::{SeaClient, SeaClientConfig, StatementResponse};
+use crate::fetch::{ArrowResultReader, ChunkFetcher};
 use crate::options::DatabaseConfig;
 use crate::runtime::{block_on_async, block_on_async_or_spawn, block_on_async_simple};
 use crate::session::SessionManager;
@@ -197,6 +198,416 @@ impl DatabricksConnection {
     /// Returns a reference to the shared Tokio runtime.
     pub fn runtime(&self) -> &Arc<Runtime> {
         &self.runtime
+    }
+
+    /// Convert a DESCRIBE TABLE result into an Arrow Schema.
+    ///
+    /// The DESCRIBE TABLE output in Databricks has columns:
+    /// - col_name: column name
+    /// - data_type: Spark SQL type (e.g., "int", "string", "decimal(10,2)")
+    /// - comment: optional column comment
+    ///
+    /// This method parses the result and maps Spark SQL types to Arrow types.
+    fn describe_result_to_schema(&self, response: &StatementResponse) -> Result<Schema> {
+
+        // Get the result data from the response
+        // For DESCRIBE TABLE, results should be returned as inline Arrow data or external links
+        let result = match &response.result {
+            Some(r) => r,
+            None => {
+                // Empty result means table has no columns (shouldn't happen)
+                return Ok(Schema::empty());
+            }
+        };
+
+        // Try to get inline Arrow data first
+        if let Some(ref chunk) = result.chunk {
+            if !chunk.is_empty() {
+                // Get schema for the reader
+                let reader_schema = self.build_describe_manifest_schema(response)?;
+
+                // Parse inline Arrow data
+                let reader =
+                    ArrowResultReader::from_inline_data(reader_schema.clone(), Some(chunk))
+                        .map_err(|e| {
+                            Error::with_message_and_status(
+                                format!("Failed to parse DESCRIBE result: {}", e),
+                                Status::Internal,
+                            )
+                        })?;
+
+                return self.extract_schema_from_describe_batches(reader);
+            }
+        }
+
+        // Try external links if no inline data
+        if let Some(ref external_links) = result.external_links {
+            if !external_links.is_empty() {
+                let reader_schema = self.build_describe_manifest_schema(response)?;
+
+                // Use ChunkFetcher to download the Arrow IPC data from external links
+                let fetcher = ChunkFetcher::new(self.client.clone(), 1).map_err(|e| {
+                    Error::with_message_and_status(
+                        format!("Failed to create chunk fetcher: {}", e),
+                        Status::Internal,
+                    )
+                })?;
+
+                let manifest = response.manifest.as_ref();
+                let statement_id = &response.statement_id;
+                let links = external_links.clone();
+                let runtime = self.runtime.clone();
+
+                // Fetch chunks using the runtime
+                let batches = block_on_async(&runtime, async move {
+                    fetcher
+                        .fetch_chunks(
+                            statement_id,
+                            manifest.unwrap_or(&Default::default()),
+                            &links,
+                        )
+                        .await
+                })
+                .map_err(|e| {
+                    Error::with_message_and_status(
+                        format!("Failed to fetch DESCRIBE result chunks: {}", e),
+                        Status::IO,
+                    )
+                })?;
+
+                let reader = ArrowResultReader::new(reader_schema, batches);
+                return self.extract_schema_from_describe_batches(reader);
+            }
+        }
+
+        // No data - return empty schema
+        Ok(Schema::empty())
+    }
+
+    /// Build schema for the DESCRIBE TABLE result from the manifest.
+    fn build_describe_manifest_schema(&self, response: &StatementResponse) -> Result<Schema> {
+        use arrow_schema::{DataType, Field};
+
+        let manifest = match &response.manifest {
+            Some(m) => m,
+            None => {
+                // Default DESCRIBE TABLE schema if no manifest
+                return Ok(Schema::new(vec![
+                    Field::new("col_name", DataType::Utf8, false),
+                    Field::new("data_type", DataType::Utf8, false),
+                    Field::new("comment", DataType::Utf8, true),
+                ]));
+            }
+        };
+
+        let result_schema = match &manifest.schema {
+            Some(s) => s,
+            None => {
+                return Ok(Schema::new(vec![
+                    Field::new("col_name", DataType::Utf8, false),
+                    Field::new("data_type", DataType::Utf8, false),
+                    Field::new("comment", DataType::Utf8, true),
+                ]));
+            }
+        };
+
+        let columns = match &result_schema.columns {
+            Some(c) => c,
+            None => {
+                return Ok(Schema::new(vec![
+                    Field::new("col_name", DataType::Utf8, false),
+                    Field::new("data_type", DataType::Utf8, false),
+                    Field::new("comment", DataType::Utf8, true),
+                ]));
+            }
+        };
+
+        // Build schema from manifest columns
+        let fields: Vec<Field> = columns
+            .iter()
+            .map(|col| Field::new(&col.name, DataType::Utf8, true))
+            .collect();
+
+        Ok(Schema::new(fields))
+    }
+
+    /// Extract the table schema from DESCRIBE TABLE result batches.
+    ///
+    /// DESCRIBE TABLE returns rows like:
+    /// | col_name | data_type | comment |
+    /// | id       | int       | null    |
+    /// | name     | string    | null    |
+    fn extract_schema_from_describe_batches(
+        &self,
+        reader: impl RecordBatchReader,
+    ) -> Result<Schema> {
+        use arrow_array::cast::AsArray;
+        use arrow_schema::Field;
+
+        let mut fields = Vec::new();
+
+        for batch_result in reader {
+            let batch = batch_result.map_err(|e| {
+                Error::with_message_and_status(
+                    format!("Failed to read DESCRIBE result batch: {}", e),
+                    Status::Internal,
+                )
+            })?;
+
+            // Find col_name and data_type column indices
+            let schema = batch.schema();
+            let col_name_idx = schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == "col_name")
+                .ok_or_else(|| {
+                    Error::with_message_and_status(
+                        "DESCRIBE result missing 'col_name' column",
+                        Status::Internal,
+                    )
+                })?;
+
+            let data_type_idx = schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == "data_type")
+                .ok_or_else(|| {
+                    Error::with_message_and_status(
+                        "DESCRIBE result missing 'data_type' column",
+                        Status::Internal,
+                    )
+                })?;
+
+            // Get the columns as string arrays
+            let col_names = batch.column(col_name_idx).as_string::<i32>();
+            let data_types = batch.column(data_type_idx).as_string::<i32>();
+
+            // Process each row
+            for row_idx in 0..batch.num_rows() {
+                let col_name = col_names.value(row_idx);
+                let type_str = data_types.value(row_idx);
+
+                // Skip partition info separator and partition columns
+                // DESCRIBE TABLE returns column info followed by partition info
+                // The separator looks like: "# Partition Information", "# col_name", etc.
+                if col_name.starts_with('#') || col_name.is_empty() {
+                    continue;
+                }
+
+                // Map Spark SQL type to Arrow type
+                let arrow_type = Self::spark_type_to_arrow(type_str);
+                fields.push(Field::new(col_name, arrow_type, true));
+            }
+        }
+
+        Ok(Schema::new(fields))
+    }
+
+    /// Map a Spark SQL type string to an Arrow DataType.
+    ///
+    /// Handles types like:
+    /// - Simple types: int, bigint, string, boolean, double, float, etc.
+    /// - Parameterized types: decimal(10,2), varchar(100), char(10)
+    /// - Complex types: array<int>, map<string,int>, struct<a:int,b:string>
+    pub(crate) fn spark_type_to_arrow(spark_type: &str) -> arrow_schema::DataType {
+        use arrow_schema::{DataType, TimeUnit};
+
+        let type_lower = spark_type.to_lowercase();
+        let type_str = type_lower.trim();
+
+        // Handle simple types first
+        match type_str {
+            "boolean" | "bool" => DataType::Boolean,
+            "tinyint" | "byte" => DataType::Int8,
+            "smallint" | "short" => DataType::Int16,
+            "int" | "integer" => DataType::Int32,
+            "bigint" | "long" => DataType::Int64,
+            "float" | "real" => DataType::Float32,
+            "double" => DataType::Float64,
+            "string" => DataType::Utf8,
+            "binary" => DataType::Binary,
+            "date" => DataType::Date32,
+            "timestamp" | "timestamp_ltz" => DataType::Timestamp(TimeUnit::Microsecond, None),
+            "timestamp_ntz" => DataType::Timestamp(TimeUnit::Microsecond, None),
+            "void" | "null" => DataType::Null,
+            _ => {
+                // Handle parameterized types
+                if type_str.starts_with("decimal") {
+                    // Parse decimal(precision, scale)
+                    Self::parse_decimal_type(type_str)
+                } else if type_str.starts_with("varchar") || type_str.starts_with("char") {
+                    // VARCHAR and CHAR map to Utf8
+                    DataType::Utf8
+                } else if type_str.starts_with("array<") {
+                    // Parse array<element_type>
+                    Self::parse_array_type(type_str)
+                } else if type_str.starts_with("map<") {
+                    // Parse map<key_type, value_type>
+                    Self::parse_map_type(type_str)
+                } else if type_str.starts_with("struct<") {
+                    // Parse struct<field1:type1, field2:type2>
+                    Self::parse_struct_type(type_str)
+                } else {
+                    // Default to string for unknown types
+                    DataType::Utf8
+                }
+            }
+        }
+    }
+
+    /// Parse a decimal type string like "decimal(10,2)" into Decimal128.
+    fn parse_decimal_type(type_str: &str) -> arrow_schema::DataType {
+        use arrow_schema::DataType;
+
+        // Default precision and scale
+        let mut precision: u8 = 38;
+        let mut scale: i8 = 18;
+
+        // Try to parse decimal(precision, scale)
+        if let Some(params) = type_str.strip_prefix("decimal(") {
+            if let Some(params) = params.strip_suffix(')') {
+                let parts: Vec<&str> = params.split(',').collect();
+                if parts.len() >= 1 {
+                    if let Ok(p) = parts[0].trim().parse::<u8>() {
+                        precision = p;
+                    }
+                }
+                if parts.len() >= 2 {
+                    if let Ok(s) = parts[1].trim().parse::<i8>() {
+                        scale = s;
+                    }
+                }
+            }
+        }
+
+        DataType::Decimal128(precision, scale)
+    }
+
+    /// Parse an array type string like "array<int>" into a List type.
+    fn parse_array_type(type_str: &str) -> arrow_schema::DataType {
+        use arrow_schema::{DataType, Field};
+
+        if let Some(inner) = type_str.strip_prefix("array<") {
+            if let Some(inner) = inner.strip_suffix('>') {
+                let element_type = Self::spark_type_to_arrow(inner.trim());
+                return DataType::List(Arc::new(Field::new("item", element_type, true)));
+            }
+        }
+
+        // Fallback
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+    }
+
+    /// Parse a map type string like "map<string,int>" into a Map type.
+    fn parse_map_type(type_str: &str) -> arrow_schema::DataType {
+        use arrow_schema::{DataType, Field, Fields};
+
+        if let Some(inner) = type_str.strip_prefix("map<") {
+            if let Some(inner) = inner.strip_suffix('>') {
+                // Split on first comma (simple approach - doesn't handle nested types perfectly)
+                if let Some(comma_pos) = Self::find_top_level_comma(inner) {
+                    let key_type_str = &inner[..comma_pos];
+                    let value_type_str = &inner[comma_pos + 1..];
+
+                    let key_type = Self::spark_type_to_arrow(key_type_str.trim());
+                    let value_type = Self::spark_type_to_arrow(value_type_str.trim());
+
+                    let struct_field = Field::new(
+                        "entries",
+                        DataType::Struct(Fields::from(vec![
+                            Field::new("key", key_type, false),
+                            Field::new("value", value_type, true),
+                        ])),
+                        false,
+                    );
+
+                    return DataType::Map(Arc::new(struct_field), false);
+                }
+            }
+        }
+
+        // Fallback
+        let struct_field = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Utf8, true),
+            ])),
+            false,
+        );
+        DataType::Map(Arc::new(struct_field), false)
+    }
+
+    /// Parse a struct type string like "struct<a:int,b:string>" into a Struct type.
+    fn parse_struct_type(type_str: &str) -> arrow_schema::DataType {
+        use arrow_schema::{DataType, Field, Fields};
+
+        if let Some(inner) = type_str.strip_prefix("struct<") {
+            if let Some(inner) = inner.strip_suffix('>') {
+                let mut fields = Vec::new();
+
+                // Split fields on top-level commas
+                let field_strs = Self::split_on_top_level_commas(inner);
+
+                for field_str in field_strs {
+                    let field_str = field_str.trim();
+                    // Each field is "name:type"
+                    if let Some(colon_pos) = field_str.find(':') {
+                        let name = &field_str[..colon_pos];
+                        let type_str = &field_str[colon_pos + 1..];
+                        let data_type = Self::spark_type_to_arrow(type_str.trim());
+                        fields.push(Field::new(name.trim(), data_type, true));
+                    }
+                }
+
+                if !fields.is_empty() {
+                    return DataType::Struct(Fields::from(fields));
+                }
+            }
+        }
+
+        // Fallback - empty struct
+        DataType::Struct(Fields::empty())
+    }
+
+    /// Find the position of a top-level comma (not inside angle brackets).
+    fn find_top_level_comma(s: &str) -> Option<usize> {
+        let mut depth = 0;
+        for (i, c) in s.char_indices() {
+            match c {
+                '<' => depth += 1,
+                '>' => depth -= 1,
+                ',' if depth == 0 => return Some(i),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Split a string on top-level commas (not inside angle brackets).
+    fn split_on_top_level_commas(s: &str) -> Vec<&str> {
+        let mut result = Vec::new();
+        let mut depth = 0;
+        let mut start = 0;
+
+        for (i, c) in s.char_indices() {
+            match c {
+                '<' => depth += 1,
+                '>' => depth -= 1,
+                ',' if depth == 0 => {
+                    result.push(&s[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+
+        // Don't forget the last segment
+        if start < s.len() {
+            result.push(&s[start..]);
+        }
+
+        result
     }
 }
 
@@ -430,15 +841,59 @@ impl Connection for DatabricksConnection {
 
     fn get_table_schema(
         &self,
-        _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: &str,
+        catalog: Option<&str>,
+        db_schema: Option<&str>,
+        table_name: &str,
     ) -> Result<Schema> {
-        // TODO: Implement table schema retrieval
-        Err(Error::with_message_and_status(
-            "get_table_schema not yet implemented",
-            Status::NotImplemented,
-        ))
+        // Build fully qualified table name
+        // Use provided values or fall back to connection defaults, then to hardcoded defaults
+        let catalog_name = catalog
+            .or(self.current_catalog.as_deref())
+            .unwrap_or("main");
+        let schema_name = db_schema
+            .or(self.current_schema.as_deref())
+            .unwrap_or("default");
+
+        // Construct the DESCRIBE TABLE query
+        // Use backtick quoting to handle special characters in identifiers
+        let sql = format!(
+            "DESCRIBE TABLE `{}`.`{}`.`{}`",
+            catalog_name, schema_name, table_name
+        );
+
+        // Execute the DESCRIBE query using a statement
+        // We need to create a mutable copy of self for new_statement, but since
+        // Connection::get_table_schema takes &self, we work around this by using
+        // the internal components directly
+        let session_manager = self.session_manager.clone();
+        let client = self.client.clone();
+        let runtime = self.runtime.clone();
+
+        // Get session ID
+        let session_id =
+            block_on_async(&runtime, async move { session_manager.get_session_id().await })
+                .map_err(|e| {
+                    Error::with_message_and_status(
+                        format!("Failed to get session: {}", e),
+                        Status::IO,
+                    )
+                })?;
+
+        // Execute the DESCRIBE statement
+        let response = block_on_async(&runtime, async move {
+            client
+                .execute_and_wait(&session_id, &sql, None, None, None)
+                .await
+        })
+        .map_err(|e| {
+            Error::with_message_and_status(
+                format!("Failed to execute DESCRIBE TABLE: {}", e),
+                Status::IO,
+            )
+        })?;
+
+        // Parse the DESCRIBE result into an Arrow Schema
+        self.describe_result_to_schema(&response)
     }
 
     fn get_table_types(&self) -> Result<impl RecordBatchReader + Send> {
@@ -1438,5 +1893,342 @@ mod tests {
         .expect("spawn_blocking failed");
 
         assert!(stmt_is_ok, "new_statement() should succeed");
+    }
+
+    // ============================================================================
+    // Spark Type Mapping Tests
+    // ============================================================================
+
+    #[test]
+    fn test_spark_type_to_arrow_simple_types() {
+        use arrow_schema::{DataType, TimeUnit};
+
+        // Boolean types
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("boolean"),
+            DataType::Boolean
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("BOOLEAN"),
+            DataType::Boolean
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("bool"),
+            DataType::Boolean
+        );
+
+        // Integer types
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("tinyint"),
+            DataType::Int8
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("byte"),
+            DataType::Int8
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("smallint"),
+            DataType::Int16
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("short"),
+            DataType::Int16
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("int"),
+            DataType::Int32
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("integer"),
+            DataType::Int32
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("bigint"),
+            DataType::Int64
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("long"),
+            DataType::Int64
+        );
+
+        // Floating point types
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("float"),
+            DataType::Float32
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("real"),
+            DataType::Float32
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("double"),
+            DataType::Float64
+        );
+
+        // String and binary types
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("string"),
+            DataType::Utf8
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("binary"),
+            DataType::Binary
+        );
+
+        // Date and timestamp types
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("date"),
+            DataType::Date32
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("timestamp"),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("timestamp_ltz"),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("timestamp_ntz"),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+
+        // Null types
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("void"),
+            DataType::Null
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("null"),
+            DataType::Null
+        );
+    }
+
+    #[test]
+    fn test_spark_type_to_arrow_decimal() {
+        use arrow_schema::DataType;
+
+        // Default decimal (no params)
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("decimal"),
+            DataType::Decimal128(38, 18)
+        );
+
+        // Decimal with precision and scale
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("decimal(10,2)"),
+            DataType::Decimal128(10, 2)
+        );
+
+        // Decimal with different precision/scale
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("decimal(38,10)"),
+            DataType::Decimal128(38, 10)
+        );
+
+        // Decimal with spaces
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("decimal( 5 , 3 )"),
+            DataType::Decimal128(5, 3)
+        );
+    }
+
+    #[test]
+    fn test_spark_type_to_arrow_varchar_char() {
+        use arrow_schema::DataType;
+
+        // VARCHAR maps to Utf8
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("varchar(100)"),
+            DataType::Utf8
+        );
+
+        // CHAR maps to Utf8
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("char(10)"),
+            DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn test_spark_type_to_arrow_array() {
+        use arrow_schema::DataType;
+
+        // Array of int
+        let arr_type = DatabricksConnection::spark_type_to_arrow("array<int>");
+        match arr_type {
+            DataType::List(field) => {
+                assert_eq!(field.data_type(), &DataType::Int32);
+            }
+            _ => panic!("Expected List type, got {:?}", arr_type),
+        }
+
+        // Array of string
+        let arr_type = DatabricksConnection::spark_type_to_arrow("array<string>");
+        match arr_type {
+            DataType::List(field) => {
+                assert_eq!(field.data_type(), &DataType::Utf8);
+            }
+            _ => panic!("Expected List type, got {:?}", arr_type),
+        }
+
+        // Nested array
+        let arr_type = DatabricksConnection::spark_type_to_arrow("array<array<int>>");
+        match arr_type {
+            DataType::List(field) => match field.data_type() {
+                DataType::List(inner) => {
+                    assert_eq!(inner.data_type(), &DataType::Int32);
+                }
+                _ => panic!("Expected nested List type"),
+            },
+            _ => panic!("Expected List type, got {:?}", arr_type),
+        }
+    }
+
+    #[test]
+    fn test_spark_type_to_arrow_map() {
+        use arrow_schema::DataType;
+
+        // Map<string,int>
+        let map_type = DatabricksConnection::spark_type_to_arrow("map<string,int>");
+        match map_type {
+            DataType::Map(field, _) => match field.data_type() {
+                DataType::Struct(fields) => {
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields[0].name(), "key");
+                    assert_eq!(fields[0].data_type(), &DataType::Utf8);
+                    assert_eq!(fields[1].name(), "value");
+                    assert_eq!(fields[1].data_type(), &DataType::Int32);
+                }
+                _ => panic!("Expected Struct inside Map"),
+            },
+            _ => panic!("Expected Map type, got {:?}", map_type),
+        }
+    }
+
+    #[test]
+    fn test_spark_type_to_arrow_struct() {
+        use arrow_schema::DataType;
+
+        // Simple struct
+        let struct_type =
+            DatabricksConnection::spark_type_to_arrow("struct<a:int,b:string>");
+        match struct_type {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].name(), "a");
+                assert_eq!(fields[0].data_type(), &DataType::Int32);
+                assert_eq!(fields[1].name(), "b");
+                assert_eq!(fields[1].data_type(), &DataType::Utf8);
+            }
+            _ => panic!("Expected Struct type, got {:?}", struct_type),
+        }
+
+        // Struct with nested array
+        let struct_type =
+            DatabricksConnection::spark_type_to_arrow("struct<id:int,tags:array<string>>");
+        match struct_type {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].name(), "id");
+                assert_eq!(fields[0].data_type(), &DataType::Int32);
+                assert_eq!(fields[1].name(), "tags");
+                match fields[1].data_type() {
+                    DataType::List(inner) => {
+                        assert_eq!(inner.data_type(), &DataType::Utf8);
+                    }
+                    _ => panic!("Expected List for tags field"),
+                }
+            }
+            _ => panic!("Expected Struct type, got {:?}", struct_type),
+        }
+    }
+
+    #[test]
+    fn test_spark_type_to_arrow_unknown_defaults_to_string() {
+        use arrow_schema::DataType;
+
+        // Unknown type should default to Utf8
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("unknown_type"),
+            DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn test_spark_type_to_arrow_case_insensitive() {
+        use arrow_schema::DataType;
+
+        // Uppercase
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("INT"),
+            DataType::Int32
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("STRING"),
+            DataType::Utf8
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("BIGINT"),
+            DataType::Int64
+        );
+
+        // Mixed case
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("Int"),
+            DataType::Int32
+        );
+        assert_eq!(
+            DatabricksConnection::spark_type_to_arrow("String"),
+            DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn test_split_on_top_level_commas() {
+        // Simple split
+        let result = DatabricksConnection::split_on_top_level_commas("a,b,c");
+        assert_eq!(result, vec!["a", "b", "c"]);
+
+        // Split with nested angle brackets
+        let result = DatabricksConnection::split_on_top_level_commas("a:int,b:array<string>");
+        assert_eq!(result, vec!["a:int", "b:array<string>"]);
+
+        // Deeply nested
+        let result =
+            DatabricksConnection::split_on_top_level_commas("a:int,b:map<string,array<int>>,c:double");
+        assert_eq!(result, vec!["a:int", "b:map<string,array<int>>", "c:double"]);
+
+        // Single element
+        let result = DatabricksConnection::split_on_top_level_commas("a:int");
+        assert_eq!(result, vec!["a:int"]);
+
+        // Empty string
+        let result = DatabricksConnection::split_on_top_level_commas("");
+        assert!(result.is_empty() || result == vec![""]);
+    }
+
+    #[test]
+    fn test_find_top_level_comma() {
+        // Simple case
+        assert_eq!(
+            DatabricksConnection::find_top_level_comma("string,int"),
+            Some(6)
+        );
+
+        // Nested - should find after the nested type
+        assert_eq!(
+            DatabricksConnection::find_top_level_comma("array<int>,string"),
+            Some(10)
+        );
+
+        // No comma
+        assert_eq!(DatabricksConnection::find_top_level_comma("string"), None);
+
+        // Comma inside nested type should be ignored
+        assert_eq!(
+            DatabricksConnection::find_top_level_comma("map<string,int>"),
+            None
+        );
     }
 }
