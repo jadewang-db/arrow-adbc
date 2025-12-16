@@ -418,7 +418,7 @@ fn test_e2e_sea_client_auth_error() {
     // Verify we got an authentication error
     match result {
         Ok(_) => panic!("Expected authentication error, but request succeeded"),
-        Err(Error::SeaApi { http_status, code, message }) => {
+        Err(Error::SeaApi { http_status, code, message, .. }) => {
             println!("Got expected authentication error:");
             println!("  HTTP Status: {}", http_status);
             println!("  Error Code: {}", code);

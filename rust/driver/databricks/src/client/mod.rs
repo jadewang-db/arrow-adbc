@@ -29,6 +29,7 @@
 
 pub mod error;
 pub mod models;
+pub mod retry;
 
 use std::time::Duration;
 
@@ -41,6 +42,7 @@ use crate::error::{Error, Result};
 
 pub use error::ApiError;
 pub use models::*;
+pub use retry::{parse_retry_after, RetryConfig};
 
 /// Driver version for User-Agent header.
 const DRIVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -432,8 +434,20 @@ impl SeaClient {
     ///
     /// Parses the error body to extract the error code and message,
     /// then returns an appropriate [`Error::SeaApi`] error.
+    /// For 429 responses, also extracts the Retry-After header if present.
     async fn handle_error_response<T>(&self, response: reqwest::Response) -> Result<T> {
         let http_status = response.status().as_u16();
+
+        // Extract Retry-After header for 429 responses
+        let retry_after = if http_status == 429 {
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_retry_after)
+        } else {
+            None
+        };
 
         // Try to parse the error body as JSON
         let body: serde_json::Value = response
@@ -456,6 +470,7 @@ impl SeaClient {
             code,
             message,
             http_status,
+            retry_after,
         })
     }
 
@@ -571,6 +586,80 @@ impl SeaClient {
         let url = self.session_url(session_id);
         let params = [("warehouse_id", &self.warehouse_id)];
         self.delete_with_params(&url, &params).await
+    }
+
+    // ========================================================================
+    // Retry Logic
+    // ========================================================================
+
+    /// Execute an async operation with retry logic.
+    ///
+    /// This method wraps an async operation and automatically retries it
+    /// on transient errors (as determined by [`Error::is_retryable`]).
+    /// It uses exponential backoff with jitter to calculate delays between
+    /// retries.
+    ///
+    /// # Arguments
+    ///
+    /// * `retry_config` - Configuration for retry behavior
+    /// * `operation` - A closure that returns a future producing a `Result<T>`
+    ///
+    /// # Returns
+    ///
+    /// The successful result, or the last error if all retries are exhausted.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use adbc_databricks::client::{SeaClient, RetryConfig};
+    ///
+    /// let client = SeaClient::new(config)?;
+    /// let retry_config = RetryConfig::default();
+    ///
+    /// let result = client.with_retry(&retry_config, || async {
+    ///     client.get_statement("stmt-123").await
+    /// }).await?;
+    /// ```
+    ///
+    /// # Retry Behavior
+    ///
+    /// - Retries only on errors where [`Error::is_retryable`] returns `true`
+    /// - Delays between retries follow exponential backoff with jitter
+    /// - For 429 errors with Retry-After header, uses the server-specified delay
+    /// - Stops retrying after `max_retries` attempts
+    pub async fn with_retry<F, Fut, T>(&self, retry_config: &RetryConfig, mut operation: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let mut last_error = None;
+
+        for attempt in 0..=retry_config.max_retries {
+            match operation().await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    // Check if we should retry
+                    if !e.is_retryable() || attempt == retry_config.max_retries {
+                        return Err(e);
+                    }
+
+                    // Calculate delay - use Retry-After if available, otherwise exponential backoff
+                    let delay = if let Some(retry_after) = e.retry_after() {
+                        retry_config.delay_with_retry_after(retry_after)
+                    } else {
+                        retry_config.delay_for_attempt(attempt)
+                    };
+
+                    tokio::time::sleep(delay).await;
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // This should never be reached because we return Err in the loop
+        // when attempt == retry_config.max_retries, but we need this for
+        // the type checker when max_retries is 0
+        Err(last_error.expect("No error recorded but retry loop exited"))
     }
 }
 
@@ -768,5 +857,198 @@ mod tests {
 
         assert_eq!(client1.host(), client2.host());
         assert_eq!(client1.warehouse_id(), client2.warehouse_id());
+    }
+
+    // ========================================================================
+    // Retry Logic Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_retry_success_on_first_attempt() {
+        let client = create_test_client();
+        let retry_config = RetryConfig::default();
+
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+
+        let result = client
+            .with_retry(&retry_config, || {
+                call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok::<_, Error>(42) }
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_retry_success_after_transient_failures() {
+        let client = create_test_client();
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(10), // Short delay for tests
+            max_delay: Duration::from_millis(100),
+            jitter: 0.0,
+        };
+
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+
+        let result = client
+            .with_retry(&retry_config, || {
+                let count = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if count < 2 {
+                        // First two attempts fail with retryable error
+                        Err(Error::SeaApi {
+                            code: "TEMPORARILY_UNAVAILABLE".into(),
+                            message: "Service unavailable".into(),
+                            http_status: 503,
+                            retry_after: None,
+                        })
+                    } else {
+                        // Third attempt succeeds
+                        Ok(42)
+                    }
+                }
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_retry_exhausted() {
+        let client = create_test_client();
+        let retry_config = RetryConfig {
+            max_retries: 2,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(100),
+            jitter: 0.0,
+        };
+
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+
+        let result = client
+            .with_retry(&retry_config, || {
+                call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    Err::<i32, _>(Error::SeaApi {
+                        code: "INTERNAL_ERROR".into(),
+                        message: "Server error".into(),
+                        http_status: 500,
+                        retry_after: None,
+                    })
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        // 1 initial + 2 retries = 3 total calls
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_non_retryable_fails_immediately() {
+        let client = create_test_client();
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(100),
+            jitter: 0.0,
+        };
+
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+
+        let result = client
+            .with_retry(&retry_config, || {
+                call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    // 400 is not retryable
+                    Err::<i32, _>(Error::SeaApi {
+                        code: "BAD_REQUEST".into(),
+                        message: "Invalid SQL".into(),
+                        http_status: 400,
+                        retry_after: None,
+                    })
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        // Should fail immediately without retries
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_retry_with_retry_after_header() {
+        let client = create_test_client();
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(100), // This should be overridden
+            max_delay: Duration::from_millis(500),
+            jitter: 0.0,
+        };
+
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+        let start = std::time::Instant::now();
+
+        let result = client
+            .with_retry(&retry_config, || {
+                let count = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if count < 1 {
+                        // First attempt fails with 429 and Retry-After
+                        Err(Error::SeaApi {
+                            code: "REQUEST_LIMIT_EXCEEDED".into(),
+                            message: "Rate limited".into(),
+                            http_status: 429,
+                            retry_after: Some(Duration::from_millis(50)), // Short delay for test
+                        })
+                    } else {
+                        Ok(42)
+                    }
+                }
+            })
+            .await;
+
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Should have waited approximately 50ms (the Retry-After value)
+        // not 100ms (the base_delay)
+        assert!(elapsed >= Duration::from_millis(40), "Elapsed: {:?}", elapsed);
+        assert!(elapsed < Duration::from_millis(200), "Elapsed: {:?}", elapsed);
+    }
+
+    #[tokio::test]
+    async fn test_retry_no_retry_config() {
+        let client = create_test_client();
+        let retry_config = RetryConfig::no_retry();
+
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+
+        let result = client
+            .with_retry(&retry_config, || {
+                call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    Err::<i32, _>(Error::SeaApi {
+                        code: "INTERNAL_ERROR".into(),
+                        message: "Server error".into(),
+                        http_status: 500,
+                        retry_after: None,
+                    })
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        // With max_retries = 0, should only call once
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

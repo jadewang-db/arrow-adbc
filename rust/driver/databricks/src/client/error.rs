@@ -109,6 +109,7 @@ mod tests {
                 code,
                 message,
                 http_status,
+                ..
             } => {
                 assert_eq!(code, "BAD_REQUEST");
                 assert_eq!(message, "Invalid SQL syntax");
@@ -136,6 +137,7 @@ mod tests {
                 code,
                 message,
                 http_status,
+                ..
             } => {
                 assert_eq!(code, "REQUEST_LIMIT_EXCEEDED");
                 assert_eq!(message, "Rate limit exceeded");

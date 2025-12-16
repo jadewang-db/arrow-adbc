@@ -60,6 +60,8 @@ pub enum Error {
         message: String,
         /// The HTTP status code (e.g., 400, 401, 500)
         http_status: u16,
+        /// Optional Retry-After duration from the response header (for 429 responses)
+        retry_after: Option<std::time::Duration>,
     },
 
     /// Arrow error during data processing.
@@ -187,6 +189,46 @@ impl Error {
             code: code.into(),
             message: message.into(),
             http_status,
+            retry_after: None,
+        }
+    }
+
+    /// Create a new SEA API error with a Retry-After duration.
+    ///
+    /// # Arguments
+    ///
+    /// * `code` - The error code from the SEA API
+    /// * `message` - The human-readable error message
+    /// * `http_status` - The HTTP status code
+    /// * `retry_after` - Optional Retry-After duration from response header
+    ///
+    /// # Returns
+    ///
+    /// A new [`Error::SeaApi`] variant.
+    pub fn sea_api_with_retry_after(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        http_status: u16,
+        retry_after: Option<std::time::Duration>,
+    ) -> Self {
+        Error::SeaApi {
+            code: code.into(),
+            message: message.into(),
+            http_status,
+            retry_after,
+        }
+    }
+
+    /// Get the Retry-After duration if this is a rate-limited error.
+    ///
+    /// # Returns
+    ///
+    /// The Retry-After duration if this is a SEA API error with a retry_after value,
+    /// `None` otherwise.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Error::SeaApi { retry_after, .. } => *retry_after,
+            _ => None,
         }
     }
 
@@ -263,6 +305,7 @@ mod tests {
             code: "BAD_REQUEST".into(),
             message: "Invalid SQL".into(),
             http_status: 400,
+            retry_after: None,
         };
         assert_eq!(err.to_adbc_status(), Status::InvalidArguments);
     }
@@ -273,11 +316,13 @@ mod tests {
             code: "REQUEST_LIMIT_EXCEEDED".into(),
             message: "Rate limited".into(),
             http_status: 429,
+            retry_after: None,
         };
         let err_400 = Error::SeaApi {
             code: "BAD_REQUEST".into(),
             message: "Invalid request".into(),
             http_status: 400,
+            retry_after: None,
         };
         assert!(err_429.is_retryable());
         assert!(!err_400.is_retryable());
@@ -301,6 +346,7 @@ mod tests {
                 code: code.into(),
                 message: "test".into(),
                 http_status,
+                retry_after: None,
             };
             assert_eq!(
                 err.to_adbc_status(),
@@ -351,6 +397,7 @@ mod tests {
             code: "BAD_REQUEST".into(),
             message: "Invalid SQL syntax at position 42".into(),
             http_status: 400,
+            retry_after: None,
         };
         let display = err.to_string();
         assert!(
@@ -375,6 +422,7 @@ mod tests {
             code: "NOT_FOUND".into(),
             message: "Table not found".into(),
             http_status: 404,
+            retry_after: None,
         };
         let adbc_err: adbc_core::error::Error = err.into();
 
@@ -392,13 +440,47 @@ mod tests {
                 code,
                 message,
                 http_status,
+                retry_after,
             } => {
                 assert_eq!(code, "INTERNAL_ERROR");
                 assert_eq!(message, "Something went wrong");
                 assert_eq!(http_status, 500);
+                assert_eq!(retry_after, None);
             }
             _ => panic!("Expected SeaApi variant"),
         }
+    }
+
+    #[test]
+    fn test_sea_api_constructor_with_retry_after() {
+        let retry_duration = std::time::Duration::from_secs(60);
+        let err = Error::sea_api_with_retry_after(
+            "REQUEST_LIMIT_EXCEEDED",
+            "Rate limited",
+            429,
+            Some(retry_duration),
+        );
+        match &err {
+            Error::SeaApi {
+                code,
+                message,
+                http_status,
+                retry_after,
+            } => {
+                assert_eq!(code, "REQUEST_LIMIT_EXCEEDED");
+                assert_eq!(message, "Rate limited");
+                assert_eq!(*http_status, 429);
+                assert_eq!(*retry_after, Some(retry_duration));
+            }
+            _ => panic!("Expected SeaApi variant"),
+        }
+
+        // Test retry_after accessor
+        assert_eq!(err.retry_after(), Some(retry_duration));
+
+        // Test that non-SeaApi errors return None
+        let config_err = Error::config("test");
+        assert_eq!(config_err.retry_after(), None);
     }
 
     #[test]
@@ -435,6 +517,7 @@ mod tests {
             code: "UNKNOWN".into(),
             message: "Unknown error".into(),
             http_status: 418, // I'm a teapot
+            retry_after: None,
         };
         assert_eq!(err.to_adbc_status(), Status::Unknown);
         assert!(!err.is_retryable());
@@ -447,6 +530,7 @@ mod tests {
             code: "UNAUTHENTICATED".into(),
             message: "Token expired".into(),
             http_status: 401,
+            retry_after: None,
         };
         // Note: Currently marked as retryable in the design for "once (refresh)"
         // but in implementation, we track this separately for token refresh logic

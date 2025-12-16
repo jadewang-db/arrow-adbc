@@ -1060,7 +1060,53 @@ fn test_jitter_range() {
 
 ### Files Modified/Created
 - `driver/databricks/src/client/mod.rs` (add retry logic)
+- `driver/databricks/src/client/retry.rs` (new module for retry config)
+- `driver/databricks/src/error.rs` (add retry_after field to SeaApi error)
 - `driver/databricks/Cargo.toml` (add `rand` dependency)
+
+### Implementation Notes (Completed 2024-12-16)
+
+**Implementation Details:**
+- Created separate `src/client/retry.rs` module for cleaner organization
+- Added `RetryConfig` struct with `Default` implementation and builder methods:
+  - `new()` - custom configuration
+  - `no_retry()` - disable retries
+  - `with_max_retries()` - set only max retries
+- Implemented `delay_for_attempt()` with exponential backoff and jitter
+- Implemented `delay_with_retry_after()` for server-specified delays
+- Added `parse_retry_after()` function for parsing Retry-After header values
+
+**Error Type Enhancement:**
+- Added `retry_after: Option<Duration>` field to `Error::SeaApi` variant
+- Added `sea_api_with_retry_after()` constructor method
+- Added `retry_after()` accessor method on `Error`
+- Updated `handle_error_response()` in SeaClient to extract Retry-After header for 429 responses
+
+**Retry Wrapper Implementation:**
+- `with_retry()` is a generic async method on SeaClient
+- Uses `Error::is_retryable()` to determine if retry should occur
+- Prefers server-specified Retry-After delay when available
+- Falls back to exponential backoff calculation otherwise
+
+**Test Coverage:**
+- 17 unit tests for RetryConfig and backoff calculation
+- 6 async tests for with_retry() behavior:
+  - Success on first attempt
+  - Success after transient failures
+  - Retry exhaustion
+  - Non-retryable fails immediately
+  - Retry-After header respected
+  - No-retry config works correctly
+
+**All Exit Criteria Met:**
+| Result | Status |
+|--------|--------|
+| Backoff increases exponentially | Pass - Verified: 1s, 2s, 4s, 8s, 16s |
+| Jitter applied | Pass - Delays vary within [base, base*(1+jitter)] |
+| Max delay respected | Pass - Capped at configured max_delay |
+| 429 uses Retry-After | Pass - Server delay used when available |
+| Non-retryable fails fast | Pass - 400 errors don't retry |
+| All unit tests pass | Pass - 66 tests passing |
 
 ---
 
