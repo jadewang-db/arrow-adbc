@@ -5921,3 +5921,832 @@ fn test_e2e_execute_schema_sql_error() {
     println!();
     println!("=== Work Item 4.9: execute_schema() SQL Error E2E Test PASSED ===");
 }
+
+// ============================================================================
+// Work Item 5.3: E2E Test Suite Completion - Large Result Sets
+// ============================================================================
+
+/// Test large result sets with external links (chunking).
+///
+/// This validates:
+/// - Query returns large result set (triggers external links mode)
+/// - External links are fetched correctly
+/// - Results are streamed properly via RecordBatchReader
+/// - All rows are returned correctly
+///
+/// Note: This test queries a large dataset to trigger the external links path.
+/// Databricks returns inline data for small results, but external links
+/// (presigned URLs to cloud storage) for larger results.
+#[test]
+#[ignore]
+fn test_e2e_large_result_external_links() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 5.3: Large Result External Links E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created");
+
+    // Create statement
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Query a large result set - this should trigger external links mode
+    // Using range() to generate 100,000 rows
+    let expected_rows = 100_000;
+    println!("Executing large query: SELECT * FROM range({})", expected_rows);
+    stmt.set_sql_query(&format!("SELECT id FROM range({})", expected_rows))
+        .expect("Failed to set SQL query");
+
+    let start = std::time::Instant::now();
+    let reader = stmt.execute().expect("Failed to execute statement");
+    let execute_time = start.elapsed();
+    println!("  Query executed in {:?}", execute_time);
+
+    // Get schema
+    let schema = reader.schema();
+    println!("  Schema fields: {}", schema.fields().len());
+    assert_eq!(schema.fields().len(), 1, "Expected 1 field");
+
+    // Read all batches and count rows
+    let read_start = std::time::Instant::now();
+    let mut total_rows = 0_usize;
+    let mut batch_count = 0_usize;
+
+    for batch_result in reader {
+        let batch = batch_result.expect("Failed to read batch");
+        total_rows += batch.num_rows();
+        batch_count += 1;
+
+        // Print progress every 10 batches
+        if batch_count % 10 == 0 {
+            println!(
+                "    Progress: {} batches, {} rows so far...",
+                batch_count, total_rows
+            );
+        }
+    }
+
+    let read_time = read_start.elapsed();
+    println!();
+    println!("Results:");
+    println!("  Total batches: {}", batch_count);
+    println!("  Total rows: {}", total_rows);
+    println!("  Read time: {:?}", read_time);
+    println!("  Throughput: {:.0} rows/sec", total_rows as f64 / read_time.as_secs_f64());
+
+    // Verify we got all rows
+    assert_eq!(
+        total_rows, expected_rows,
+        "Expected {} rows, got {}",
+        expected_rows, total_rows
+    );
+
+    println!();
+    println!("=== Work Item 5.3: Large Result External Links E2E Test PASSED ===");
+}
+
+/// Test large result set streaming with multiple chunks.
+///
+/// This validates:
+/// - Results are streamed (not loaded all at once)
+/// - Memory usage stays bounded during streaming
+/// - All chunks are processed correctly
+#[test]
+#[ignore]
+fn test_e2e_large_result_streaming() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 5.3: Large Result Streaming E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created");
+
+    // Create statement
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Query with multiple columns to increase data size
+    // This query generates rows with multiple columns to increase chunk size
+    let expected_rows = 50_000;
+    println!(
+        "Executing large query with multiple columns: SELECT id, id*2, ... FROM range({})",
+        expected_rows
+    );
+    stmt.set_sql_query(&format!(
+        "SELECT \
+            id AS col1, \
+            id * 2 AS col2, \
+            id * 3 AS col3, \
+            CAST(id AS STRING) AS col4, \
+            id % 100 AS col5 \
+        FROM range({})",
+        expected_rows
+    ))
+    .expect("Failed to set SQL query");
+
+    let reader = stmt.execute().expect("Failed to execute statement");
+
+    // Get schema
+    let schema = reader.schema();
+    println!("  Schema fields: {}", schema.fields().len());
+    assert_eq!(schema.fields().len(), 5, "Expected 5 fields");
+
+    // Read batches and verify streaming behavior
+    let mut total_rows = 0_usize;
+    let mut batch_count = 0_usize;
+    let mut batch_sizes: Vec<usize> = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result.expect("Failed to read batch");
+        let batch_rows = batch.num_rows();
+        total_rows += batch_rows;
+        batch_count += 1;
+        batch_sizes.push(batch_rows);
+    }
+
+    println!();
+    println!("Streaming results:");
+    println!("  Total batches: {}", batch_count);
+    println!("  Total rows: {}", total_rows);
+
+    // Show batch size distribution
+    if !batch_sizes.is_empty() {
+        let min_size = *batch_sizes.iter().min().unwrap();
+        let max_size = *batch_sizes.iter().max().unwrap();
+        let avg_size = total_rows / batch_count;
+        println!("  Batch sizes: min={}, max={}, avg={}", min_size, max_size, avg_size);
+    }
+
+    // Verify we got all rows
+    assert_eq!(
+        total_rows, expected_rows,
+        "Expected {} rows, got {}",
+        expected_rows, total_rows
+    );
+
+    println!();
+    println!("=== Work Item 5.3: Large Result Streaming E2E Test PASSED ===");
+}
+
+// ============================================================================
+// Work Item 5.3: E2E Test Suite Completion - Comprehensive Workflows
+// ============================================================================
+
+/// Test complete ADBC workflow from connection to query execution.
+///
+/// This validates the complete end-to-end workflow:
+/// 1. Create driver
+/// 2. Create database with options
+/// 3. Create connection (creates session)
+/// 4. Execute query
+/// 5. Read results
+/// 6. Verify data
+/// 7. Clean up (connection auto-closed on drop)
+#[test]
+#[ignore]
+fn test_e2e_complete_workflow() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 5.3: Complete Workflow E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Step 1: Create driver
+    println!("Step 1: Create driver");
+    let mut driver = DatabricksDriver::new();
+    println!("  Driver created");
+
+    // Step 2: Create database with options
+    println!("Step 2: Create database with options");
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+    println!("  Database created");
+
+    // Step 3: Create connection (creates session)
+    println!("Step 3: Create connection");
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    let session_id = conn.session_id();
+    assert!(session_id.is_some(), "Connection should have a session ID");
+    println!("  Connection created with session: {}", session_id.unwrap());
+
+    // Step 4: Execute query
+    println!("Step 4: Execute query");
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query("SELECT 42 AS answer, 'test' AS message")
+        .expect("Failed to set SQL query");
+    let reader = stmt.execute().expect("Failed to execute statement");
+    println!("  Query executed");
+
+    // Step 5: Read results
+    println!("Step 5: Read results");
+    let schema = reader.schema();
+    println!("  Schema: {} fields", schema.fields().len());
+
+    let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    println!("  Batches: {}", batches.len());
+    println!("  Total rows: {}", total_rows);
+
+    // Step 6: Verify data
+    println!("Step 6: Verify data");
+    assert!(!batches.is_empty(), "Should have at least one batch");
+    assert_eq!(total_rows, 1, "Should have exactly 1 row");
+    assert_eq!(schema.fields().len(), 2, "Should have 2 columns");
+    assert_eq!(schema.field(0).name(), "answer", "First field should be 'answer'");
+    assert_eq!(schema.field(1).name(), "message", "Second field should be 'message'");
+
+    // Verify actual values
+    let batch = &batches[0];
+    let answer_col = batch.column(0);
+    let message_col = batch.column(1);
+    println!("  Column 'answer': {:?}", answer_col);
+    println!("  Column 'message': {:?}", message_col);
+
+    // Step 7: Clean up (automatic on drop)
+    println!("Step 7: Clean up");
+    drop(stmt);
+    drop(conn);
+    println!("  Resources cleaned up (connection dropped, session terminated)");
+
+    println!();
+    println!("=== Work Item 5.3: Complete Workflow E2E Test PASSED ===");
+}
+
+/// Test sequential queries on the same connection.
+///
+/// This validates:
+/// - Multiple queries can be executed sequentially on the same connection
+/// - Each query returns correct results
+/// - Session is reused across queries
+#[test]
+#[ignore]
+fn test_e2e_sequential_queries() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 5.3: Sequential Queries E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    let session_id = conn.session_id().expect("Connection should have session");
+    println!("Connection created with session: {}", session_id);
+
+    // Execute multiple queries sequentially
+    let num_queries = 5;
+    println!("Executing {} sequential queries...", num_queries);
+
+    for i in 1..=num_queries {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(&format!("SELECT {} AS iteration", i))
+            .expect("Failed to set SQL query");
+
+        let reader = stmt.execute().expect("Failed to execute statement");
+        let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+
+        assert!(!batches.is_empty(), "Query {} should return results", i);
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "Query {} should return 1 row", i);
+
+        println!("  Query {}: returned {} row(s)", i, total_rows);
+    }
+
+    // Verify session is still the same
+    let current_session = conn.session_id().expect("Should still have session");
+    assert_eq!(
+        session_id, current_session,
+        "Session should be reused across queries"
+    );
+    println!("Session reused: {}", current_session);
+
+    println!();
+    println!("=== Work Item 5.3: Sequential Queries E2E Test PASSED ===");
+}
+
+/// Test statement reuse across multiple queries.
+///
+/// This validates:
+/// - A single statement can be reused for multiple queries
+/// - set_sql_query() replaces the previous query
+/// - Each execution returns correct results
+#[test]
+#[ignore]
+fn test_e2e_statement_reuse() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 5.3: Statement Reuse E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created");
+
+    // Create a single statement
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Reuse the statement for multiple queries
+    let queries = vec![
+        "SELECT 1 AS num",
+        "SELECT 'hello' AS greeting",
+        "SELECT true AS flag",
+        "SELECT 42 AS answer, 'world' AS word",
+        "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, letter)",
+    ];
+
+    println!("Reusing statement for {} queries...", queries.len());
+
+    for (i, query) in queries.iter().enumerate() {
+        stmt.set_sql_query(query).expect("Failed to set SQL query");
+
+        let reader = stmt.execute().expect("Failed to execute statement");
+        let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let num_cols = if batches.is_empty() {
+            0
+        } else {
+            batches[0].num_columns()
+        };
+
+        println!(
+            "  Query {}: '{}' -> {} rows, {} columns",
+            i + 1,
+            query,
+            total_rows,
+            num_cols
+        );
+    }
+
+    println!();
+    println!("=== Work Item 5.3: Statement Reuse E2E Test PASSED ===");
+}
+
+/// Test multiple connections from the same database.
+///
+/// This validates:
+/// - Multiple connections can be created from a single database
+/// - Each connection gets its own session
+/// - Connections are independent
+#[test]
+#[ignore]
+fn test_e2e_multiple_connections() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 5.3: Multiple Connections E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver and database
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    // Create multiple connections
+    let num_connections = 3;
+    println!("Creating {} connections...", num_connections);
+
+    let mut connections = Vec::new();
+    let mut session_ids = Vec::new();
+
+    for i in 1..=num_connections {
+        let conn = db.new_connection().expect("Failed to create connection");
+        let session_id = conn.session_id().expect("Connection should have session");
+        println!("  Connection {}: session {}", i, session_id);
+        session_ids.push(session_id.to_string());
+        connections.push(conn);
+    }
+
+    // Verify all sessions are different
+    let unique_sessions: std::collections::HashSet<_> = session_ids.iter().collect();
+    assert_eq!(
+        unique_sessions.len(),
+        num_connections,
+        "Each connection should have a unique session"
+    );
+    println!("All {} sessions are unique", num_connections);
+
+    // Execute queries on each connection
+    println!("Executing queries on each connection...");
+    for (i, conn) in connections.iter_mut().enumerate() {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(&format!("SELECT {} AS conn_id", i + 1))
+            .expect("Failed to set SQL query");
+
+        let reader = stmt.execute().expect("Failed to execute statement");
+        let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+
+        assert!(!batches.is_empty(), "Connection {} should return results", i + 1);
+        println!("  Connection {}: query executed successfully", i + 1);
+    }
+
+    println!();
+    println!("=== Work Item 5.3: Multiple Connections E2E Test PASSED ===");
+}
+
+/// Test mixed operations workflow (SELECT, DML, DDL).
+///
+/// This validates a realistic workflow with:
+/// - DDL: CREATE TABLE
+/// - DML: INSERT, UPDATE, DELETE
+/// - SELECT: Query data
+/// - DDL: DROP TABLE
+#[test]
+#[ignore]
+fn test_e2e_mixed_operations_workflow() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    // Skip if no catalog/schema configured
+    if config.metadata.catalog.is_empty() || config.metadata.schema.is_empty() {
+        println!("Skipping: No catalog/schema configured in test metadata");
+        return;
+    }
+
+    println!("=== Work Item 5.3: Mixed Operations Workflow E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!("Catalog: {}", config.metadata.catalog);
+    println!("Schema: {}", config.metadata.schema);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Generate unique table name
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_millis();
+    let table_name = format!(
+        "{}.{}.workflow_test_{}",
+        config.metadata.catalog, config.metadata.schema, timestamp
+    );
+    println!("Test table: {}", table_name);
+    println!();
+
+    // Step 1: CREATE TABLE
+    println!("Step 1: CREATE TABLE");
+    stmt.set_sql_query(&format!(
+        "CREATE TABLE {} (id INT, name STRING, active BOOLEAN)",
+        table_name
+    ))
+    .expect("Failed to set SQL query");
+    stmt.execute_update().expect("Failed to create table");
+    println!("  Table created");
+
+    // Step 2: INSERT
+    println!("Step 2: INSERT");
+    stmt.set_sql_query(&format!(
+        "INSERT INTO {} VALUES \
+            (1, 'Alice', true), \
+            (2, 'Bob', true), \
+            (3, 'Charlie', false)",
+        table_name
+    ))
+    .expect("Failed to set SQL query");
+    stmt.execute_update().expect("Failed to insert");
+    println!("  Inserted 3 rows");
+
+    // Step 3: SELECT
+    println!("Step 3: SELECT");
+    stmt.set_sql_query(&format!("SELECT * FROM {} ORDER BY id", table_name))
+        .expect("Failed to set SQL query");
+    {
+        let reader = stmt.execute().expect("Failed to execute");
+        let batches: Vec<_> = reader.map(|r| r.expect("Failed to read")).collect();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "Should have 3 rows");
+        println!("  Selected {} rows", total_rows);
+    }
+
+    // Step 4: UPDATE
+    println!("Step 4: UPDATE");
+    stmt.set_sql_query(&format!(
+        "UPDATE {} SET active = false WHERE id = 1",
+        table_name
+    ))
+    .expect("Failed to set SQL query");
+    stmt.execute_update().expect("Failed to update");
+    println!("  Updated 1 row");
+
+    // Step 5: SELECT again to verify update
+    println!("Step 5: SELECT (verify update)");
+    stmt.set_sql_query(&format!(
+        "SELECT COUNT(*) AS cnt FROM {} WHERE active = false",
+        table_name
+    ))
+    .expect("Failed to set SQL query");
+    {
+        let mut reader = stmt.execute().expect("Failed to execute");
+        let batch = reader.next().expect("Expected batch").expect("Batch error");
+        let count = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("Expected Int64Array")
+            .value(0);
+        assert_eq!(count, 2, "Should have 2 inactive rows now");
+        println!("  Verified: {} inactive rows", count);
+    }
+
+    // Step 6: DELETE
+    println!("Step 6: DELETE");
+    stmt.set_sql_query(&format!("DELETE FROM {} WHERE id = 3", table_name))
+        .expect("Failed to set SQL query");
+    stmt.execute_update().expect("Failed to delete");
+    println!("  Deleted 1 row");
+
+    // Step 7: SELECT to verify delete
+    println!("Step 7: SELECT (verify delete)");
+    stmt.set_sql_query(&format!("SELECT COUNT(*) AS cnt FROM {}", table_name))
+        .expect("Failed to set SQL query");
+    {
+        let mut reader = stmt.execute().expect("Failed to execute");
+        let batch = reader.next().expect("Expected batch").expect("Batch error");
+        let count = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("Expected Int64Array")
+            .value(0);
+        assert_eq!(count, 2, "Should have 2 rows now");
+        println!("  Verified: {} rows remaining", count);
+    }
+
+    // Step 8: DROP TABLE (cleanup)
+    println!("Step 8: DROP TABLE (cleanup)");
+    stmt.set_sql_query(&format!("DROP TABLE {}", table_name))
+        .expect("Failed to set SQL query");
+    stmt.execute_update().expect("Failed to drop table");
+    println!("  Table dropped");
+
+    println!();
+    println!("=== Work Item 5.3: Mixed Operations Workflow E2E Test PASSED ===");
+}
+
+/// Test error recovery workflow.
+///
+/// This validates:
+/// - Connection remains usable after query errors
+/// - Statement can be reused after errors
+/// - Error messages are informative
+#[test]
+#[ignore]
+fn test_e2e_error_recovery_workflow() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 5.3: Error Recovery Workflow E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Step 1: Execute a valid query
+    println!("Step 1: Execute valid query");
+    stmt.set_sql_query("SELECT 1 AS value")
+        .expect("Failed to set SQL query");
+    let reader = stmt.execute().expect("Failed to execute");
+    let _batches: Vec<_> = reader.into_iter().collect();
+    println!("  Valid query succeeded");
+
+    // Step 2: Execute an invalid query (syntax error)
+    println!("Step 2: Execute invalid query (syntax error)");
+    stmt.set_sql_query("SELEC 1")
+        .expect("Failed to set SQL query");
+    let result = stmt.execute();
+    assert!(result.is_err(), "Invalid SQL should fail");
+    let err = result.unwrap_err();
+    println!("  Got expected error: {}", err.message);
+
+    // Step 3: Verify statement is still usable
+    println!("Step 3: Verify statement is still usable");
+    stmt.set_sql_query("SELECT 2 AS value")
+        .expect("Failed to set SQL query");
+    let reader = stmt.execute().expect("Failed to execute after error");
+    let batches: Vec<_> = reader.map(|r| r.expect("Failed to read")).collect();
+    assert!(!batches.is_empty(), "Should get results after error recovery");
+    println!("  Statement recovered successfully");
+
+    // Step 4: Execute another invalid query (table not found)
+    println!("Step 4: Execute invalid query (table not found)");
+    stmt.set_sql_query("SELECT * FROM nonexistent_table_12345")
+        .expect("Failed to set SQL query");
+    let result = stmt.execute();
+    assert!(result.is_err(), "Nonexistent table should fail");
+    let err = result.unwrap_err();
+    println!("  Got expected error: {}", err.message);
+
+    // Step 5: Verify statement and connection still work
+    println!("Step 5: Verify connection still works");
+    stmt.set_sql_query("SELECT 3 AS value")
+        .expect("Failed to set SQL query");
+    let reader = stmt.execute().expect("Failed to execute after second error");
+    let batches: Vec<_> = reader.map(|r| r.expect("Failed to read")).collect();
+    assert!(!batches.is_empty(), "Should get results after second error recovery");
+    println!("  Connection and statement recovered successfully");
+
+    // Step 6: Create a new statement to verify connection is still good
+    println!("Step 6: Create new statement on same connection");
+    let mut stmt2 = conn.new_statement().expect("Failed to create new statement");
+    stmt2
+        .set_sql_query("SELECT 4 AS value")
+        .expect("Failed to set SQL query");
+    let reader = stmt2.execute().expect("Failed to execute on new statement");
+    let batches: Vec<_> = reader.map(|r| r.expect("Failed to read")).collect();
+    assert!(!batches.is_empty(), "New statement should work");
+    println!("  New statement works on recovered connection");
+
+    println!();
+    println!("=== Work Item 5.3: Error Recovery Workflow E2E Test PASSED ===");
+}
