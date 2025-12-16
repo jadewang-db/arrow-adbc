@@ -1974,3 +1974,393 @@ fn test_e2e_connection_inherits_database_catalog_schema() {
     println!();
     println!("=== Connection Inherits Database Catalog/Schema E2E Test PASSED ===");
 }
+
+// ============================================================================
+// Work Item 2.3: SEA Client - Execute Statement E2E Tests
+// ============================================================================
+
+/// Test SeaClient execute_statement with a simple SELECT 1 query.
+///
+/// This validates:
+/// - execute_statement successfully sends request to SEA API
+/// - Response contains valid statement_id
+/// - Response contains valid status
+/// - For simple queries, response should be SUCCEEDED immediately
+#[test]
+#[ignore]
+fn test_e2e_execute_statement_select_one() {
+    use adbc_databricks::client::{
+        ExecuteStatementRequest, SeaClient, SeaClientConfig, StatementState,
+    };
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== SEA Client Execute Statement (SELECT 1) E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create SeaClient
+    let sea_config = SeaClientConfig::new(&host, &config.token, &warehouse_id);
+    let client = SeaClient::new(sea_config).expect("Failed to create SeaClient");
+
+    // Create Tokio runtime for async operations
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+    // Execute the test
+    rt.block_on(async {
+        // Step 1: Create a session
+        println!("Step 1: Creating session...");
+        let session_request = adbc_databricks::client::CreateSessionRequest {
+            warehouse_id: warehouse_id.clone(),
+            session_alias: Some("e2e_execute_statement_test".to_string()),
+            catalog: None,
+            schema: None,
+        };
+        let session_response = client
+            .create_session(&session_request)
+            .await
+            .expect("Failed to create session");
+        let session_id = session_response.session_id;
+        println!("  Session created: {}", session_id);
+
+        // Step 2: Execute SELECT 1
+        println!("Step 2: Executing SELECT 1...");
+        let execute_request = ExecuteStatementRequest::new(&warehouse_id, "SELECT 1")
+            .with_session_id(&session_id)
+            .with_wait_timeout("30s");
+
+        let response = client
+            .execute_statement(&execute_request)
+            .await
+            .expect("Failed to execute statement");
+
+        println!("  Statement ID: {}", response.statement_id);
+        println!("  Status: {:?}", response.status.state);
+
+        // Step 3: Verify response
+        println!("Step 3: Verifying response...");
+        assert!(
+            !response.statement_id.is_empty(),
+            "Statement ID should not be empty"
+        );
+
+        // For a simple SELECT 1, it should succeed immediately or be pending/running
+        assert!(
+            matches!(
+                response.status.state,
+                StatementState::Succeeded | StatementState::Pending | StatementState::Running
+            ),
+            "Expected Succeeded, Pending, or Running state, got {:?}",
+            response.status.state
+        );
+
+        // If succeeded, verify we have manifest and result
+        if response.status.state == StatementState::Succeeded {
+            println!("  Query completed immediately!");
+            assert!(
+                response.manifest.is_some(),
+                "Should have manifest for completed query"
+            );
+
+            if let Some(ref manifest) = response.manifest {
+                println!("  Total rows: {:?}", manifest.total_row_count);
+                println!("  Total chunks: {:?}", manifest.total_chunk_count);
+
+                // Verify schema if available
+                if let Some(ref schema) = manifest.schema {
+                    println!("  Schema columns: {:?}", schema.column_count);
+                }
+            }
+
+            // Result should have either data_array (inline) or external_links
+            if let Some(ref result) = response.result {
+                if result.data_array.is_some() {
+                    println!("  Result type: INLINE");
+                } else if result.external_links.is_some() {
+                    println!("  Result type: EXTERNAL_LINKS");
+                }
+            }
+        } else {
+            println!("  Query is still executing (state: {:?})", response.status.state);
+            println!("  Statement ID for polling: {}", response.statement_id);
+        }
+
+        // Step 4: Close the statement
+        println!("Step 4: Closing statement...");
+        client
+            .close_statement(&response.statement_id)
+            .await
+            .expect("Failed to close statement");
+        println!("  Statement closed");
+
+        // Step 5: Delete session
+        println!("Step 5: Deleting session...");
+        client
+            .delete_session(&session_id)
+            .await
+            .expect("Failed to delete session");
+        println!("  Session deleted");
+    });
+
+    println!();
+    println!("=== SEA Client Execute Statement (SELECT 1) E2E Test PASSED ===");
+}
+
+/// Test SeaClient execute_statement with catalog and schema specification.
+///
+/// This validates:
+/// - execute_statement correctly passes catalog and schema parameters
+/// - Query using explicit catalog.schema.table works correctly
+#[test]
+#[ignore]
+fn test_e2e_execute_statement_with_catalog_schema() {
+    use adbc_databricks::client::{
+        ExecuteStatementRequest, SeaClient, SeaClientConfig, StatementState,
+    };
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    // Skip if no catalog configured
+    if config.metadata.catalog.is_empty() {
+        println!("Skipping: No catalog configured in test metadata");
+        return;
+    }
+
+    println!("=== SEA Client Execute Statement with Catalog/Schema E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!("Catalog: {}", config.metadata.catalog);
+    println!("Schema: {}", config.metadata.schema);
+    println!();
+
+    let sea_config = SeaClientConfig::new(&host, &config.token, &warehouse_id);
+    let client = SeaClient::new(sea_config).expect("Failed to create SeaClient");
+
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+    rt.block_on(async {
+        // Note: The SEA API does not allow setting session_id at the same time as
+        // catalog or schema fields in the execute statement request. So we have two options:
+        // 1. Use session_id (and let the session's catalog/schema apply)
+        // 2. Use catalog/schema directly in the request (without session_id)
+        //
+        // For this test, we'll use option 2 - execute with catalog/schema but without session
+
+        // Execute a query with explicit catalog and schema (no session)
+        let query = format!(
+            "SELECT 1 AS test_col FROM {}.{}.INFORMATION_SCHEMA.COLUMNS LIMIT 1",
+            config.metadata.catalog, config.metadata.schema
+        );
+
+        println!("Executing query with catalog/schema (no session): {}", query);
+
+        let request = ExecuteStatementRequest::new(&warehouse_id, &query)
+            .with_catalog(&config.metadata.catalog)
+            .with_schema(&config.metadata.schema)
+            .with_wait_timeout("30s");
+
+        let response = client
+            .execute_statement(&request)
+            .await
+            .expect("Failed to execute statement");
+
+        println!("  Statement ID: {}", response.statement_id);
+        println!("  Status: {:?}", response.status.state);
+
+        // Query should complete (may be immediate or async)
+        assert!(
+            !response.statement_id.is_empty(),
+            "Statement ID should not be empty"
+        );
+
+        // Clean up - close statement
+        let _ = client.close_statement(&response.statement_id).await;
+    });
+
+    println!();
+    println!("=== SEA Client Execute Statement with Catalog/Schema E2E Test PASSED ===");
+}
+
+/// Test SeaClient execute_statement with row limit.
+///
+/// This validates:
+/// - row_limit parameter is correctly passed
+/// - Results are limited as expected
+#[test]
+#[ignore]
+fn test_e2e_execute_statement_with_row_limit() {
+    use adbc_databricks::client::{
+        ExecuteStatementRequest, SeaClient, SeaClientConfig, StatementState,
+    };
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== SEA Client Execute Statement with Row Limit E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    let sea_config = SeaClientConfig::new(&host, &config.token, &warehouse_id);
+    let client = SeaClient::new(sea_config).expect("Failed to create SeaClient");
+
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+    rt.block_on(async {
+        // Create session
+        let session_request = adbc_databricks::client::CreateSessionRequest {
+            warehouse_id: warehouse_id.clone(),
+            session_alias: Some("e2e_row_limit_test".to_string()),
+            catalog: None,
+            schema: None,
+        };
+        let session = client
+            .create_session(&session_request)
+            .await
+            .expect("Failed to create session");
+        let session_id = session.session_id;
+
+        // Execute a query with row limit
+        // Using VALUES clause to generate rows
+        let query = "SELECT * FROM (VALUES (1), (2), (3), (4), (5)) AS t(n)";
+
+        println!("Executing query with row_limit=2: {}", query);
+
+        let request = ExecuteStatementRequest::new(&warehouse_id, query)
+            .with_session_id(&session_id)
+            .with_wait_timeout("30s")
+            .with_row_limit(2);
+
+        let response = client
+            .execute_statement(&request)
+            .await
+            .expect("Failed to execute statement");
+
+        println!("  Statement ID: {}", response.statement_id);
+        println!("  Status: {:?}", response.status.state);
+
+        if response.status.state == StatementState::Succeeded {
+            if let Some(ref manifest) = response.manifest {
+                println!(
+                    "  Total rows returned: {:?}",
+                    manifest.total_row_count
+                );
+                // With row_limit=2, we should get at most 2 rows
+                if let Some(row_count) = manifest.total_row_count {
+                    assert!(
+                        row_count <= 2,
+                        "Row limit should be respected, got {} rows",
+                        row_count
+                    );
+                }
+            }
+        }
+
+        // Clean up
+        let _ = client.close_statement(&response.statement_id).await;
+        client
+            .delete_session(&session_id)
+            .await
+            .expect("Failed to delete session");
+    });
+
+    println!();
+    println!("=== SEA Client Execute Statement with Row Limit E2E Test PASSED ===");
+}
+
+/// Test SeaClient execute_statement handles SQL errors correctly.
+///
+/// This validates:
+/// - Invalid SQL returns a FAILED state
+/// - Error information is available in response
+#[test]
+#[ignore]
+fn test_e2e_execute_statement_sql_error() {
+    use adbc_databricks::client::{
+        ExecuteStatementRequest, SeaClient, SeaClientConfig, StatementState,
+    };
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== SEA Client Execute Statement SQL Error E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    let sea_config = SeaClientConfig::new(&host, &config.token, &warehouse_id);
+    let client = SeaClient::new(sea_config).expect("Failed to create SeaClient");
+
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+    rt.block_on(async {
+        // Create session
+        let session_request = adbc_databricks::client::CreateSessionRequest {
+            warehouse_id: warehouse_id.clone(),
+            session_alias: Some("e2e_sql_error_test".to_string()),
+            catalog: None,
+            schema: None,
+        };
+        let session = client
+            .create_session(&session_request)
+            .await
+            .expect("Failed to create session");
+        let session_id = session.session_id;
+
+        // Execute invalid SQL
+        let invalid_query = "SELEC * FORM nonexistent_table"; // Intentional typos
+
+        println!("Executing invalid SQL: {}", invalid_query);
+
+        let request = ExecuteStatementRequest::new(&warehouse_id, invalid_query)
+            .with_session_id(&session_id)
+            .with_wait_timeout("30s");
+
+        let response = client
+            .execute_statement(&request)
+            .await
+            .expect("Request should succeed, but statement should fail");
+
+        println!("  Statement ID: {}", response.statement_id);
+        println!("  Status: {:?}", response.status.state);
+
+        // The statement should fail due to syntax error
+        assert_eq!(
+            response.status.state,
+            StatementState::Failed,
+            "Invalid SQL should result in FAILED state"
+        );
+
+        // Error information should be available
+        assert!(
+            response.status.error.is_some(),
+            "Error details should be provided"
+        );
+
+        if let Some(ref error) = response.status.error {
+            println!("  Error code: {:?}", error.error_code);
+            println!("  Error message: {:?}", error.message);
+        }
+
+        // Clean up - close statement (may or may not succeed depending on state)
+        let _ = client.close_statement(&response.statement_id).await;
+        client
+            .delete_session(&session_id)
+            .await
+            .expect("Failed to delete session");
+    });
+
+    println!();
+    println!("=== SEA Client Execute Statement SQL Error E2E Test PASSED ===");
+}

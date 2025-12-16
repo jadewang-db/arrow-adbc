@@ -1907,7 +1907,11 @@ Implement the statement execution endpoint with proper request building and resp
        #[serde(skip_serializing_if = "Option::is_none")]
        pub schema: Option<String>,
        pub wait_timeout: String,
+       /// Behavior when wait timeout is reached: "CONTINUE" or "CANCEL"
+       pub on_wait_timeout: String,
+       /// Result disposition: "INLINE" or "EXTERNAL_LINKS"
        pub disposition: String,
+       /// Result format: "ARROW_STREAM", "JSON_ARRAY", or "CSV"
        pub format: String,
        #[serde(skip_serializing_if = "Option::is_none")]
        pub row_limit: Option<i64>,
@@ -1915,16 +1919,28 @@ Implement the statement execution endpoint with proper request building and resp
        pub byte_limit: Option<i64>,
    }
 
-   impl Default for ExecuteStatementRequest {
-       fn default() -> Self {
+   /// Note: The SEA API supports two disposition values:
+   /// - "INLINE" - Result data included in response (limited to 25 MiB, JSON_ARRAY format only)
+   /// - "EXTERNAL_LINKS" - Result data via presigned URLs (all formats, larger results)
+   ///
+   /// We default to "EXTERNAL_LINKS" because:
+   /// - It works with ARROW_STREAM format (our default)
+   /// - It supports larger result sets
+   /// - It provides better throughput via Cloud Fetch technology
+   ///
+   /// Also note: The SEA API does not allow setting session_id at the same time as
+   /// catalog or schema fields in the execute statement request.
+   impl ExecuteStatementRequest {
+       fn new(warehouse_id: String, statement: String) -> Self {
            Self {
-               statement: String::new(),
-               warehouse_id: String::new(),
+               statement,
+               warehouse_id,
                session_id: None,
                catalog: None,
                schema: None,
                wait_timeout: "10s".to_string(),
-               disposition: "INLINE_OR_EXTERNAL_LINKS".to_string(),
+               on_wait_timeout: "CONTINUE".to_string(),
+               disposition: "EXTERNAL_LINKS".to_string(),
                format: "ARROW_STREAM".to_string(),
                row_limit: None,
                byte_limit: None,
@@ -2042,16 +2058,13 @@ Implement the statement execution endpoint with proper request building and resp
 ```rust
 #[test]
 fn test_execute_request_serialization() {
-    let request = ExecuteStatementRequest {
-        statement: "SELECT 1".to_string(),
-        warehouse_id: "abc123".to_string(),
-        session_id: Some("session456".to_string()),
-        ..Default::default()
-    };
+    let request = ExecuteStatementRequest::new("abc123", "SELECT 1")
+        .with_session_id("session456");
 
     let json = serde_json::to_string(&request).unwrap();
     assert!(json.contains("ARROW_STREAM"));
-    assert!(json.contains("INLINE_OR_EXTERNAL_LINKS"));
+    assert!(json.contains("EXTERNAL_LINKS"));
+    assert!(json.contains("on_wait_timeout"));
 }
 
 #[test]
@@ -2062,11 +2075,19 @@ fn test_execute_response_deserialization() {
         "result": { "chunk_index": 0, "row_count": 1 }
     }"#;
 
-    let response: ExecuteStatementResponse = serde_json::from_str(json).unwrap();
+    let response: StatementResponse = serde_json::from_str(json).unwrap();
     assert_eq!(response.statement_id, "stmt123");
     assert_eq!(response.status.state, StatementState::Succeeded);
 }
 ```
+
+### Implementation Notes (from Work Item 2.3)
+- Added `on_wait_timeout` field to ExecuteStatementRequest for controlling behavior when wait timeout is reached
+- Changed default disposition from "INLINE_OR_EXTERNAL_LINKS" (invalid) to "EXTERNAL_LINKS"
+- Added builder pattern with `with_*` methods for ExecuteStatementRequest
+- SEA API restriction: Cannot set session_id at same time as catalog/schema in execute request
+- Comprehensive wiremock tests added for all response states and error handling
+- E2E tests verified against real Databricks SQL warehouse
 
 ### Files Modified/Created
 - `driver/databricks/src/client/models.rs`

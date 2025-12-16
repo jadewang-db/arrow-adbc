@@ -1051,4 +1051,494 @@ mod tests {
         // With max_retries = 0, should only call once
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
+
+    // ========================================================================
+    // Wiremock Integration Tests for execute_statement
+    // ========================================================================
+
+    mod wiremock_tests {
+        use super::*;
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// Helper function to create a test client pointing to a mock server.
+        fn create_mock_client(mock_server_uri: &str) -> SeaClient {
+            SeaClient::new(SeaClientConfig {
+                host: mock_server_uri.into(),
+                token: "test_token".into(),
+                warehouse_id: "test_warehouse".into(),
+                ..Default::default()
+            })
+            .expect("Failed to create mock client")
+        }
+
+        #[tokio::test]
+        async fn test_execute_statement_success_immediate() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .and(header("Authorization", "Bearer test_token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-12345",
+                    "status": {
+                        "state": "SUCCEEDED"
+                    },
+                    "manifest": {
+                        "format": "ARROW_STREAM",
+                        "schema": {
+                            "column_count": 1,
+                            "columns": [
+                                {"name": "1", "type_name": "INT", "type_text": "INT", "position": 0}
+                            ]
+                        },
+                        "total_chunk_count": 1,
+                        "total_row_count": 1,
+                        "total_byte_count": 100,
+                        "truncated": false
+                    },
+                    "result": {
+                        "data_array": [[1]],
+                        "row_count": 1,
+                        "byte_count": 100
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let request = ExecuteStatementRequest::new("test_warehouse", "SELECT 1")
+                .with_session_id("session-123");
+
+            let response = client.execute_statement(&request).await;
+
+            assert!(response.is_ok(), "Expected success, got {:?}", response);
+            let response = response.unwrap();
+
+            assert_eq!(response.statement_id, "stmt-12345");
+            assert_eq!(response.status.state, StatementState::Succeeded);
+            assert!(response.manifest.is_some());
+            assert!(response.result.is_some());
+
+            let result = response.result.unwrap();
+            assert!(result.data_array.is_some());
+            let data_array = result.data_array.unwrap();
+            assert_eq!(data_array.len(), 1);
+            assert_eq!(data_array[0][0].as_i64(), Some(1));
+        }
+
+        #[tokio::test]
+        async fn test_execute_statement_returns_pending() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-async-456",
+                    "status": {
+                        "state": "PENDING"
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let request = ExecuteStatementRequest::new("test_warehouse", "SELECT * FROM large_table");
+
+            let response = client.execute_statement(&request).await.unwrap();
+
+            assert_eq!(response.statement_id, "stmt-async-456");
+            assert_eq!(response.status.state, StatementState::Pending);
+            assert!(response.manifest.is_none());
+            assert!(response.result.is_none());
+        }
+
+        #[tokio::test]
+        async fn test_execute_statement_returns_running() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-running-789",
+                    "status": {
+                        "state": "RUNNING"
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let request = ExecuteStatementRequest::new("test_warehouse", "SELECT * FROM medium_table")
+                .with_wait_timeout("1s");
+
+            let response = client.execute_statement(&request).await.unwrap();
+
+            assert_eq!(response.statement_id, "stmt-running-789");
+            assert_eq!(response.status.state, StatementState::Running);
+        }
+
+        #[tokio::test]
+        async fn test_execute_statement_with_inline_result() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-inline",
+                    "status": {
+                        "state": "SUCCEEDED"
+                    },
+                    "manifest": {
+                        "format": "ARROW_STREAM",
+                        "schema": {
+                            "column_count": 2,
+                            "columns": [
+                                {"name": "id", "type_name": "INT", "type_text": "INT", "position": 0},
+                                {"name": "name", "type_name": "STRING", "type_text": "STRING", "position": 1}
+                            ]
+                        },
+                        "total_chunk_count": 1,
+                        "total_row_count": 3,
+                        "total_byte_count": 500
+                    },
+                    "result": {
+                        "data_array": [
+                            [1, "Alice"],
+                            [2, "Bob"],
+                            [3, "Charlie"]
+                        ],
+                        "row_count": 3,
+                        "byte_count": 500
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let request =
+                ExecuteStatementRequest::new("test_warehouse", "SELECT id, name FROM users");
+
+            let response = client.execute_statement(&request).await.unwrap();
+
+            assert_eq!(response.status.state, StatementState::Succeeded);
+
+            let result = response.result.unwrap();
+            assert!(result.data_array.is_some());
+            assert!(result.external_links.is_none());
+
+            let data = result.data_array.unwrap();
+            assert_eq!(data.len(), 3);
+            assert_eq!(data[0][0].as_i64(), Some(1));
+            assert_eq!(data[0][1].as_str(), Some("Alice"));
+            assert_eq!(data[2][0].as_i64(), Some(3));
+            assert_eq!(data[2][1].as_str(), Some("Charlie"));
+        }
+
+        #[tokio::test]
+        async fn test_execute_statement_with_external_links() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-external",
+                    "status": {
+                        "state": "SUCCEEDED"
+                    },
+                    "manifest": {
+                        "format": "ARROW_STREAM",
+                        "schema": {
+                            "column_count": 1,
+                            "columns": [
+                                {"name": "data", "type_name": "STRING", "type_text": "STRING", "position": 0}
+                            ]
+                        },
+                        "total_chunk_count": 2,
+                        "total_row_count": 100000,
+                        "total_byte_count": 5000000,
+                        "truncated": false
+                    },
+                    "result": {
+                        "external_links": [
+                            {
+                                "chunk_index": 0,
+                                "external_link": "https://storage.example.com/chunk0?token=abc123",
+                                "expiration": "2025-12-31T23:59:59Z",
+                                "row_offset": 0,
+                                "row_count": 50000,
+                                "byte_count": 2500000
+                            },
+                            {
+                                "chunk_index": 1,
+                                "external_link": "https://storage.example.com/chunk1?token=def456",
+                                "expiration": "2025-12-31T23:59:59Z",
+                                "row_offset": 50000,
+                                "row_count": 50000,
+                                "byte_count": 2500000
+                            }
+                        ]
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let request = ExecuteStatementRequest::new("test_warehouse", "SELECT * FROM huge_table");
+
+            let response = client.execute_statement(&request).await.unwrap();
+
+            assert_eq!(response.status.state, StatementState::Succeeded);
+
+            let manifest = response.manifest.unwrap();
+            assert_eq!(manifest.total_chunk_count, Some(2));
+            assert_eq!(manifest.total_row_count, Some(100000));
+
+            let result = response.result.unwrap();
+            assert!(result.data_array.is_none());
+            assert!(result.external_links.is_some());
+
+            let links = result.external_links.unwrap();
+            assert_eq!(links.len(), 2);
+
+            assert_eq!(links[0].chunk_index, 0);
+            assert!(links[0].external_link.contains("chunk0"));
+            assert_eq!(links[0].row_offset, Some(0));
+            assert_eq!(links[0].row_count, Some(50000));
+
+            assert_eq!(links[1].chunk_index, 1);
+            assert!(links[1].external_link.contains("chunk1"));
+            assert_eq!(links[1].row_offset, Some(50000));
+        }
+
+        #[tokio::test]
+        async fn test_execute_statement_failed() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-failed",
+                    "status": {
+                        "state": "FAILED",
+                        "error": {
+                            "error_code": "SYNTAX_ERROR",
+                            "message": "Syntax error at position 7: expected expression"
+                        }
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let request =
+                ExecuteStatementRequest::new("test_warehouse", "SELEC * FROM table"); // Intentional typo
+
+            let response = client.execute_statement(&request).await.unwrap();
+
+            assert_eq!(response.statement_id, "stmt-failed");
+            assert_eq!(response.status.state, StatementState::Failed);
+            assert!(response.status.error.is_some());
+
+            let error = response.status.error.unwrap();
+            assert_eq!(error.error_code, Some("SYNTAX_ERROR".to_string()));
+            assert!(error.message.unwrap().contains("Syntax error"));
+        }
+
+        #[tokio::test]
+        async fn test_execute_statement_http_error_401() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                    "error_code": "UNAUTHENTICATED",
+                    "message": "Invalid or missing authentication token"
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let request = ExecuteStatementRequest::new("test_warehouse", "SELECT 1");
+
+            let result = client.execute_statement(&request).await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+
+            match err {
+                Error::SeaApi {
+                    code,
+                    http_status,
+                    message,
+                    ..
+                } => {
+                    assert_eq!(http_status, 401);
+                    assert_eq!(code, "UNAUTHENTICATED");
+                    assert!(message.contains("authentication"));
+                }
+                _ => panic!("Expected SeaApi error, got {:?}", err),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_execute_statement_http_error_404() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error_code": "NOT_FOUND",
+                    "message": "Warehouse not found: invalid_warehouse"
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let request = ExecuteStatementRequest::new("invalid_warehouse", "SELECT 1");
+
+            let result = client.execute_statement(&request).await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+
+            match err {
+                Error::SeaApi { http_status, .. } => {
+                    assert_eq!(http_status, 404);
+                }
+                _ => panic!("Expected SeaApi error, got {:?}", err),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_execute_statement_http_error_429_rate_limited() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(
+                    ResponseTemplate::new(429)
+                        .insert_header("Retry-After", "30")
+                        .set_body_json(serde_json::json!({
+                            "error_code": "REQUEST_LIMIT_EXCEEDED",
+                            "message": "Rate limit exceeded. Please retry after 30 seconds."
+                        })),
+                )
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let request = ExecuteStatementRequest::new("test_warehouse", "SELECT 1");
+
+            let result = client.execute_statement(&request).await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+
+            match err {
+                Error::SeaApi {
+                    code,
+                    http_status,
+                    retry_after,
+                    ..
+                } => {
+                    assert_eq!(http_status, 429);
+                    assert_eq!(code, "REQUEST_LIMIT_EXCEEDED");
+                    assert!(retry_after.is_some());
+                    assert_eq!(retry_after.unwrap(), Duration::from_secs(30));
+                }
+                _ => panic!("Expected SeaApi error, got {:?}", err),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_execute_statement_http_error_500() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                    "error_code": "INTERNAL_ERROR",
+                    "message": "Internal server error"
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let request = ExecuteStatementRequest::new("test_warehouse", "SELECT 1");
+
+            let result = client.execute_statement(&request).await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+
+            match err {
+                Error::SeaApi { http_status, .. } => {
+                    assert_eq!(http_status, 500);
+                }
+                _ => panic!("Expected SeaApi error, got {:?}", err),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_execute_statement_request_body_contains_required_fields() {
+            let mock_server = MockServer::start().await;
+
+            // Use body_partial_json matcher to verify request structure contains expected fields
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .and(body_partial_json(serde_json::json!({
+                    "statement": "SELECT 1",
+                    "warehouse_id": "test_warehouse",
+                    "session_id": "session-abc",
+                    "wait_timeout": "10s",
+                    "on_wait_timeout": "CONTINUE",
+                    "disposition": "EXTERNAL_LINKS",
+                    "format": "ARROW_STREAM"
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-verified",
+                    "status": { "state": "SUCCEEDED" }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let request = ExecuteStatementRequest::new("test_warehouse", "SELECT 1")
+                .with_session_id("session-abc");
+
+            let result = client.execute_statement(&request).await;
+            assert!(result.is_ok(), "Request should match expected schema: {:?}", result);
+        }
+
+        #[tokio::test]
+        async fn test_execute_statement_with_all_optional_fields() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-full",
+                    "status": { "state": "SUCCEEDED" }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let request = ExecuteStatementRequest::new("test_warehouse", "SELECT 1")
+                .with_session_id("session-xyz")
+                .with_catalog("main")
+                .with_schema("default")
+                .with_wait_timeout("30s")
+                .with_on_wait_timeout("CANCEL")
+                .with_row_limit(1000)
+                .with_byte_limit(1_000_000);
+
+            let result = client.execute_statement(&request).await;
+            assert!(result.is_ok());
+
+            let response = result.unwrap();
+            assert_eq!(response.statement_id, "stmt-full");
+        }
+    }
 }
