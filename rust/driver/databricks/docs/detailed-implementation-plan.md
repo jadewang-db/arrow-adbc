@@ -4211,24 +4211,83 @@ Step 8: DROP TABLE (cleanup)...
 ### Objective
 Get query schema without executing the full query.
 
-### Actions
+### Implementation
+
+The `execute_schema()` method returns the Arrow schema of a prepared query without fetching actual data. This is achieved by executing the query with `row_limit = 0`, which tells the SEA API to return only the schema without any data rows.
+
+**Key Implementation Details:**
+- Executes the query using the SEA API with `row_limit = 0`
+- Does NOT modify the statement's `row_limit` setting (uses a local variable)
+- Extracts the schema from the response manifest
+- Does not create a RecordBatchReader to avoid unnecessary processing
 
 ```rust
 impl Statement for DatabricksStatement {
     fn execute_schema(&mut self) -> adbc_core::error::Result<Schema> {
-        // Execute with row_limit = 0 to get schema only
-        let original_limit = self.config.row_limit;
-        self.config.row_limit = Some(0);
+        // Execute with row_limit = 0 to get schema only without fetching actual data.
+        // This is essentially the same as execute() but uses row_limit=0 and extracts
+        // only the schema from the result.
 
-        let reader = self.execute()?;
-        let schema = reader.schema();
+        let sql = self.sql_query.as_ref().ok_or_else(|| {
+            Error::with_message_and_status("SQL query not set", Status::InvalidState)
+        })?;
 
-        self.config.row_limit = original_limit;
+        // Get session ID from session manager (creates session if needed)
+        let session_manager = self.session_manager.clone();
+        let session_id = block_on_async(&self.runtime, async move {
+            session_manager.get_session_id().await
+        })
+        .map_err(|e| {
+            let db_err: DatabricksError = e;
+            Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
+        })?;
 
-        Ok((*schema).clone())
+        // Determine max wait time
+        let max_wait = self
+            .max_wait
+            .unwrap_or(Duration::from_secs(DEFAULT_MAX_WAIT_SECS));
+
+        // Execute statement with row_limit = 0 to get schema only (no data fetched)
+        let client = self.client.clone();
+        let sql = sql.clone();
+        let byte_limit = self.byte_limit;
+        let response = block_on_async(&self.runtime, async move {
+            client
+                .execute_and_wait(&session_id, &sql, Some(max_wait), Some(0), byte_limit)
+                .await
+        })
+        .map_err(|e| {
+            let db_err: DatabricksError = e;
+            Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
+        })?;
+
+        // Store statement ID for potential cancellation
+        self.statement_id = Some(response.statement_id.clone());
+
+        // Build and return the schema from the response manifest
+        self.build_schema_from_response(&response)
     }
 }
 ```
+
+### Test Types
+- **Unit Tests**: Verify SQL requirement, row_limit not modified
+- **E2E Tests**: Verify schema retrieval with real Databricks instance
+
+### Expected Results
+
+| Result | Verification | Test Type |
+|--------|--------------|-----------|
+| Returns correct schema for simple SELECT | Schema field names and types match | E2E |
+| Returns correct schema for multiple types | INT, BIGINT, DOUBLE, BOOLEAN, STRING mapped correctly | E2E |
+| Returns correct schema from table | Column count matches expected | E2E |
+| Does not transfer data rows | Query completes quickly even for large tables | E2E |
+| Returns appropriate errors | Invalid SQL returns error | E2E |
+| Requires SQL to be set | Returns InvalidState if no SQL | Unit |
+| Does not modify row_limit | Statement's row_limit unchanged after call | Unit |
+
+### E2E Exit Criteria
+- All 5 E2E tests pass: `test_e2e_execute_schema_simple_select`, `test_e2e_execute_schema_multiple_types`, `test_e2e_execute_schema_from_table`, `test_e2e_execute_schema_no_data`, `test_e2e_execute_schema_sql_error`
 
 ---
 

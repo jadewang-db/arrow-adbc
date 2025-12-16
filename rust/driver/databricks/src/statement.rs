@@ -490,11 +490,48 @@ impl Statement for DatabricksStatement {
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
-        // TODO: Implement schema-only execution
-        Err(Error::with_message_and_status(
-            "Schema-only execution not yet implemented",
-            Status::NotImplemented,
-        ))
+        // Execute with row_limit = 0 to get schema only without fetching actual data.
+        // This is essentially the same as execute() but uses row_limit=0 and extracts
+        // only the schema from the result.
+
+        let sql = self.sql_query.as_ref().ok_or_else(|| {
+            Error::with_message_and_status("SQL query not set", Status::InvalidState)
+        })?;
+
+        // Get session ID from session manager (creates session if needed)
+        let session_manager = self.session_manager.clone();
+        let session_id = block_on_async(&self.runtime, async move {
+            session_manager.get_session_id().await
+        })
+        .map_err(|e| {
+            let db_err: DatabricksError = e;
+            Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
+        })?;
+
+        // Determine max wait time
+        let max_wait = self
+            .max_wait
+            .unwrap_or(Duration::from_secs(DEFAULT_MAX_WAIT_SECS));
+
+        // Execute statement with row_limit = 0 to get schema only (no data fetched)
+        let client = self.client.clone();
+        let sql = sql.clone();
+        let byte_limit = self.byte_limit;
+        let response = block_on_async(&self.runtime, async move {
+            client
+                .execute_and_wait(&session_id, &sql, Some(max_wait), Some(0), byte_limit)
+                .await
+        })
+        .map_err(|e| {
+            let db_err: DatabricksError = e;
+            Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
+        })?;
+
+        // Store statement ID for potential cancellation
+        self.statement_id = Some(response.statement_id.clone());
+
+        // Build and return the schema from the response manifest
+        self.build_schema_from_response(&response)
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
@@ -860,17 +897,46 @@ mod tests {
     }
 
     #[test]
-    fn test_statement_execute_schema_not_implemented() {
+    fn test_statement_execute_schema_requires_sql() {
         let runtime = create_mt_runtime();
         let mock_uri = "http://localhost:1234";
         let (client, session_manager) = create_test_client_and_session(mock_uri);
 
         let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
 
+        // execute_schema should fail if SQL query is not set
         let result = stmt.execute_schema();
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.status, Status::NotImplemented);
+        assert_eq!(err.status, Status::InvalidState);
+        assert!(err.message.contains("SQL query not set"));
+    }
+
+    #[test]
+    fn test_statement_execute_schema_does_not_modify_row_limit() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        // Set a row_limit - this should NOT be affected by execute_schema
+        stmt.set_option(
+            OptionStatement::Other(option_keys::ROW_LIMIT.into()),
+            OptionValue::String("100".into()),
+        )
+        .unwrap();
+        assert_eq!(stmt.row_limit, Some(100));
+
+        // Set SQL to get past the "SQL query not set" check
+        // (execute_schema will still fail because no server is running,
+        // but we're testing that row_limit is not modified)
+        stmt.set_sql_query("SELECT 1").unwrap();
+        let _ = stmt.execute_schema(); // Will fail, but that's expected
+
+        // Verify row_limit is NOT modified by execute_schema
+        // (execute_schema internally uses row_limit=0 but should not change the statement's row_limit)
+        assert_eq!(stmt.row_limit, Some(100), "row_limit should not be modified by execute_schema");
     }
 
     #[test]

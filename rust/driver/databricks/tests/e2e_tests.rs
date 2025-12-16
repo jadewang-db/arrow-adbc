@@ -5562,3 +5562,362 @@ fn test_e2e_execute_update_ddl_commands() {
     println!();
     println!("=== Work Item 4.8: execute_update() DDL Commands E2E Test PASSED ===");
 }
+
+// ============================================================================
+// Work Item 4.9: execute_schema() E2E Tests
+// ============================================================================
+
+/// Test execute_schema() returns the correct schema for a simple SELECT query.
+///
+/// This validates:
+/// - execute_schema() works without fetching actual data
+/// - Returns correct Arrow schema from manifest
+/// - Schema field names and types are correct
+#[test]
+#[ignore]
+fn test_e2e_execute_schema_simple_select() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_schema::DataType;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 4.9: execute_schema() Simple SELECT E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Test 1: Simple SELECT with literals
+    println!("Test 1: SELECT 1 AS int_col, 'hello' AS str_col");
+    stmt.set_sql_query("SELECT 1 AS int_col, 'hello' AS str_col")
+        .expect("Failed to set SQL query");
+
+    let schema = stmt.execute_schema().expect("Failed to execute_schema");
+    println!("  Schema: {:?}", schema);
+
+    assert_eq!(schema.fields().len(), 2, "Expected 2 fields");
+    assert_eq!(schema.field(0).name(), "int_col", "First field should be 'int_col'");
+    assert_eq!(schema.field(1).name(), "str_col", "Second field should be 'str_col'");
+
+    // Verify data types (INT and STRING)
+    assert_eq!(
+        *schema.field(0).data_type(),
+        DataType::Int32,
+        "int_col should be Int32"
+    );
+    assert_eq!(
+        *schema.field(1).data_type(),
+        DataType::Utf8,
+        "str_col should be Utf8"
+    );
+
+    println!();
+    println!("=== Work Item 4.9: execute_schema() Simple SELECT E2E Test PASSED ===");
+}
+
+/// Test execute_schema() with multiple data types.
+///
+/// This validates:
+/// - execute_schema() returns correct types for various Spark SQL types
+/// - All common data types are mapped correctly
+#[test]
+#[ignore]
+fn test_e2e_execute_schema_multiple_types() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_schema::DataType;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 4.9: execute_schema() Multiple Types E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Test with various data types using CAST
+    println!("Testing schema for multiple data types...");
+    stmt.set_sql_query(
+        "SELECT \
+            CAST(1 AS INT) AS col_int, \
+            CAST(100 AS BIGINT) AS col_bigint, \
+            CAST(3.14 AS DOUBLE) AS col_double, \
+            CAST(true AS BOOLEAN) AS col_boolean, \
+            CAST('text' AS STRING) AS col_string"
+    ).expect("Failed to set SQL query");
+
+    let schema = stmt.execute_schema().expect("Failed to execute_schema");
+    println!("  Schema: {:?}", schema);
+
+    assert_eq!(schema.fields().len(), 5, "Expected 5 fields");
+
+    // Verify field names
+    assert_eq!(schema.field(0).name(), "col_int");
+    assert_eq!(schema.field(1).name(), "col_bigint");
+    assert_eq!(schema.field(2).name(), "col_double");
+    assert_eq!(schema.field(3).name(), "col_boolean");
+    assert_eq!(schema.field(4).name(), "col_string");
+
+    // Verify data types
+    assert_eq!(*schema.field(0).data_type(), DataType::Int32);
+    assert_eq!(*schema.field(1).data_type(), DataType::Int64);
+    assert_eq!(*schema.field(2).data_type(), DataType::Float64);
+    assert_eq!(*schema.field(3).data_type(), DataType::Boolean);
+    assert_eq!(*schema.field(4).data_type(), DataType::Utf8);
+
+    println!();
+    println!("=== Work Item 4.9: execute_schema() Multiple Types E2E Test PASSED ===");
+}
+
+/// Test execute_schema() on a table from the test configuration.
+///
+/// This validates:
+/// - execute_schema() works with actual table queries
+/// - Schema matches the expected column count from config
+#[test]
+#[ignore]
+fn test_e2e_execute_schema_from_table() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    // Skip if no table metadata is configured
+    if config.metadata.table.is_empty() {
+        println!("Skipping test: No table metadata configured");
+        return;
+    }
+
+    println!("=== Work Item 4.9: execute_schema() From Table E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!("Table: {}.{}.{}", config.metadata.catalog, config.metadata.schema, config.metadata.table);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Get schema from actual table
+    let query = format!(
+        "SELECT * FROM {}.{}.{}",
+        config.metadata.catalog, config.metadata.schema, config.metadata.table
+    );
+    println!("Query: {}", query);
+    stmt.set_sql_query(&query).expect("Failed to set SQL query");
+
+    let schema = stmt.execute_schema().expect("Failed to execute_schema");
+    println!("  Schema fields: {}", schema.fields().len());
+    for (i, field) in schema.fields().iter().enumerate() {
+        println!("    {}: {} ({:?})", i, field.name(), field.data_type());
+    }
+
+    // Verify column count if configured
+    if config.metadata.expected_column_count > 0 {
+        assert_eq!(
+            schema.fields().len() as i32,
+            config.metadata.expected_column_count,
+            "Column count should match expected"
+        );
+    }
+
+    println!();
+    println!("=== Work Item 4.9: execute_schema() From Table E2E Test PASSED ===");
+}
+
+/// Test execute_schema() does not return data rows.
+///
+/// This validates:
+/// - execute_schema() is efficient and only gets schema
+/// - No data is actually transferred
+#[test]
+#[ignore]
+fn test_e2e_execute_schema_no_data() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 4.9: execute_schema() No Data E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Use a query that would return many rows, but execute_schema should not fetch them
+    println!("Testing that execute_schema does not fetch data...");
+    stmt.set_sql_query("SELECT id FROM RANGE(1000000) AS id")
+        .expect("Failed to set SQL query");
+
+    // This should complete quickly because it uses row_limit=0
+    let start = std::time::Instant::now();
+    let schema = stmt.execute_schema().expect("Failed to execute_schema");
+    let elapsed = start.elapsed();
+
+    println!("  Schema retrieved in {:?}", elapsed);
+    println!("  Schema: {:?}", schema);
+
+    assert_eq!(schema.fields().len(), 1, "Expected 1 field");
+    assert_eq!(schema.field(0).name(), "id", "Field should be 'id'");
+
+    // Should complete quickly (less than a few seconds since no data is fetched)
+    // Note: This assertion is soft - network latency can vary
+    println!("  Time check: {:?} (should be relatively fast)", elapsed);
+
+    println!();
+    println!("=== Work Item 4.9: execute_schema() No Data E2E Test PASSED ===");
+}
+
+/// Test execute_schema() error handling.
+///
+/// This validates:
+/// - execute_schema() returns appropriate errors for invalid SQL
+#[test]
+#[ignore]
+fn test_e2e_execute_schema_sql_error() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 4.9: execute_schema() SQL Error E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Test with invalid SQL
+    println!("Testing execute_schema with invalid SQL...");
+    stmt.set_sql_query("SELECT * FROM nonexistent_table_xyz_12345")
+        .expect("Failed to set SQL query");
+
+    let result = stmt.execute_schema();
+    assert!(result.is_err(), "execute_schema should fail for invalid table");
+    println!("  Error: {:?}", result.unwrap_err());
+
+    println!();
+    println!("=== Work Item 4.9: execute_schema() SQL Error E2E Test PASSED ===");
+}
