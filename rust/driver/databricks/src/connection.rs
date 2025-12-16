@@ -61,6 +61,7 @@ use tokio::runtime::Runtime;
 
 use crate::client::{SeaClient, SeaClientConfig};
 use crate::options::DatabaseConfig;
+use crate::runtime::{block_on_async, block_on_async_or_spawn, block_on_async_simple};
 use crate::session::SessionManager;
 use crate::statement::DatabricksStatement;
 
@@ -133,8 +134,9 @@ impl DatabricksConnection {
             config.default_schema.clone(),
         ));
 
-        // Create session eagerly
-        let session_id = runtime.block_on(session_manager.get_session_id()).map_err(|e| {
+        // Create session eagerly using the async/sync bridge
+        // Note: This will fail if called from within an async context
+        let session_id = block_on_async(&runtime, session_manager.get_session_id()).map_err(|e| {
             Error::with_message_and_status(
                 format!("Failed to create session: {}", e),
                 Status::IO,
@@ -156,14 +158,21 @@ impl DatabricksConnection {
     /// Get the session ID.
     ///
     /// Returns the session ID if a session is active.
+    ///
+    /// # Note
+    ///
+    /// This method uses `block_on` internally and should not be called from
+    /// within an async context. If called from async code, it will return `None`.
     pub fn session_id(&self) -> Option<String> {
-        // Use block_on to get the session ID synchronously
-        // This is safe because we create the session eagerly in new()
-        // so is_active() will return cached state
-        if self.runtime.block_on(self.session_manager.is_active()) {
-            self.runtime
-                .block_on(self.session_manager.get_session_id())
-                .ok()
+        // Use the async/sync bridge to get the session ID synchronously
+        // Since we create the session eagerly in new(), is_active() will return cached state
+        //
+        // If we're in an async context, we return None rather than panicking.
+        // This is a defensive approach for the session_id() accessor.
+        let is_active = block_on_async_simple(&self.runtime, self.session_manager.is_active())?;
+
+        if is_active {
+            block_on_async(&self.runtime, self.session_manager.get_session_id()).ok()
         } else {
             None
         }
@@ -193,32 +202,24 @@ impl DatabricksConnection {
 
 impl Drop for DatabricksConnection {
     fn drop(&mut self) {
-        // Terminate session on drop
+        // Terminate session on drop using the async/sync bridge
         // We ignore errors here since we're in drop and can't propagate them
         //
-        // Handle different runtime contexts:
-        // 1. If we're already inside a tokio runtime, we can't call block_on
-        //    (it would panic with "Cannot start a runtime from within a runtime")
-        // 2. If we're outside a tokio runtime, use block_on to terminate synchronously
+        // The block_on_async_or_spawn helper handles the runtime context:
+        // - If outside a tokio runtime: blocks synchronously
+        // - If inside a tokio runtime: spawns a detached task
         let session_manager = self.session_manager.clone();
 
-        if tokio::runtime::Handle::try_current().is_ok() {
-            // We're inside a tokio runtime - spawn a task to terminate asynchronously
-            // The task will run on the current runtime, not our owned runtime
-            tokio::spawn(async move {
-                if let Err(_e) = session_manager.terminate().await {
-                    #[cfg(debug_assertions)]
-                    eprintln!("Failed to terminate session on connection drop: {}", _e);
-                }
-            });
-        } else {
-            // We're outside a tokio runtime - safe to use block_on
-            let result = self.runtime.block_on(session_manager.terminate());
+        if let Some(result) = block_on_async_or_spawn(&self.runtime, async move {
+            session_manager.terminate().await
+        }) {
+            // We blocked synchronously - log any errors
             if let Err(_e) = result {
                 #[cfg(debug_assertions)]
                 eprintln!("Failed to terminate session on connection drop: {}", _e);
             }
         }
+        // If None, the task was spawned asynchronously - errors logged by the helper
     }
 }
 

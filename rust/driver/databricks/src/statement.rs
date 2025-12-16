@@ -50,6 +50,7 @@ use tokio::runtime::Runtime;
 use crate::client::{SeaClient, StatementResponse};
 use crate::error::Error as DatabricksError;
 use crate::fetch::ArrowResultReader;
+use crate::runtime::block_on_async;
 use crate::session::SessionManager;
 
 /// Statement option keys.
@@ -370,14 +371,16 @@ impl Statement for DatabricksStatement {
 
     fn cancel(&mut self) -> Result<()> {
         if let Some(ref statement_id) = self.statement_id {
-            // Cancel the statement via SEA API
+            // Cancel the statement via SEA API using the async/sync bridge
+            let client = self.client.clone();
             let statement_id = statement_id.clone();
-            self.runtime
-                .block_on(async { self.client.cancel_statement(&statement_id).await })
-                .map_err(|e| {
-                    let db_err: DatabricksError = e;
-                    Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
-                })?;
+            block_on_async(&self.runtime, async move {
+                client.cancel_statement(&statement_id).await
+            })
+            .map_err(|e| {
+                let db_err: DatabricksError = e;
+                Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
+            })?;
         }
         // Clear the statement ID after cancellation
         self.statement_id = None;
@@ -390,37 +393,35 @@ impl Statement for DatabricksStatement {
         })?;
 
         // Get session ID from session manager (creates session if needed)
-        let session_id = self
-            .runtime
-            .block_on(async { self.session_manager.get_session_id().await })
-            .map_err(|e| {
-                let db_err: DatabricksError = e;
-                Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
-            })?;
+        // Uses the async/sync bridge - will fail if called from async context
+        let session_manager = self.session_manager.clone();
+        let session_id = block_on_async(&self.runtime, async move {
+            session_manager.get_session_id().await
+        })
+        .map_err(|e| {
+            let db_err: DatabricksError = e;
+            Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
+        })?;
 
         // Determine max wait time
         let max_wait = self
             .max_wait
             .unwrap_or(Duration::from_secs(DEFAULT_MAX_WAIT_SECS));
 
-        // Execute statement and wait for completion
-        let response = self
-            .runtime
-            .block_on(async {
-                self.client
-                    .execute_and_wait(
-                        &session_id,
-                        sql,
-                        Some(max_wait),
-                        self.row_limit,
-                        self.byte_limit,
-                    )
-                    .await
-            })
-            .map_err(|e| {
-                let db_err: DatabricksError = e;
-                Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
-            })?;
+        // Execute statement and wait for completion using the async/sync bridge
+        let client = self.client.clone();
+        let sql = sql.clone();
+        let row_limit = self.row_limit;
+        let byte_limit = self.byte_limit;
+        let response = block_on_async(&self.runtime, async move {
+            client
+                .execute_and_wait(&session_id, &sql, Some(max_wait), row_limit, byte_limit)
+                .await
+        })
+        .map_err(|e| {
+            let db_err: DatabricksError = e;
+            Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
+        })?;
 
         // Store statement ID for potential cancellation
         self.statement_id = Some(response.statement_id.clone());
@@ -449,47 +450,42 @@ impl Statement for DatabricksStatement {
             Error::with_message_and_status("SQL query not set", Status::InvalidState)
         })?;
 
-        // Get session ID from session manager
-        let session_id = self
-            .runtime
-            .block_on(async { self.session_manager.get_session_id().await })
-            .map_err(|e| {
-                let db_err: DatabricksError = e;
-                Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
-            })?;
+        // Get session ID from session manager using the async/sync bridge
+        let session_manager = self.session_manager.clone();
+        let session_id = block_on_async(&self.runtime, async move {
+            session_manager.get_session_id().await
+        })
+        .map_err(|e| {
+            let db_err: DatabricksError = e;
+            Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
+        })?;
 
         // Determine max wait time
         let max_wait = self
             .max_wait
             .unwrap_or(Duration::from_secs(DEFAULT_MAX_WAIT_SECS));
 
-        // Execute statement and wait for completion
-        let response = self
-            .runtime
-            .block_on(async {
-                self.client
-                    .execute_and_wait(
-                        &session_id,
-                        sql,
-                        Some(max_wait),
-                        self.row_limit,
-                        self.byte_limit,
-                    )
-                    .await
-            })
-            .map_err(|e| {
-                let db_err: DatabricksError = e;
-                Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
-            })?;
+        // Execute statement and wait for completion using the async/sync bridge
+        let client = self.client.clone();
+        let sql = sql.clone();
+        let row_limit = self.row_limit;
+        let byte_limit = self.byte_limit;
+        let response = block_on_async(&self.runtime, async move {
+            client
+                .execute_and_wait(&session_id, &sql, Some(max_wait), row_limit, byte_limit)
+                .await
+        })
+        .map_err(|e| {
+            let db_err: DatabricksError = e;
+            Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
+        })?;
 
         // Store statement ID
         self.statement_id = Some(response.statement_id.clone());
 
         // Return affected row count from manifest if available
         // For DDL/DML, the manifest may contain the row count
-        let row_count = response
-            .manifest
-            .and_then(|m| m.total_row_count);
+        let row_count = response.manifest.and_then(|m| m.total_row_count);
 
         Ok(row_count)
     }

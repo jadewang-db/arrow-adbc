@@ -2527,6 +2527,42 @@ Implement the bridge pattern between sync ADBC trait methods and async internal 
 
 ### Files Modified/Created
 - `driver/databricks/src/statement.rs` (add async/sync bridge)
+- `driver/databricks/src/runtime.rs` (new - async/sync bridge utilities)
+- `driver/databricks/src/connection.rs` (updated to use runtime utilities)
+
+### Implementation Notes (Completed 2024-12-16)
+
+**Actual Implementation:**
+
+The async/sync bridge was implemented in a dedicated `runtime` module with three utility functions:
+
+1. **`block_on_async<F, T>(runtime, future) -> Result<T>`**
+   - For operations returning `Result<T>`
+   - Used by `execute()`, `execute_update()`, `cancel()`
+   - Panics if called from async task context (tokio's built-in behavior)
+
+2. **`block_on_async_simple<F, T>(runtime, future) -> Option<T>`**
+   - For operations returning plain values
+   - Used by `session_id()` to check `is_active()`
+   - Returns `Some(value)` in sync context
+
+3. **`block_on_async_or_spawn<F, T>(runtime, future) -> Option<Result<T>>`**
+   - For `Drop` implementations
+   - Detects async context using `Handle::try_current()`
+   - In async context: spawns detached task, returns `None`
+   - In sync context: blocks and returns `Some(result)`
+
+**Key Design Decision:**
+
+Initially we tried to detect nested runtime context using `Handle::try_current().is_ok()`,
+but this check is too strict - it returns true even inside `spawn_blocking` threads where
+`block_on` is actually safe. The final implementation:
+- For normal operations: trusts tokio's built-in panic behavior
+- For Drop: uses `Handle::try_current()` to decide between blocking vs spawning
+
+**Tests Added:**
+- Unit tests in `runtime.rs` for all three functions
+- E2E tests for full workflow, multiple statements, execute_update, and drop cleanup
 
 ---
 

@@ -58,6 +58,7 @@ mod driver;
 mod error;
 mod fetch;
 mod options;
+pub mod runtime;
 pub mod session;
 mod statement;
 

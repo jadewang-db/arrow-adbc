@@ -650,30 +650,101 @@ flowchart TB
 
 ### 6.2 Async/Sync Bridge
 
+The driver uses async internally (tokio + reqwest) but exposes sync ADBC trait methods.
+The `runtime` module provides helper functions for bridging between async and sync contexts.
+
+**Implementation Details:**
+
+The runtime module (`src/runtime.rs`) provides three helper functions:
+
+1. **`block_on_async`**: For operations that return `Result<T>`. Used by execute(), cancel(), etc.
+2. **`block_on_async_simple`**: For operations that return plain values (like `is_active()`).
+3. **`block_on_async_or_spawn`**: For Drop implementations - blocks in sync context, spawns in async.
+
 ```rust
-impl DatabricksStatement {
-    /// Execute query (sync ADBC interface)
-    pub fn execute(&mut self) -> Result<impl RecordBatchReader + Send> {
-        // Block on async execution within the shared runtime
-        self.runtime.block_on(self.execute_async())
-    }
+// src/runtime.rs - Async/Sync Bridge Utilities
 
-    /// Internal async implementation
-    async fn execute_async(&mut self) -> Result<ArrowResultReader> {
-        let response = self.client.execute_statement(&request).await?;
+/// Block on an async operation from a sync context.
+/// Note: Will panic if called from within an async task context.
+pub fn block_on_async<F, T>(runtime: &Runtime, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    runtime.block_on(future)
+}
 
-        match response.status.state {
-            State::Succeeded => self.handle_success(response).await,
-            State::Pending | State::Running => {
-                let final_response = self.poll_until_complete(response.statement_id).await?;
-                self.handle_success(final_response).await
-            }
-            State::Failed => Err(self.map_error(response.status.error)),
-            _ => Err(Error::with_message_and_status("Unexpected state", Status::Internal)),
-        }
+/// Block on async or spawn for Drop implementations.
+/// Returns Some(result) in sync context, None if spawned.
+pub fn block_on_async_or_spawn<F, T>(runtime: &Arc<Runtime>, future: F) -> Option<Result<T>>
+where
+    F: Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // In async context - spawn detached task
+        tokio::spawn(async move { let _ = future.await; });
+        None
+    } else {
+        // In sync context - safe to block
+        Some(runtime.block_on(future))
     }
 }
 ```
+
+**Usage in Statement:**
+
+```rust
+impl Statement for DatabricksStatement {
+    fn execute(&mut self) -> Result<impl RecordBatchReader + Send> {
+        let sql = self.sql_query.as_ref().ok_or_else(|| /* error */)?;
+
+        // Get session ID using async/sync bridge
+        let session_manager = self.session_manager.clone();
+        let session_id = block_on_async(&self.runtime, async move {
+            session_manager.get_session_id().await
+        })?;
+
+        // Execute statement using async/sync bridge
+        let client = self.client.clone();
+        let response = block_on_async(&self.runtime, async move {
+            client.execute_and_wait(&session_id, &sql, ...).await
+        })?;
+
+        self.response_to_reader(response)
+    }
+}
+```
+
+**Connection Drop Handling:**
+
+```rust
+impl Drop for DatabricksConnection {
+    fn drop(&mut self) {
+        let session_manager = self.session_manager.clone();
+
+        // Use block_on_async_or_spawn for safe cleanup
+        if let Some(result) = block_on_async_or_spawn(&self.runtime, async move {
+            session_manager.terminate().await
+        }) {
+            if let Err(e) = result {
+                eprintln!("Failed to terminate session: {}", e);
+            }
+        }
+        // If None, task was spawned asynchronously
+    }
+}
+```
+
+**Important Notes:**
+
+1. **Nested Runtime Detection**: Calling `block_on` from within an async task will panic.
+   The driver detects this case in Drop and spawns a detached task instead.
+
+2. **spawn_blocking Compatibility**: Code inside `spawn_blocking` can safely call `block_on`
+   because `spawn_blocking` runs on a blocking thread pool, not the async task context.
+
+3. **Testing**: Tests that need to create connections use `spawn_blocking` to run in a
+   sync context while still being async test functions.
 
 ---
 

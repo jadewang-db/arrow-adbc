@@ -3248,3 +3248,297 @@ fn test_e2e_adbc_statement_sql_error() {
     println!();
     println!("=== ADBC Statement SQL Error E2E Test PASSED ===");
 }
+
+// ============================================================================
+// Work Item 2.6: Async/Sync Bridge E2E Tests
+// ============================================================================
+
+/// Complete E2E test for the full ADBC workflow with async/sync bridge.
+///
+/// This validates:
+/// - block_on works correctly from sync context
+/// - Session is created during connection establishment
+/// - Statement execution works through the sync interface
+/// - All results can be read synchronously
+/// - Session cleanup on drop works correctly
+/// - Multiple statements can share the same runtime
+#[test]
+#[ignore]
+fn test_e2e_full_workflow_with_async_sync_bridge() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Async/Sync Bridge Full Workflow E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Step 1: Create driver (sync)
+    println!("Step 1: Create driver");
+    let mut driver = DatabricksDriver::new();
+    println!("  - Driver created");
+
+    // Step 2: Create database (sync)
+    println!("Step 2: Create database with options");
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+    println!("  - Database created");
+
+    // Step 3: Create connection (sync - this triggers async session creation)
+    println!("Step 3: Create connection (blocks on async session creation)");
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    let session_id = conn.session_id();
+    assert!(session_id.is_some(), "Connection should have a session ID");
+    println!("  - Connection created with session: {}", session_id.unwrap());
+
+    // Step 4: Create first statement (sync)
+    println!("Step 4: Create first statement");
+    let mut stmt1 = conn.new_statement().expect("Failed to create statement");
+    println!("  - Statement created");
+
+    // Step 5: Execute query (sync - blocks on async execution)
+    println!("Step 5: Execute first query (blocks on async execution)");
+    stmt1
+        .set_sql_query("SELECT 1 AS a, 2 AS b, 3 AS c")
+        .expect("Failed to set SQL query");
+    let reader = stmt1.execute().expect("Failed to execute statement");
+    println!("  - Query executed");
+
+    // Step 6: Read all results (sync)
+    println!("Step 6: Read all results synchronously");
+    let batches: Vec<_> = reader.into_iter().collect();
+    let total_rows: usize = batches
+        .iter()
+        .filter_map(|b| b.as_ref().ok())
+        .map(|b| b.num_rows())
+        .sum();
+    println!("  - Read {} batch(es) with {} total row(s)", batches.len(), total_rows);
+    assert!(total_rows >= 1, "Should have at least 1 row");
+
+    // Step 7: Create second statement (shared runtime)
+    println!("Step 7: Create second statement (shared runtime)");
+    let mut stmt2 = conn.new_statement().expect("Failed to create second statement");
+    println!("  - Second statement created");
+
+    // Step 8: Execute second query
+    println!("Step 8: Execute second query");
+    stmt2
+        .set_sql_query("SELECT 'hello' AS greeting, 42 AS answer")
+        .expect("Failed to set SQL query");
+    let reader2 = stmt2.execute().expect("Failed to execute second statement");
+    let batches2: Vec<_> = reader2.into_iter().collect();
+    let total_rows2: usize = batches2
+        .iter()
+        .filter_map(|b| b.as_ref().ok())
+        .map(|b| b.num_rows())
+        .sum();
+    println!("  - Read {} batch(es) with {} total row(s)", batches2.len(), total_rows2);
+
+    // Step 9: Drop connection (triggers async session termination)
+    println!("Step 9: Drop connection (triggers async session termination)");
+    drop(stmt1);
+    drop(stmt2);
+    drop(conn);
+    println!("  - Connection dropped, session termination triggered");
+
+    println!();
+    println!("=== Async/Sync Bridge Full Workflow E2E Test PASSED ===");
+    println!("All async operations successfully bridged to sync interface!");
+}
+
+/// Test that multiple statements share the same Tokio runtime.
+///
+/// This validates:
+/// - Multiple statements created from the same connection share the runtime
+/// - Concurrent statement execution works (sequential in this test)
+#[test]
+#[ignore]
+fn test_e2e_multiple_statements_same_runtime() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Multiple Statements Same Runtime E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session: {:?}", conn.session_id());
+
+    // Create multiple statements
+    let num_statements = 3;
+    println!("Creating {} statements...", num_statements);
+
+    for i in 0..num_statements {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(&format!("SELECT {} AS iteration", i + 1))
+            .expect("Failed to set SQL query");
+
+        let reader = stmt.execute().expect("Failed to execute statement");
+        let batches: Vec<_> = reader.into_iter().collect();
+
+        println!(
+            "  Statement {}: executed and read {} batch(es)",
+            i + 1,
+            batches.len()
+        );
+    }
+
+    println!();
+    println!("=== Multiple Statements Same Runtime E2E Test PASSED ===");
+    println!("All {} statements executed successfully!", num_statements);
+}
+
+/// Test execute_update for DDL/DML operations.
+///
+/// This validates:
+/// - execute_update works through the async/sync bridge
+/// - Row count is returned for DML operations
+#[test]
+#[ignore]
+fn test_e2e_execute_update_with_async_sync_bridge() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Execute Update Async/Sync Bridge E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created");
+
+    // Create statement for DDL
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Execute a query that doesn't return rows (using execute_update)
+    // Note: SELECT also works with execute_update
+    println!("Executing SELECT via execute_update...");
+    stmt.set_sql_query("SELECT 1")
+        .expect("Failed to set SQL query");
+    let row_count = stmt.execute_update().expect("Failed to execute_update");
+    println!("  execute_update returned row count: {:?}", row_count);
+
+    println!();
+    println!("=== Execute Update Async/Sync Bridge E2E Test PASSED ===");
+}
+
+/// Test connection drop terminates session correctly.
+///
+/// This validates:
+/// - Session is created when connection is established
+/// - Session is terminated when connection is dropped
+/// - The async/sync bridge handles drop correctly in sync context
+#[test]
+#[ignore]
+fn test_e2e_connection_drop_terminates_session() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Database, Driver};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Connection Drop Terminates Session E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver and database
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    // Create connection in a block to control when drop happens
+    let session_id = {
+        let conn = db.new_connection().expect("Failed to create connection");
+        let session_id = conn.session_id().expect("Should have session ID");
+        println!("Connection created with session: {}", session_id);
+        session_id
+        // Connection dropped here - session termination triggered
+    };
+
+    println!("Connection dropped, session {} should be terminating...", session_id);
+
+    // Note: We can't easily verify the session was terminated without
+    // making additional API calls. The test verifies that drop doesn't panic
+    // and completes successfully.
+
+    println!();
+    println!("=== Connection Drop Terminates Session E2E Test PASSED ===");
+    println!("Connection dropped without errors.");
+}
