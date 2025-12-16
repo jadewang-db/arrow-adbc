@@ -3982,79 +3982,93 @@ For each metadata API, the pattern is:
 
 ---
 
-## 4.7 Connection - get_table_schema()
+## 4.7 Connection - get_table_schema() [COMPLETED]
 
 ### Objective
 Implement efficient single-table schema retrieval.
 
-### Actions
+### Implementation Summary (Completed 2024-12-16)
+
+The implementation executes a DESCRIBE TABLE query via SEA API and parses the result into an Arrow Schema.
+
+**Key Components:**
+- `get_table_schema()`: Main method that constructs and executes DESCRIBE TABLE query
+- `describe_result_to_schema()`: Parses SEA response into Arrow Schema
+- `spark_type_to_arrow()`: Maps Spark SQL type strings to Arrow DataType
+- Helper functions for parsing complex types (decimal, array, map, struct)
+
+**Type Mapping Support:**
+- Simple types: boolean, int, bigint, string, binary, date, timestamp, etc.
+- Parameterized types: decimal(p,s), varchar(n), char(n)
+- Complex types: array<T>, map<K,V>, struct<field:type,...>
+
+**Identifier Handling:**
+- Uses backtick quoting for safe identifier handling
+- Falls back to connection's current_catalog/current_schema when not specified
+
+### Actual Implementation
 
 ```rust
 impl Connection for DatabricksConnection {
     fn get_table_schema(
-        &mut self,
+        &self,
         catalog: Option<&str>,
         db_schema: Option<&str>,
         table_name: &str,
-    ) -> adbc_core::error::Result<Schema> {
-        let full_name = format!(
-            "{}.{}.{}",
-            catalog.unwrap_or("main"),
-            db_schema.unwrap_or("default"),
-            table_name
+    ) -> Result<Schema> {
+        // Use provided values or fall back to connection defaults
+        let catalog_name = catalog
+            .or(self.current_catalog.as_deref())
+            .unwrap_or("main");
+        let schema_name = db_schema
+            .or(self.current_schema.as_deref())
+            .unwrap_or("default");
+
+        // Construct with backtick quoting for safety
+        let sql = format!(
+            "DESCRIBE TABLE `{}`.`{}`.`{}`",
+            catalog_name, schema_name, table_name
         );
 
-        let sql = format!("DESCRIBE TABLE {}", full_name);
+        // Execute via SEA client directly
+        let response = block_on_async(&self.runtime, async move {
+            client.execute_and_wait(&session_id, &sql, None, None, None).await
+        })?;
 
-        let mut stmt = self.new_statement()?;
-        stmt.set_sql_query(&sql)?;
-        let reader = stmt.execute()?;
-
-        // Parse DESCRIBE output into Arrow Schema
-        let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>()?;
-
-        self.describe_to_schema(&batches)
+        // Parse DESCRIBE result into Arrow Schema
+        self.describe_result_to_schema(&response)
     }
 }
 ```
 
 ### Test Types
-- **Unit Tests**: Schema parsing from DESCRIBE output
-- **Integration Tests**: get_table_schema with mock responses
+- **Unit Tests**: Schema parsing from DESCRIBE output, type mapping tests
 - **E2E Tests**: Retrieve schema for real tables from Databricks
 
+### E2E Tests Implemented
+
+1. `test_e2e_get_table_schema_system_table` - Retrieves schema for system.information_schema.tables
+2. `test_e2e_get_table_schema_configured_table` - Retrieves schema for configured test table
+3. `test_e2e_get_table_schema_uses_connection_defaults` - Verifies catalog/schema defaults work
+4. `test_e2e_get_table_schema_nonexistent_table` - Verifies error handling for invalid tables
+5. `test_e2e_get_table_schema_type_mapping` - Verifies type mapping with information_schema.columns
+
 ### E2E Exit Criteria
-✅ **E2E Test**: `test_e2e_metadata_get_table_schema` - Retrieve schema for test tables with real Databricks
+✅ **COMPLETED**: All E2E tests pass against real Databricks instance
 
 ```rust
 #[test]
 #[ignore]
-fn test_e2e_metadata_get_table_schema() {
-    skip_if_no_config!();
+fn test_e2e_get_table_schema_system_table() {
+    // Retrieves schema for system.information_schema.tables
+    // Verifies expected columns: table_catalog, table_schema, table_name, table_type
+}
 
-    let config = get_test_config();
-    let mut conn = create_test_connection();
-
-    // Get schema for test_types table
-    let schema = conn.get_table_schema(
-        Some(&config.metadata.catalog),
-        Some(&config.metadata.schema),
-        &config.metadata.table
-    ).unwrap();
-
-    // Verify expected columns from test_types table
-    assert_eq!(schema.fields().len(), config.metadata.expected_column_count as usize);
-
-    // Verify specific columns exist
-    let field_names: Vec<&str> = schema.fields().iter()
-        .map(|f| f.name().as_str())
-        .collect();
-
-    assert!(field_names.contains(&"col_boolean"));
-    assert!(field_names.contains(&"col_int"));
-    assert!(field_names.contains(&"col_string"));
-
-    println!("Table schema verified: {} columns", schema.fields().len());
+#[test]
+#[ignore]
+fn test_e2e_get_table_schema_configured_table() {
+    // Uses config.metadata.catalog/schema/table from test config
+    // Verifies column count matches config.metadata.expected_column_count
 }
 ```
 
@@ -4608,7 +4622,7 @@ cargo test --ignored -- --nocapture
 - [ ] Sprint 2: test_e2e_query_data_types
 - [ ] Sprint 3: test_e2e_query_large_result
 - [ ] Sprint 3: test_e2e_query_external_links_decompression
-- [ ] Sprint 4: test_e2e_metadata_get_table_schema
+- [x] Sprint 4: test_e2e_metadata_get_table_schema (Completed as test_e2e_get_table_schema_*)
 - [ ] Sprint 4: test_e2e_execute_update_dml
 - [ ] Sprint 5: test_e2e_complete_workflow
 - [ ] Sprint 5: test_e2e_concurrent_statements
