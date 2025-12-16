@@ -589,6 +589,198 @@ impl SeaClient {
     }
 
     // ========================================================================
+    // Statement Polling Methods
+    // ========================================================================
+
+    /// Poll a statement until it reaches a terminal state.
+    ///
+    /// This method polls the statement status with exponential backoff until
+    /// the statement reaches a terminal state (SUCCEEDED, FAILED, CANCELED, or CLOSED).
+    ///
+    /// The polling intervals follow exponential backoff:
+    /// - Initial interval: 1 second
+    /// - Maximum interval: 10 seconds
+    /// - Backoff multiplier: 2x
+    ///
+    /// # Arguments
+    ///
+    /// * `statement_id` - The ID of the statement to poll
+    /// * `max_wait` - Maximum time to wait for completion. If `None`, defaults to 5 minutes.
+    ///
+    /// # Returns
+    ///
+    /// The final statement response when the statement reaches a terminal state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The statement fails (returns [`Error::StatementFailed`])
+    /// - The statement is canceled (returns [`Error::StatementFailed`])
+    /// - The statement is closed unexpectedly (returns [`Error::StatementFailed`])
+    /// - The timeout is reached (returns [`Error::Timeout`])
+    /// - A network or API error occurs
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    ///
+    /// let response = client.poll_until_complete(
+    ///     "stmt-123",
+    ///     Some(Duration::from_secs(60)),
+    /// ).await?;
+    /// ```
+    pub async fn poll_until_complete(
+        &self,
+        statement_id: &str,
+        max_wait: Option<Duration>,
+    ) -> Result<StatementResponse> {
+        let start = std::time::Instant::now();
+        let max_wait = max_wait.unwrap_or(Duration::from_secs(300)); // 5 min default
+
+        let mut poll_interval = Duration::from_secs(1);
+        let max_poll_interval = Duration::from_secs(10);
+
+        loop {
+            let response = self.get_statement(statement_id).await?;
+
+            match response.status.state {
+                StatementState::Succeeded => return Ok(response),
+                StatementState::Failed => {
+                    let error_msg = response
+                        .status
+                        .error
+                        .as_ref()
+                        .map(|e| {
+                            format!(
+                                "{}: {}",
+                                e.error_code.as_deref().unwrap_or("UNKNOWN"),
+                                e.message.as_deref().unwrap_or("Statement failed")
+                            )
+                        })
+                        .unwrap_or_else(|| "Statement failed".to_string());
+                    return Err(Error::statement_failed(error_msg));
+                }
+                StatementState::Canceled => {
+                    return Err(Error::statement_failed("Statement was canceled"));
+                }
+                StatementState::Closed => {
+                    return Err(Error::statement_failed("Statement was closed"));
+                }
+                StatementState::Pending | StatementState::Running => {
+                    // Check timeout
+                    if start.elapsed() >= max_wait {
+                        return Err(Error::Timeout);
+                    }
+
+                    // Sleep with exponential backoff
+                    tokio::time::sleep(poll_interval).await;
+                    poll_interval = (poll_interval * 2).min(max_poll_interval);
+                }
+            }
+        }
+    }
+
+    /// Execute a SQL statement and wait for completion.
+    ///
+    /// This is a convenience method that combines [`execute_statement`] with
+    /// [`poll_until_complete`]. It first executes the statement with an initial
+    /// wait timeout, and if the statement doesn't complete immediately, it polls
+    /// until completion.
+    ///
+    /// Note: The SEA API does not allow setting `session_id` and `catalog`/`schema`
+    /// at the same time. If you need to specify catalog/schema context, create the
+    /// session with the desired catalog/schema, and then use this method with just
+    /// the session_id.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The session ID to use for execution
+    /// * `sql` - The SQL statement to execute
+    /// * `max_wait` - Maximum time to wait for completion. If `None`, defaults to 5 minutes.
+    /// * `row_limit` - Optional limit on the number of rows returned
+    /// * `byte_limit` - Optional limit on the response size in bytes
+    ///
+    /// # Returns
+    ///
+    /// The statement response with the completed results.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The statement fails to execute
+    /// - The statement fails during execution
+    /// - The timeout is reached
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    ///
+    /// let response = client.execute_and_wait(
+    ///     "session-123",
+    ///     "SELECT * FROM my_table",
+    ///     Some(Duration::from_secs(60)),
+    ///     Some(1000),
+    ///     None,
+    /// ).await?;
+    /// ```
+    pub async fn execute_and_wait(
+        &self,
+        session_id: &str,
+        sql: &str,
+        max_wait: Option<Duration>,
+        row_limit: Option<i64>,
+        byte_limit: Option<i64>,
+    ) -> Result<StatementResponse> {
+        // Build the execute request
+        // Note: catalog/schema cannot be set with session_id per SEA API constraints
+        let mut request = ExecuteStatementRequest::new(&self.warehouse_id, sql)
+            .with_session_id(session_id)
+            .with_wait_timeout("10s"); // Initial wait for fast queries
+
+        if let Some(limit) = row_limit {
+            request = request.with_row_limit(limit);
+        }
+        if let Some(limit) = byte_limit {
+            request = request.with_byte_limit(limit);
+        }
+
+        // Execute the statement
+        let response = self.execute_statement(&request).await?;
+
+        // Check if already completed
+        match response.status.state {
+            StatementState::Succeeded => Ok(response),
+            StatementState::Failed => {
+                let error_msg = response
+                    .status
+                    .error
+                    .as_ref()
+                    .map(|e| {
+                        format!(
+                            "{}: {}",
+                            e.error_code.as_deref().unwrap_or("UNKNOWN"),
+                            e.message.as_deref().unwrap_or("Statement failed")
+                        )
+                    })
+                    .unwrap_or_else(|| "Statement failed".to_string());
+                Err(Error::statement_failed(error_msg))
+            }
+            StatementState::Canceled => {
+                Err(Error::statement_failed("Statement was canceled"))
+            }
+            StatementState::Closed => {
+                Err(Error::statement_failed("Statement was closed"))
+            }
+            StatementState::Pending | StatementState::Running => {
+                // Poll until complete
+                self.poll_until_complete(&response.statement_id, max_wait).await
+            }
+        }
+    }
+
+    // ========================================================================
     // Retry Logic
     // ========================================================================
 
@@ -1539,6 +1731,585 @@ mod tests {
 
             let response = result.unwrap();
             assert_eq!(response.statement_id, "stmt-full");
+        }
+
+        // ====================================================================
+        // get_statement Tests
+        // ====================================================================
+
+        #[tokio::test]
+        async fn test_get_statement_success() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/api/2.0/sql/statements/stmt-123"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-123",
+                    "status": {
+                        "state": "SUCCEEDED"
+                    },
+                    "manifest": {
+                        "format": "ARROW_STREAM",
+                        "total_row_count": 100
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let response = client.get_statement("stmt-123").await;
+
+            assert!(response.is_ok());
+            let response = response.unwrap();
+            assert_eq!(response.statement_id, "stmt-123");
+            assert_eq!(response.status.state, StatementState::Succeeded);
+        }
+
+        #[tokio::test]
+        async fn test_get_statement_pending() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/api/2.0/sql/statements/stmt-pending"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-pending",
+                    "status": {
+                        "state": "PENDING"
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let response = client.get_statement("stmt-pending").await.unwrap();
+
+            assert_eq!(response.status.state, StatementState::Pending);
+        }
+
+        #[tokio::test]
+        async fn test_get_statement_running() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/api/2.0/sql/statements/stmt-running"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-running",
+                    "status": {
+                        "state": "RUNNING"
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let response = client.get_statement("stmt-running").await.unwrap();
+
+            assert_eq!(response.status.state, StatementState::Running);
+        }
+
+        #[tokio::test]
+        async fn test_get_statement_failed() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/api/2.0/sql/statements/stmt-failed"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-failed",
+                    "status": {
+                        "state": "FAILED",
+                        "error": {
+                            "error_code": "RESOURCE_EXHAUSTED",
+                            "message": "Query exceeded memory limits"
+                        }
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let response = client.get_statement("stmt-failed").await.unwrap();
+
+            assert_eq!(response.status.state, StatementState::Failed);
+            assert!(response.status.error.is_some());
+            let error = response.status.error.unwrap();
+            assert_eq!(error.error_code, Some("RESOURCE_EXHAUSTED".to_string()));
+        }
+
+        // ====================================================================
+        // poll_until_complete Tests
+        // ====================================================================
+
+        #[tokio::test]
+        async fn test_poll_until_complete_immediate_success() {
+            let mock_server = MockServer::start().await;
+
+            // First poll returns SUCCEEDED immediately
+            Mock::given(method("GET"))
+                .and(path("/api/2.0/sql/statements/stmt-fast"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-fast",
+                    "status": {
+                        "state": "SUCCEEDED"
+                    },
+                    "manifest": {
+                        "total_row_count": 1
+                    }
+                })))
+                .expect(1) // Should only call once
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let result = client.poll_until_complete(
+                "stmt-fast",
+                Some(Duration::from_secs(10)),
+            ).await;
+
+            assert!(result.is_ok());
+            let response = result.unwrap();
+            assert_eq!(response.status.state, StatementState::Succeeded);
+        }
+
+        #[tokio::test]
+        async fn test_poll_until_complete_after_pending() {
+            let mock_server = MockServer::start().await;
+
+            // Use a sequence: PENDING -> RUNNING -> SUCCEEDED
+            let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let call_count_clone = call_count.clone();
+
+            Mock::given(method("GET"))
+                .and(path("/api/2.0/sql/statements/stmt-slow"))
+                .respond_with(move |_req: &wiremock::Request| {
+                    let count = call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    match count {
+                        0 => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "statement_id": "stmt-slow",
+                            "status": { "state": "PENDING" }
+                        })),
+                        1 => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "statement_id": "stmt-slow",
+                            "status": { "state": "RUNNING" }
+                        })),
+                        _ => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "statement_id": "stmt-slow",
+                            "status": { "state": "SUCCEEDED" },
+                            "manifest": { "total_row_count": 100 }
+                        })),
+                    }
+                })
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+
+            // Use a custom backoff with very short delays for testing
+            // We can't easily change the backoff in the method, so we just test it works
+            let start = std::time::Instant::now();
+            let result = client.poll_until_complete(
+                "stmt-slow",
+                Some(Duration::from_secs(30)),
+            ).await;
+
+            assert!(result.is_ok(), "Expected success, got {:?}", result);
+            let response = result.unwrap();
+            assert_eq!(response.status.state, StatementState::Succeeded);
+
+            // Verify multiple calls were made
+            let total_calls = call_count.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(total_calls >= 3, "Expected at least 3 calls, got {}", total_calls);
+
+            // Verify exponential backoff timing (1s + 2s = 3s minimum)
+            let elapsed = start.elapsed();
+            assert!(elapsed >= Duration::from_secs(2), "Expected at least 2s delay, got {:?}", elapsed);
+        }
+
+        #[tokio::test]
+        async fn test_poll_until_complete_fails() {
+            let mock_server = MockServer::start().await;
+
+            // Return FAILED state
+            Mock::given(method("GET"))
+                .and(path("/api/2.0/sql/statements/stmt-will-fail"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-will-fail",
+                    "status": {
+                        "state": "FAILED",
+                        "error": {
+                            "error_code": "QUERY_TIMEOUT",
+                            "message": "Query execution timed out"
+                        }
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let result = client.poll_until_complete(
+                "stmt-will-fail",
+                Some(Duration::from_secs(10)),
+            ).await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            match err {
+                Error::StatementFailed(msg) => {
+                    assert!(msg.contains("QUERY_TIMEOUT"), "Error should contain error code: {}", msg);
+                    assert!(msg.contains("timed out"), "Error should contain message: {}", msg);
+                }
+                _ => panic!("Expected StatementFailed error, got {:?}", err),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_poll_until_complete_canceled() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/api/2.0/sql/statements/stmt-canceled"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-canceled",
+                    "status": {
+                        "state": "CANCELED"
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let result = client.poll_until_complete(
+                "stmt-canceled",
+                Some(Duration::from_secs(10)),
+            ).await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            match err {
+                Error::StatementFailed(msg) => {
+                    assert!(msg.contains("canceled"), "Error should mention cancellation: {}", msg);
+                }
+                _ => panic!("Expected StatementFailed error, got {:?}", err),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_poll_until_complete_closed() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/api/2.0/sql/statements/stmt-closed"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-closed",
+                    "status": {
+                        "state": "CLOSED"
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let result = client.poll_until_complete(
+                "stmt-closed",
+                Some(Duration::from_secs(10)),
+            ).await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            match err {
+                Error::StatementFailed(msg) => {
+                    assert!(msg.contains("closed"), "Error should mention closed: {}", msg);
+                }
+                _ => panic!("Expected StatementFailed error, got {:?}", err),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_poll_until_complete_timeout() {
+            let mock_server = MockServer::start().await;
+
+            // Always return RUNNING - will timeout
+            Mock::given(method("GET"))
+                .and(path("/api/2.0/sql/statements/stmt-forever"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-forever",
+                    "status": {
+                        "state": "RUNNING"
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+
+            // Use very short timeout for testing
+            let start = std::time::Instant::now();
+            let result = client.poll_until_complete(
+                "stmt-forever",
+                Some(Duration::from_millis(100)), // Very short timeout
+            ).await;
+
+            let elapsed = start.elapsed();
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            match err {
+                Error::Timeout => {
+                    // Timeout should occur after approximately the specified duration
+                    assert!(elapsed >= Duration::from_millis(100), "Should wait at least 100ms");
+                }
+                _ => panic!("Expected Timeout error, got {:?}", err),
+            }
+        }
+
+        // ====================================================================
+        // execute_and_wait Tests
+        // ====================================================================
+
+        #[tokio::test]
+        async fn test_execute_and_wait_immediate_success() {
+            let mock_server = MockServer::start().await;
+
+            // Execute returns SUCCEEDED immediately
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-instant",
+                    "status": {
+                        "state": "SUCCEEDED"
+                    },
+                    "manifest": {
+                        "total_row_count": 1
+                    },
+                    "result": {
+                        "data_array": [[42]],
+                        "row_count": 1
+                    }
+                })))
+                .expect(1) // Only one call needed
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let result = client.execute_and_wait(
+                "session-123",
+                "SELECT 42",
+                Some(Duration::from_secs(10)),
+                None,
+                None,
+            ).await;
+
+            assert!(result.is_ok());
+            let response = result.unwrap();
+            assert_eq!(response.status.state, StatementState::Succeeded);
+            assert_eq!(response.statement_id, "stmt-instant");
+        }
+
+        #[tokio::test]
+        async fn test_execute_and_wait_with_polling() {
+            let mock_server = MockServer::start().await;
+
+            // Execute returns PENDING
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-async",
+                    "status": {
+                        "state": "PENDING"
+                    }
+                })))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            // Polling returns SUCCEEDED after one poll
+            Mock::given(method("GET"))
+                .and(path("/api/2.0/sql/statements/stmt-async"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-async",
+                    "status": {
+                        "state": "SUCCEEDED"
+                    },
+                    "manifest": {
+                        "total_row_count": 100
+                    }
+                })))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let result = client.execute_and_wait(
+                "session-456",
+                "SELECT * FROM large_table",
+                Some(Duration::from_secs(60)),
+                Some(1000),
+                None,
+            ).await;
+
+            assert!(result.is_ok());
+            let response = result.unwrap();
+            assert_eq!(response.status.state, StatementState::Succeeded);
+        }
+
+        #[tokio::test]
+        async fn test_execute_and_wait_fails_immediately() {
+            let mock_server = MockServer::start().await;
+
+            // Execute returns FAILED immediately
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-bad-sql",
+                    "status": {
+                        "state": "FAILED",
+                        "error": {
+                            "error_code": "PARSE_SYNTAX_ERROR",
+                            "message": "Syntax error at line 1"
+                        }
+                    }
+                })))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let result = client.execute_and_wait(
+                "session-789",
+                "SELEC 1", // Typo
+                None,
+                None,
+                None,
+            ).await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            match err {
+                Error::StatementFailed(msg) => {
+                    assert!(msg.contains("PARSE_SYNTAX_ERROR"), "Error should contain code: {}", msg);
+                }
+                _ => panic!("Expected StatementFailed error, got {:?}", err),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_execute_and_wait_fails_during_polling() {
+            let mock_server = MockServer::start().await;
+
+            // Execute returns RUNNING
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-will-fail-later",
+                    "status": {
+                        "state": "RUNNING"
+                    }
+                })))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            // Polling returns FAILED
+            Mock::given(method("GET"))
+                .and(path("/api/2.0/sql/statements/stmt-will-fail-later"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-will-fail-later",
+                    "status": {
+                        "state": "FAILED",
+                        "error": {
+                            "error_code": "RESOURCE_EXHAUSTED",
+                            "message": "Out of memory"
+                        }
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let result = client.execute_and_wait(
+                "session-abc",
+                "SELECT * FROM huge_table",
+                Some(Duration::from_secs(30)),
+                None,
+                None,
+            ).await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            match err {
+                Error::StatementFailed(msg) => {
+                    assert!(msg.contains("RESOURCE_EXHAUSTED"), "Error should contain code: {}", msg);
+                    assert!(msg.contains("memory"), "Error should contain message: {}", msg);
+                }
+                _ => panic!("Expected StatementFailed error, got {:?}", err),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_execute_and_wait_canceled_immediately() {
+            let mock_server = MockServer::start().await;
+
+            // Execute returns CANCELED
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-canceled",
+                    "status": {
+                        "state": "CANCELED"
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let result = client.execute_and_wait(
+                "session-xyz",
+                "SELECT 1",
+                None,
+                None,
+                None,
+            ).await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            match err {
+                Error::StatementFailed(msg) => {
+                    assert!(msg.contains("canceled"), "Error should mention cancellation: {}", msg);
+                }
+                _ => panic!("Expected StatementFailed error, got {:?}", err),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_execute_and_wait_with_options() {
+            let mock_server = MockServer::start().await;
+
+            // Verify that options are passed correctly
+            // Note: catalog/schema cannot be combined with session_id per SEA API
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .and(body_partial_json(serde_json::json!({
+                    "session_id": "session-opts",
+                    "row_limit": 500,
+                    "byte_limit": 1000000
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "statement_id": "stmt-with-opts",
+                    "status": {
+                        "state": "SUCCEEDED"
+                    }
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let client = create_mock_client(&mock_server.uri());
+            let result = client.execute_and_wait(
+                "session-opts",
+                "SELECT * FROM table",
+                Some(Duration::from_secs(30)),
+                Some(500),
+                Some(1_000_000),
+            ).await;
+
+            assert!(result.is_ok(), "Request should succeed with options: {:?}", result);
         }
     }
 }

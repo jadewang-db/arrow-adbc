@@ -2364,3 +2364,510 @@ fn test_e2e_execute_statement_sql_error() {
     println!();
     println!("=== SEA Client Execute Statement SQL Error E2E Test PASSED ===");
 }
+
+// ============================================================================
+// Work Item 2.4: SEA Client - Statement Polling E2E Tests
+// ============================================================================
+
+/// Test SeaClient get_statement retrieves statement status.
+///
+/// This validates:
+/// - get_statement sends GET request to correct endpoint
+/// - Response contains valid statement state
+/// - Statement ID matches the one we're querying
+#[test]
+#[ignore]
+fn test_e2e_get_statement() {
+    use adbc_databricks::client::{
+        CreateSessionRequest, ExecuteStatementRequest, SeaClient, SeaClientConfig, StatementState,
+    };
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== SEA Client get_statement E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    let sea_config = SeaClientConfig::new(&host, &config.token, &warehouse_id);
+    let client = SeaClient::new(sea_config).expect("Failed to create SeaClient");
+
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+    rt.block_on(async {
+        // Step 1: Create session
+        println!("Step 1: Creating session...");
+        let session_request = CreateSessionRequest {
+            warehouse_id: warehouse_id.clone(),
+            session_alias: Some("e2e_get_statement_test".to_string()),
+            catalog: None,
+            schema: None,
+        };
+        let session = client
+            .create_session(&session_request)
+            .await
+            .expect("Failed to create session");
+        let session_id = session.session_id;
+        println!("  Session created: {}", session_id);
+
+        // Step 2: Execute a statement
+        println!("Step 2: Executing statement...");
+        let request = ExecuteStatementRequest::new(&warehouse_id, "SELECT 1 AS test_col")
+            .with_session_id(&session_id)
+            .with_wait_timeout("5s"); // Short wait to let it finish quickly
+
+        let execute_response = client
+            .execute_statement(&request)
+            .await
+            .expect("Failed to execute statement");
+        let statement_id = execute_response.statement_id.clone();
+        println!("  Statement ID: {}", statement_id);
+        println!("  Initial state: {:?}", execute_response.status.state);
+
+        // Step 3: Get statement status
+        println!("Step 3: Getting statement status...");
+        let get_response = client
+            .get_statement(&statement_id)
+            .await
+            .expect("Failed to get statement");
+
+        println!("  Statement ID from get: {}", get_response.statement_id);
+        println!("  Current state: {:?}", get_response.status.state);
+
+        // Verify the statement ID matches
+        assert_eq!(
+            get_response.statement_id, statement_id,
+            "Statement ID should match"
+        );
+
+        // State should be one of the valid states
+        assert!(
+            matches!(
+                get_response.status.state,
+                StatementState::Succeeded
+                    | StatementState::Failed
+                    | StatementState::Canceled
+                    | StatementState::Closed
+                    | StatementState::Pending
+                    | StatementState::Running
+            ),
+            "State should be a valid statement state"
+        );
+
+        // Step 4: Clean up
+        println!("Step 4: Cleaning up...");
+        let _ = client.close_statement(&statement_id).await;
+        client
+            .delete_session(&session_id)
+            .await
+            .expect("Failed to delete session");
+        println!("  Cleanup complete");
+    });
+
+    println!();
+    println!("=== SEA Client get_statement E2E Test PASSED ===");
+}
+
+/// Test SeaClient poll_until_complete with a simple query.
+///
+/// This validates:
+/// - poll_until_complete waits for statement completion
+/// - Returns SUCCEEDED state for valid queries
+/// - Result includes manifest and data
+#[test]
+#[ignore]
+fn test_e2e_poll_until_complete() {
+    use adbc_databricks::client::{
+        CreateSessionRequest, ExecuteStatementRequest, SeaClient, SeaClientConfig, StatementState,
+    };
+    use std::time::Duration;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== SEA Client poll_until_complete E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    let sea_config = SeaClientConfig::new(&host, &config.token, &warehouse_id);
+    let client = SeaClient::new(sea_config).expect("Failed to create SeaClient");
+
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+    rt.block_on(async {
+        // Step 1: Create session
+        println!("Step 1: Creating session...");
+        let session_request = CreateSessionRequest {
+            warehouse_id: warehouse_id.clone(),
+            session_alias: Some("e2e_poll_test".to_string()),
+            catalog: None,
+            schema: None,
+        };
+        let session = client
+            .create_session(&session_request)
+            .await
+            .expect("Failed to create session");
+        let session_id = session.session_id;
+        println!("  Session created: {}", session_id);
+
+        // Step 2: Execute a statement with short wait timeout to force polling
+        println!("Step 2: Executing statement (will poll if needed)...");
+        let request = ExecuteStatementRequest::new(&warehouse_id, "SELECT * FROM range(100)")
+            .with_session_id(&session_id)
+            .with_wait_timeout("0s"); // No initial wait, force polling
+
+        let execute_response = client
+            .execute_statement(&request)
+            .await
+            .expect("Failed to execute statement");
+        let statement_id = execute_response.statement_id.clone();
+        println!("  Statement ID: {}", statement_id);
+        println!("  Initial state: {:?}", execute_response.status.state);
+
+        // Step 3: Poll until complete
+        println!("Step 3: Polling until complete...");
+        let start = std::time::Instant::now();
+        let poll_response = client
+            .poll_until_complete(&statement_id, Some(Duration::from_secs(120)))
+            .await
+            .expect("Failed to poll statement");
+        let elapsed = start.elapsed();
+
+        println!("  Final state: {:?}", poll_response.status.state);
+        println!("  Polling duration: {:?}", elapsed);
+
+        // Verify the statement succeeded
+        assert_eq!(
+            poll_response.status.state,
+            StatementState::Succeeded,
+            "Statement should succeed"
+        );
+
+        // Verify we have results
+        assert!(
+            poll_response.manifest.is_some(),
+            "Should have manifest after completion"
+        );
+
+        if let Some(ref manifest) = poll_response.manifest {
+            println!("  Total rows: {:?}", manifest.total_row_count);
+        }
+
+        // Step 4: Clean up
+        println!("Step 4: Cleaning up...");
+        let _ = client.close_statement(&statement_id).await;
+        client
+            .delete_session(&session_id)
+            .await
+            .expect("Failed to delete session");
+        println!("  Cleanup complete");
+    });
+
+    println!();
+    println!("=== SEA Client poll_until_complete E2E Test PASSED ===");
+}
+
+/// Test SeaClient execute_and_wait convenience method.
+///
+/// This validates:
+/// - execute_and_wait combines execution and polling
+/// - Returns completed statement with results
+/// - Works correctly for both fast and slower queries
+#[test]
+#[ignore]
+fn test_e2e_execute_and_wait() {
+    use adbc_databricks::client::{
+        CreateSessionRequest, SeaClient, SeaClientConfig, StatementState,
+    };
+    use std::time::Duration;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== SEA Client execute_and_wait E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    let sea_config = SeaClientConfig::new(&host, &config.token, &warehouse_id);
+    let client = SeaClient::new(sea_config).expect("Failed to create SeaClient");
+
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+    rt.block_on(async {
+        // Step 1: Create session
+        println!("Step 1: Creating session...");
+        let session_request = CreateSessionRequest {
+            warehouse_id: warehouse_id.clone(),
+            session_alias: Some("e2e_execute_and_wait_test".to_string()),
+            catalog: None,
+            schema: None,
+        };
+        let session = client
+            .create_session(&session_request)
+            .await
+            .expect("Failed to create session");
+        let session_id = session.session_id;
+        println!("  Session created: {}", session_id);
+
+        // Step 2: Execute a simple query using execute_and_wait
+        println!("Step 2: Executing simple query with execute_and_wait...");
+        let start = std::time::Instant::now();
+        let response = client
+            .execute_and_wait(
+                &session_id,
+                "SELECT 1 AS result",
+                Some(Duration::from_secs(60)),
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to execute_and_wait");
+        let elapsed = start.elapsed();
+
+        println!("  Statement ID: {}", response.statement_id);
+        println!("  Final state: {:?}", response.status.state);
+        println!("  Duration: {:?}", elapsed);
+
+        // Verify the statement succeeded
+        assert_eq!(
+            response.status.state,
+            StatementState::Succeeded,
+            "Statement should succeed"
+        );
+
+        // Verify we have manifest
+        assert!(response.manifest.is_some(), "Should have manifest");
+
+        // Step 3: Execute a larger query
+        println!("Step 3: Executing larger query...");
+        let start = std::time::Instant::now();
+        let response = client
+            .execute_and_wait(
+                &session_id,
+                "SELECT * FROM range(1000)",
+                Some(Duration::from_secs(120)),
+                Some(100), // Limit to 100 rows
+                None,
+            )
+            .await
+            .expect("Failed to execute_and_wait for larger query");
+        let elapsed = start.elapsed();
+
+        println!("  Statement ID: {}", response.statement_id);
+        println!("  Final state: {:?}", response.status.state);
+        println!("  Duration: {:?}", elapsed);
+
+        assert_eq!(
+            response.status.state,
+            StatementState::Succeeded,
+            "Larger query should succeed"
+        );
+
+        if let Some(ref manifest) = response.manifest {
+            println!("  Total rows: {:?}", manifest.total_row_count);
+        }
+
+        // Step 4: Clean up
+        println!("Step 4: Cleaning up...");
+        client
+            .delete_session(&session_id)
+            .await
+            .expect("Failed to delete session");
+        println!("  Cleanup complete");
+    });
+
+    println!();
+    println!("=== SEA Client execute_and_wait E2E Test PASSED ===");
+}
+
+/// Test SeaClient execute_and_wait with session containing catalog and schema.
+///
+/// This validates:
+/// - Session is created with catalog/schema context
+/// - execute_and_wait uses the session context correctly
+/// - Query executes in the specified context
+///
+/// Note: The SEA API does not allow combining session_id with catalog/schema
+/// in execute_statement. Instead, create the session with the desired context.
+#[test]
+#[ignore]
+fn test_e2e_execute_and_wait_with_catalog_schema() {
+    use adbc_databricks::client::{
+        CreateSessionRequest, SeaClient, SeaClientConfig, StatementState,
+    };
+    use std::time::Duration;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    // Skip if no catalog configured
+    if config.metadata.catalog.is_empty() {
+        println!("Skipping: No catalog configured in test metadata");
+        return;
+    }
+
+    println!("=== SEA Client execute_and_wait with Catalog/Schema E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!("Catalog: {}", config.metadata.catalog);
+    println!("Schema: {}", config.metadata.schema);
+    println!();
+
+    let sea_config = SeaClientConfig::new(&host, &config.token, &warehouse_id);
+    let client = SeaClient::new(sea_config).expect("Failed to create SeaClient");
+
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+    rt.block_on(async {
+        // Create session WITH catalog/schema context
+        // This is the correct way per the SEA API - catalog/schema are set on session
+        println!("Step 1: Creating session with catalog/schema...");
+        let session_request = CreateSessionRequest {
+            warehouse_id: warehouse_id.clone(),
+            session_alias: Some("e2e_execute_wait_catalog_test".to_string()),
+            catalog: Some(config.metadata.catalog.clone()),
+            schema: Some(config.metadata.schema.clone()),
+        };
+        let session = client
+            .create_session(&session_request)
+            .await
+            .expect("Failed to create session");
+        let session_id = session.session_id;
+        println!("  Session created: {}", session_id);
+
+        // Execute query - session already has catalog/schema context
+        println!("Step 2: Executing query using session context...");
+        let response = client
+            .execute_and_wait(
+                &session_id,
+                "SELECT 1 AS catalog_test",
+                Some(Duration::from_secs(60)),
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to execute_and_wait with session context");
+
+        println!("  Statement ID: {}", response.statement_id);
+        println!("  Final state: {:?}", response.status.state);
+
+        assert_eq!(
+            response.status.state,
+            StatementState::Succeeded,
+            "Query with session catalog/schema context should succeed"
+        );
+
+        // Clean up
+        println!("Step 3: Cleaning up...");
+        client
+            .delete_session(&session_id)
+            .await
+            .expect("Failed to delete session");
+        println!("  Cleanup complete");
+    });
+
+    println!();
+    println!("=== SEA Client execute_and_wait with Catalog/Schema E2E Test PASSED ===");
+}
+
+/// Test SeaClient poll_until_complete handles failed statements.
+///
+/// This validates:
+/// - poll_until_complete returns error for failed statements
+/// - Error message contains relevant information
+#[test]
+#[ignore]
+fn test_e2e_poll_until_complete_failed_statement() {
+    use adbc_databricks::client::{
+        CreateSessionRequest, ExecuteStatementRequest, SeaClient, SeaClientConfig,
+    };
+    use adbc_databricks::Error;
+    use std::time::Duration;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== SEA Client poll_until_complete Failed Statement E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    let sea_config = SeaClientConfig::new(&host, &config.token, &warehouse_id);
+    let client = SeaClient::new(sea_config).expect("Failed to create SeaClient");
+
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+    rt.block_on(async {
+        // Create session
+        println!("Step 1: Creating session...");
+        let session_request = CreateSessionRequest {
+            warehouse_id: warehouse_id.clone(),
+            session_alias: Some("e2e_poll_failed_test".to_string()),
+            catalog: None,
+            schema: None,
+        };
+        let session = client
+            .create_session(&session_request)
+            .await
+            .expect("Failed to create session");
+        let session_id = session.session_id;
+        println!("  Session created: {}", session_id);
+
+        // Execute invalid SQL
+        println!("Step 2: Executing invalid SQL...");
+        let request = ExecuteStatementRequest::new(&warehouse_id, "SELECT * FROM nonexistent_table_12345")
+            .with_session_id(&session_id)
+            .with_wait_timeout("0s");
+
+        let execute_response = client
+            .execute_statement(&request)
+            .await
+            .expect("Execute should succeed even for invalid SQL");
+        let statement_id = execute_response.statement_id.clone();
+        println!("  Statement ID: {}", statement_id);
+
+        // Poll - should fail
+        println!("Step 3: Polling (expecting failure)...");
+        let result = client
+            .poll_until_complete(&statement_id, Some(Duration::from_secs(60)))
+            .await;
+
+        // Verify we got an error
+        assert!(result.is_err(), "Polling should return error for failed statement");
+
+        let err = result.unwrap_err();
+        match err {
+            Error::StatementFailed(msg) => {
+                println!("  Got expected StatementFailed error: {}", msg);
+            }
+            other => {
+                panic!("Expected StatementFailed error, got: {:?}", other);
+            }
+        }
+
+        // Clean up
+        println!("Step 4: Cleaning up...");
+        let _ = client.close_statement(&statement_id).await;
+        client
+            .delete_session(&session_id)
+            .await
+            .expect("Failed to delete session");
+        println!("  Cleanup complete");
+    });
+
+    println!();
+    println!("=== SEA Client poll_until_complete Failed Statement E2E Test PASSED ===");
+}

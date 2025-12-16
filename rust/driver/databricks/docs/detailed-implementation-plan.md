@@ -2100,79 +2100,119 @@ fn test_execute_response_deserialization() {
 ### Objective
 Implement statement status polling with exponential backoff for async statement execution.
 
+### Implementation Status: COMPLETED
+
 ### Actions
 
-1. **Implement get_statement in SeaClient**
+1. **Implemented get_statement in SeaClient** (already existed from 2.3)
    ```rust
    impl SeaClient {
        /// Get statement status and results
-       pub async fn get_statement(&self, statement_id: &str) -> Result<ExecuteStatementResponse> {
+       pub async fn get_statement(&self, statement_id: &str) -> Result<StatementResponse> {
            self.get(&self.statement_url(statement_id)).await
        }
    }
    ```
 
-2. **Implement polling logic**
+2. **Implemented poll_until_complete with inline configuration**
    ```rust
-   /// Configuration for polling
-   #[derive(Clone, Debug)]
-   pub struct PollConfig {
-       pub initial_delay: Duration,
-       pub max_delay: Duration,
-       pub timeout: Duration,
-   }
-
-   impl Default for PollConfig {
-       fn default() -> Self {
-           Self {
-               initial_delay: Duration::from_secs(1),
-               max_delay: Duration::from_secs(10),
-               timeout: Duration::from_secs(300),
-           }
-       }
-   }
-
    impl SeaClient {
-       /// Poll until statement completes or fails
+       /// Poll statement until completion with exponential backoff
+       /// - Initial delay: 1 second
+       /// - Max delay: 10 seconds
+       /// - Backoff multiplier: 2x
+       /// - Default timeout: 5 minutes
        pub async fn poll_until_complete(
            &self,
            statement_id: &str,
-           config: &PollConfig,
-       ) -> Result<ExecuteStatementResponse> {
+           max_wait: Option<Duration>,
+       ) -> Result<StatementResponse> {
            let start = std::time::Instant::now();
-           let mut delay = config.initial_delay;
+           let max_wait = max_wait.unwrap_or(Duration::from_secs(300));
+
+           let mut poll_interval = Duration::from_secs(1);
+           let max_poll_interval = Duration::from_secs(10);
 
            loop {
-               if start.elapsed() > config.timeout {
-                   return Err(Error::Timeout);
-               }
-
                let response = self.get_statement(statement_id).await?;
 
                match response.status.state {
                    StatementState::Succeeded => return Ok(response),
                    StatementState::Failed => {
                        let error_msg = response.status.error
-                           .map(|e| e.message.unwrap_or_default())
-                           .unwrap_or_else(|| "Unknown error".to_string());
-                       return Err(Error::StatementFailed(error_msg));
+                           .as_ref()
+                           .map(|e| format!("{}: {}",
+                               e.error_code.as_deref().unwrap_or("UNKNOWN"),
+                               e.message.as_deref().unwrap_or("Statement failed")))
+                           .unwrap_or_else(|| "Statement failed".to_string());
+                       return Err(Error::statement_failed(error_msg));
                    }
                    StatementState::Canceled => {
-                       return Err(Error::StatementFailed("Statement was canceled".into()));
-                   }
-                   StatementState::Pending | StatementState::Running => {
-                       tokio::time::sleep(delay).await;
-                       // Exponential backoff with cap
-                       delay = std::cmp::min(delay * 2, config.max_delay);
+                       return Err(Error::statement_failed("Statement was canceled"));
                    }
                    StatementState::Closed => {
-                       return Err(Error::StatementFailed("Statement was closed".into()));
+                       return Err(Error::statement_failed("Statement was closed"));
+                   }
+                   StatementState::Pending | StatementState::Running => {
+                       if start.elapsed() >= max_wait {
+                           return Err(Error::Timeout);
+                       }
+                       tokio::time::sleep(poll_interval).await;
+                       poll_interval = (poll_interval * 2).min(max_poll_interval);
                    }
                }
            }
        }
    }
    ```
+
+3. **Implemented execute_and_wait helper**
+   ```rust
+   impl SeaClient {
+       /// Execute a SQL statement and wait for completion.
+       /// Note: The SEA API does not allow setting session_id and catalog/schema
+       /// at the same time. Catalog/schema should be set on the session instead.
+       pub async fn execute_and_wait(
+           &self,
+           session_id: &str,
+           sql: &str,
+           max_wait: Option<Duration>,
+           row_limit: Option<i64>,
+           byte_limit: Option<i64>,
+       ) -> Result<StatementResponse> {
+           // Execute with 10s initial wait for fast queries
+           let mut request = ExecuteStatementRequest::new(&self.warehouse_id, sql)
+               .with_session_id(session_id)
+               .with_wait_timeout("10s");
+
+           if let Some(limit) = row_limit {
+               request = request.with_row_limit(limit);
+           }
+           if let Some(limit) = byte_limit {
+               request = request.with_byte_limit(limit);
+           }
+
+           let response = self.execute_statement(&request).await?;
+
+           match response.status.state {
+               StatementState::Succeeded => Ok(response),
+               StatementState::Failed | StatementState::Canceled | StatementState::Closed => {
+                   // Return error with details
+                   Err(Error::statement_failed(...))
+               }
+               StatementState::Pending | StatementState::Running => {
+                   // Poll until complete
+                   self.poll_until_complete(&response.statement_id, max_wait).await
+               }
+           }
+       }
+   }
+   ```
+
+### Important API Constraint
+**SEA API does not allow combining `session_id` with `catalog`/`schema` in execute_statement**.
+- If you need catalog/schema context, create the session with `catalog` and `schema` fields set
+- Then use `execute_and_wait` without passing catalog/schema parameters
 
 ### Expected Results
 
@@ -2180,45 +2220,39 @@ Implement statement status polling with exponential backoff for async statement 
 |--------|--------------|
 | Polling respects delay | First delay ~1s, doubles each iteration |
 | Max delay capped | Never exceeds 10s between polls |
-| Timeout works | Returns Timeout error after 300s |
-| Failed state handled | Returns error with message |
+| Timeout works | Returns Timeout error after specified duration |
+| Failed state handled | Returns error with error code and message |
+| Canceled state handled | Returns StatementFailed error |
+| Closed state handled | Returns StatementFailed error |
 
-### Unit Tests
-```rust
-#[tokio::test]
-async fn test_poll_backoff_timing() {
-    // Use mock server to simulate PENDING -> RUNNING -> SUCCEEDED
-    let mock_server = MockServer::start().await;
+### Unit Tests (All Passing)
+- `test_get_statement_success` - Basic GET statement status
+- `test_get_statement_pending` - Statement in PENDING state
+- `test_get_statement_running` - Statement in RUNNING state
+- `test_get_statement_failed` - Statement with error details
+- `test_poll_until_complete_immediate_success` - First poll returns SUCCEEDED
+- `test_poll_until_complete_after_pending` - PENDING -> RUNNING -> SUCCEEDED with backoff timing
+- `test_poll_until_complete_fails` - Statement transitions to FAILED
+- `test_poll_until_complete_canceled` - Statement transitions to CANCELED
+- `test_poll_until_complete_closed` - Statement transitions to CLOSED
+- `test_poll_until_complete_timeout` - Always RUNNING, verifies timeout error
+- `test_execute_and_wait_immediate_success` - Execute returns SUCCEEDED immediately
+- `test_execute_and_wait_with_polling` - Execute returns PENDING, polling completes
+- `test_execute_and_wait_fails_immediately` - Execute returns FAILED immediately
+- `test_execute_and_wait_fails_during_polling` - Statement fails during polling
+- `test_execute_and_wait_canceled_immediately` - Execute returns CANCELED
+- `test_execute_and_wait_with_options` - Verify row_limit and byte_limit pass correctly
 
-    // First call: PENDING
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "statement_id": "stmt1",
-            "status": { "state": "PENDING" }
-        })))
-        .up_to_n_times(1)
-        .mount(&mock_server)
-        .await;
-
-    // Second call: SUCCEEDED
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "statement_id": "stmt1",
-            "status": { "state": "SUCCEEDED" },
-            "result": {}
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let client = create_client_with_url(&mock_server.uri());
-    let result = client.poll_until_complete("stmt1", &PollConfig::default()).await;
-
-    assert!(result.is_ok());
-}
-```
+### E2E Tests (All Passing)
+- `test_e2e_get_statement` - Verify GET statement status against real Databricks
+- `test_e2e_poll_until_complete` - Poll a query until completion
+- `test_e2e_execute_and_wait` - Execute simple and larger queries
+- `test_e2e_execute_and_wait_with_catalog_schema` - Create session with catalog/schema, execute query
+- `test_e2e_poll_until_complete_failed_statement` - Verify failed statement error handling
 
 ### Files Modified/Created
-- `driver/databricks/src/client/mod.rs` (add get_statement, poll_until_complete)
+- `driver/databricks/src/client/mod.rs` (add poll_until_complete, execute_and_wait)
+- `driver/databricks/tests/e2e_tests.rs` (add Work Item 2.4 E2E tests)
 
 ---
 
