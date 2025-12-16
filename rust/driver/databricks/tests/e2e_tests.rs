@@ -709,3 +709,309 @@ fn test_e2e_session_manager_full_lifecycle() {
     println!("=== SessionManager Full Lifecycle E2E Test PASSED ===");
     println!("All session management operations completed successfully!");
 }
+
+// ============================================================================
+// Work Item 1.6: DatabricksDriver E2E Tests
+// ============================================================================
+
+/// Test that DatabricksDriver can create a database instance.
+///
+/// This validates:
+/// - DatabricksDriver::new() creates a valid driver
+/// - Driver::new_database() returns a DatabricksDatabase
+#[test]
+fn test_driver_creates_database() {
+    use adbc_core::Driver;
+    use adbc_databricks::DatabricksDriver;
+
+    let mut driver = DatabricksDriver::new();
+    let db = driver.new_database();
+    assert!(db.is_ok(), "new_database should succeed");
+}
+
+/// Test that DatabricksDriver can create a database with options.
+///
+/// This validates:
+/// - Driver::new_database_with_opts() accepts options
+/// - Options are correctly set on the database
+#[test]
+fn test_driver_creates_database_with_opts() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Driver, Optionable};
+    use adbc_databricks::DatabricksDriver;
+
+    let mut driver = DatabricksDriver::new();
+    let db = driver.new_database_with_opts([
+        (
+            OptionDatabase::Uri,
+            OptionValue::String("https://example.cloud.databricks.com".into()),
+        ),
+        (
+            OptionDatabase::Password,
+            OptionValue::String("dapi_token".into()),
+        ),
+    ]);
+    assert!(db.is_ok(), "new_database_with_opts should succeed");
+
+    let db = db.unwrap();
+    let uri = db.get_option_string(OptionDatabase::Uri);
+    assert!(uri.is_ok(), "Should be able to get uri option");
+    assert_eq!(
+        uri.unwrap(),
+        "https://example.cloud.databricks.com",
+        "URI should match"
+    );
+}
+
+/// Test DatabricksDriver using E2E config to create a fully configured database.
+///
+/// This validates:
+/// - Driver can create database with real Databricks configuration
+/// - All required options (uri, warehouse_id, token) can be set
+/// - Optional options (catalog, schema) can be set
+#[test]
+#[ignore]
+fn test_e2e_driver_creates_database_with_real_config() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Driver, Optionable};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== DatabricksDriver Database Creation E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver
+    let mut driver = DatabricksDriver::new();
+
+    // Build options from config
+    let mut opts: Vec<(OptionDatabase, OptionValue)> = vec![
+        (OptionDatabase::Uri, OptionValue::String(host.clone())),
+        (OptionDatabase::Password, OptionValue::String(config.token.clone())),
+        (
+            OptionDatabase::Other("databricks.warehouse_id".into()),
+            OptionValue::String(warehouse_id.clone()),
+        ),
+    ];
+
+    // Add optional catalog and schema if available
+    if !config.metadata.catalog.is_empty() {
+        opts.push((
+            OptionDatabase::Other("databricks.catalog".into()),
+            OptionValue::String(config.metadata.catalog.clone()),
+        ));
+    }
+    if !config.metadata.schema.is_empty() {
+        opts.push((
+            OptionDatabase::Other("databricks.schema".into()),
+            OptionValue::String(config.metadata.schema.clone()),
+        ));
+    }
+
+    // Create database with options
+    let db = driver.new_database_with_opts(opts);
+    assert!(db.is_ok(), "new_database_with_opts should succeed with real config");
+
+    let db = db.unwrap();
+
+    // Verify uri was set correctly
+    let uri = db.get_option_string(OptionDatabase::Uri).unwrap();
+    assert_eq!(uri, host, "URI should match configured host");
+
+    // Verify warehouse_id was set correctly
+    let wh_id = db
+        .get_option_string(OptionDatabase::Other("databricks.warehouse_id".into()))
+        .unwrap();
+    assert_eq!(wh_id, warehouse_id, "Warehouse ID should match");
+
+    // Verify catalog if set
+    if !config.metadata.catalog.is_empty() {
+        let catalog = db
+            .get_option_string(OptionDatabase::Other("databricks.catalog".into()))
+            .unwrap();
+        assert_eq!(
+            catalog, config.metadata.catalog,
+            "Catalog should match config"
+        );
+        println!("  Catalog: {}", catalog);
+    }
+
+    // Verify schema if set
+    if !config.metadata.schema.is_empty() {
+        let schema = db
+            .get_option_string(OptionDatabase::Other("databricks.schema".into()))
+            .unwrap();
+        assert_eq!(schema, config.metadata.schema, "Schema should match config");
+        println!("  Schema: {}", schema);
+    }
+
+    println!();
+    println!("=== DatabricksDriver Database Creation E2E Test PASSED ===");
+}
+
+/// Test DatabricksDriver end-to-end: create driver -> database -> connection.
+///
+/// This validates the complete ADBC workflow:
+/// 1. Create DatabricksDriver
+/// 2. Create DatabricksDatabase with options
+/// 3. Create DatabricksConnection from database
+/// 4. Verify connection has a valid session
+#[test]
+#[ignore]
+fn test_e2e_driver_database_connection_workflow() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Database, Driver};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== DatabricksDriver -> Database -> Connection E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Step 1: Create driver
+    println!("Step 1: Create DatabricksDriver");
+    let mut driver = DatabricksDriver::new();
+    println!("  - Driver created successfully");
+
+    // Step 2: Create database with options
+    println!("Step 2: Create DatabricksDatabase with options");
+    let mut opts: Vec<(OptionDatabase, OptionValue)> = vec![
+        (OptionDatabase::Uri, OptionValue::String(host.clone())),
+        (OptionDatabase::Password, OptionValue::String(config.token.clone())),
+        (
+            OptionDatabase::Other("databricks.warehouse_id".into()),
+            OptionValue::String(warehouse_id.clone()),
+        ),
+    ];
+
+    // Add optional catalog and schema if available
+    if !config.metadata.catalog.is_empty() {
+        opts.push((
+            OptionDatabase::Other("databricks.catalog".into()),
+            OptionValue::String(config.metadata.catalog.clone()),
+        ));
+    }
+    if !config.metadata.schema.is_empty() {
+        opts.push((
+            OptionDatabase::Other("databricks.schema".into()),
+            OptionValue::String(config.metadata.schema.clone()),
+        ));
+    }
+
+    let db = driver
+        .new_database_with_opts(opts)
+        .expect("Failed to create database");
+    println!("  - Database created successfully");
+
+    // Step 3: Create connection from database
+    println!("Step 3: Create DatabricksConnection from database");
+    let connection = db.new_connection();
+    assert!(
+        connection.is_ok(),
+        "new_connection should succeed: {:?}",
+        connection.err()
+    );
+
+    let connection = connection.unwrap();
+    println!("  - Connection created successfully");
+
+    // Step 4: Verify connection has session
+    println!("Step 4: Verify connection state");
+    let session_id = connection.session_id();
+    assert!(session_id.is_some(), "Connection should have a session ID");
+    println!("  - Session ID: {}", session_id.unwrap());
+
+    println!();
+    println!("=== DatabricksDriver -> Database -> Connection E2E Test PASSED ===");
+    println!("Complete ADBC workflow validated successfully!");
+}
+
+/// Test DatabricksDriver creates connection with options.
+///
+/// This validates:
+/// - Database::new_connection_with_opts() works correctly
+/// - Connection options (current_catalog, current_schema) can be set
+#[test]
+#[ignore]
+fn test_e2e_driver_connection_with_opts() {
+    use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
+    use adbc_core::{Database, Driver, Optionable};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== DatabricksDriver Connection with Options E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver and database
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (OptionDatabase::Password, OptionValue::String(config.token.clone())),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    // Create connection with options
+    let connection = db.new_connection_with_opts([
+        (
+            OptionConnection::CurrentCatalog,
+            OptionValue::String("main".into()),
+        ),
+        (
+            OptionConnection::CurrentSchema,
+            OptionValue::String("default".into()),
+        ),
+    ]);
+    assert!(
+        connection.is_ok(),
+        "new_connection_with_opts should succeed: {:?}",
+        connection.err()
+    );
+
+    let connection = connection.unwrap();
+
+    // Verify connection options
+    let catalog = connection
+        .get_option_string(OptionConnection::CurrentCatalog)
+        .unwrap();
+    assert_eq!(catalog, "main", "Catalog should be 'main'");
+
+    let schema = connection
+        .get_option_string(OptionConnection::CurrentSchema)
+        .unwrap();
+    assert_eq!(schema, "default", "Schema should be 'default'");
+
+    // Verify autocommit (always true for Databricks)
+    let autocommit = connection
+        .get_option_string(OptionConnection::AutoCommit)
+        .unwrap();
+    assert_eq!(autocommit, "true", "Autocommit should be 'true'");
+
+    println!("Connection options verified:");
+    println!("  Current Catalog: {}", catalog);
+    println!("  Current Schema: {}", schema);
+    println!("  AutoCommit: {}", autocommit);
+
+    println!();
+    println!("=== DatabricksDriver Connection with Options E2E Test PASSED ===");
+}

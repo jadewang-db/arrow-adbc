@@ -72,3 +72,166 @@ impl Driver for DatabricksDriver {
         Ok(database)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::options::keys;
+    use adbc_core::Optionable;
+
+    #[test]
+    fn test_driver_new() {
+        // Verify that the driver can be created
+        let _driver = DatabricksDriver::new();
+        // If we reach here, the driver was successfully created
+    }
+
+    #[test]
+    fn test_driver_default() {
+        // Verify that the driver implements Default
+        let _driver = DatabricksDriver::default();
+        // If we reach here, the driver was successfully created via Default
+    }
+
+    #[test]
+    fn test_driver_creates_database() {
+        let mut driver = DatabricksDriver::new();
+        let db = driver.new_database();
+        assert!(db.is_ok(), "new_database should succeed");
+    }
+
+    #[test]
+    fn test_driver_creates_database_with_uri_option() {
+        let mut driver = DatabricksDriver::new();
+        let db = driver.new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String("https://example.cloud.databricks.com".into()),
+        )]);
+        assert!(db.is_ok(), "new_database_with_opts should succeed");
+
+        let db = db.unwrap();
+        let uri = db.get_option_string(OptionDatabase::Uri);
+        assert!(uri.is_ok(), "Should be able to get uri option");
+        assert_eq!(
+            uri.unwrap(),
+            "https://example.cloud.databricks.com",
+            "URI should match"
+        );
+    }
+
+    #[test]
+    fn test_driver_creates_database_with_password_option() {
+        let mut driver = DatabricksDriver::new();
+        let db = driver.new_database_with_opts([(
+            OptionDatabase::Password,
+            OptionValue::String("dapi_test_token".into()),
+        )]);
+        assert!(db.is_ok(), "new_database_with_opts should succeed with password");
+    }
+
+    #[test]
+    fn test_driver_creates_database_with_multiple_opts() {
+        let mut driver = DatabricksDriver::new();
+        let db = driver.new_database_with_opts([
+            (
+                OptionDatabase::Uri,
+                OptionValue::String("https://example.cloud.databricks.com".into()),
+            ),
+            (
+                OptionDatabase::Password,
+                OptionValue::String("dapi_token".into()),
+            ),
+            (
+                OptionDatabase::Other(keys::WAREHOUSE_ID.into()),
+                OptionValue::String("abc123def456".into()),
+            ),
+            (
+                OptionDatabase::Other(keys::CATALOG.into()),
+                OptionValue::String("main".into()),
+            ),
+            (
+                OptionDatabase::Other(keys::SCHEMA.into()),
+                OptionValue::String("default".into()),
+            ),
+        ]);
+        assert!(
+            db.is_ok(),
+            "new_database_with_opts should succeed with multiple options"
+        );
+
+        let db = db.unwrap();
+
+        // Verify uri was set
+        let uri = db.get_option_string(OptionDatabase::Uri).unwrap();
+        assert_eq!(uri, "https://example.cloud.databricks.com");
+
+        // Verify warehouse_id was set
+        let warehouse_id = db
+            .get_option_string(OptionDatabase::Other(keys::WAREHOUSE_ID.into()))
+            .unwrap();
+        assert_eq!(warehouse_id, "abc123def456");
+
+        // Verify catalog was set
+        let catalog = db
+            .get_option_string(OptionDatabase::Other(keys::CATALOG.into()))
+            .unwrap();
+        assert_eq!(catalog, "main");
+
+        // Verify schema was set
+        let schema = db
+            .get_option_string(OptionDatabase::Other(keys::SCHEMA.into()))
+            .unwrap();
+        assert_eq!(schema, "default");
+    }
+
+    #[test]
+    fn test_driver_creates_database_with_empty_opts() {
+        let mut driver = DatabricksDriver::new();
+        let db = driver.new_database_with_opts(std::iter::empty());
+        assert!(
+            db.is_ok(),
+            "new_database_with_opts should succeed with empty options"
+        );
+    }
+
+    #[test]
+    fn test_driver_creates_database_with_invalid_option() {
+        let mut driver = DatabricksDriver::new();
+        let db = driver.new_database_with_opts([(
+            OptionDatabase::Other("invalid.option.key".into()),
+            OptionValue::String("some_value".into()),
+        )]);
+        assert!(
+            db.is_err(),
+            "new_database_with_opts should fail with unknown option"
+        );
+    }
+
+    #[test]
+    fn test_driver_creates_database_with_wrong_value_type() {
+        let mut driver = DatabricksDriver::new();
+        // URI expects a string, not an int
+        let db = driver.new_database_with_opts([(OptionDatabase::Uri, OptionValue::Int(42))]);
+        assert!(
+            db.is_err(),
+            "new_database_with_opts should fail with wrong value type"
+        );
+    }
+
+    #[test]
+    fn test_driver_is_debug() {
+        let driver = DatabricksDriver::new();
+        let debug_str = format!("{:?}", driver);
+        assert!(
+            debug_str.contains("DatabricksDriver"),
+            "Debug output should contain struct name"
+        );
+    }
+
+    #[test]
+    fn test_driver_type_is_databricks_database() {
+        // This is a compile-time check that DatabaseType is DatabricksDatabase
+        let mut driver = DatabricksDriver::new();
+        let _db: DatabricksDatabase = driver.new_database().unwrap();
+    }
+}
