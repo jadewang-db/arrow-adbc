@@ -51,7 +51,7 @@
 //! }
 //! ```
 
-mod client;
+pub mod client;
 mod connection;
 mod database;
 mod driver;

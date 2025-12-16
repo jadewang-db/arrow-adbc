@@ -19,27 +19,123 @@
 //!
 //! This module provides the HTTP client for communicating with the
 //! Databricks SQL Statement Execution API.
+//!
+//! # Features
+//!
+//! - Bearer token authentication
+//! - Configurable timeouts
+//! - Automatic error parsing from SEA API responses
+//! - URL helpers for all SEA API endpoints
 
 pub mod error;
 pub mod models;
 
 use std::time::Duration;
 
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::Client;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 
-use crate::error::Result;
-use crate::options::HttpConfig;
+use crate::error::{Error, Result};
 
 pub use error::ApiError;
 pub use models::*;
 
+/// Driver version for User-Agent header.
+const DRIVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Configuration for the SEA client.
+///
+/// This struct holds all configuration options for creating a [`SeaClient`].
+/// Use [`Default::default()`] to get sensible defaults for timeouts.
+#[derive(Debug, Clone)]
+pub struct SeaClientConfig {
+    /// Workspace host URL (e.g., "https://workspace.cloud.databricks.com").
+    pub host: String,
+    /// Personal Access Token for authentication.
+    pub token: String,
+    /// SQL Warehouse ID.
+    pub warehouse_id: String,
+    /// Connection timeout (default: 10 seconds).
+    pub connect_timeout: Duration,
+    /// Read timeout (default: 300 seconds / 5 minutes).
+    pub read_timeout: Duration,
+}
+
+impl Default for SeaClientConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            token: String::new(),
+            warehouse_id: String::new(),
+            connect_timeout: Duration::from_secs(10),
+            read_timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+impl SeaClientConfig {
+    /// Create a new configuration with the required fields.
+    ///
+    /// # Arguments
+    ///
+    /// * `host` - Workspace host URL
+    /// * `token` - Personal Access Token
+    /// * `warehouse_id` - SQL Warehouse ID
+    pub fn new(
+        host: impl Into<String>,
+        token: impl Into<String>,
+        warehouse_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            token: token.into(),
+            warehouse_id: warehouse_id.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Set the connection timeout.
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Set the read timeout.
+    pub fn with_read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = timeout;
+        self
+    }
+}
+
 /// SEA REST API client for Databricks.
 ///
 /// Handles all HTTP communication with the Databricks SQL Statement
-/// Execution API.
+/// Execution API. The client is configured with authentication credentials
+/// and timeout settings, and provides methods for all SEA API endpoints.
+///
+/// # Thread Safety
+///
+/// `SeaClient` implements `Clone` and uses `reqwest::Client` internally,
+/// which manages a connection pool. Cloning a `SeaClient` is cheap and
+/// shares the underlying connection pool.
+///
+/// # Example
+///
+/// ```ignore
+/// use adbc_databricks::client::{SeaClient, SeaClientConfig};
+///
+/// let config = SeaClientConfig::new(
+///     "https://workspace.cloud.databricks.com",
+///     "dapi...",
+///     "abc123",
+/// );
+/// let client = SeaClient::new(config)?;
+/// ```
 #[derive(Debug, Clone)]
 pub struct SeaClient {
-    /// HTTP client.
+    /// HTTP client with configured timeouts and headers.
     http_client: Client,
     /// Workspace host URL.
     host: String,
@@ -50,86 +146,131 @@ pub struct SeaClient {
 }
 
 impl SeaClient {
-    /// Create a new SEA client.
-    pub fn new(
-        host: impl Into<String>,
-        token: impl Into<String>,
-        warehouse_id: impl Into<String>,
-        http_config: &HttpConfig,
-    ) -> Result<Self> {
+    /// Create a new SEA client with the given configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Client configuration including host, token, and warehouse ID
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be built (e.g., invalid TLS configuration).
+    pub fn new(config: SeaClientConfig) -> Result<Self> {
+        let default_headers = Self::default_headers(&config.token)?;
+
         let http_client = Client::builder()
-            .connect_timeout(http_config.connect_timeout)
-            .timeout(http_config.read_timeout)
+            .connect_timeout(config.connect_timeout)
+            .timeout(config.read_timeout)
+            .default_headers(default_headers)
             .build()
-            .map_err(|e| crate::error::Error::Http(e))?;
+            .map_err(Error::Http)?;
 
         Ok(Self {
             http_client,
-            host: host.into(),
-            token: token.into(),
-            warehouse_id: warehouse_id.into(),
+            host: config.host,
+            token: config.token,
+            warehouse_id: config.warehouse_id,
         })
     }
 
+    /// Create default headers for all requests.
+    ///
+    /// Includes:
+    /// - Authorization: Bearer <token>
+    /// - Content-Type: application/json
+    /// - User-Agent: adbc-driver-databricks/<version>
+    fn default_headers(token: &str) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+
+        // Authorization header with Bearer token
+        let auth_value = format!("Bearer {}", token);
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&auth_value).map_err(|e| {
+                Error::config(format!("Invalid authorization header value: {}", e))
+            })?,
+        );
+
+        // Content-Type header
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+
+        // User-Agent header
+        let user_agent = format!("adbc-driver-databricks/{}", DRIVER_VERSION);
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(&user_agent).map_err(|e| {
+                Error::config(format!("Invalid user-agent header value: {}", e))
+            })?,
+        );
+
+        Ok(headers)
+    }
+
+    // ========================================================================
+    // URL Helper Methods
+    // ========================================================================
+
     /// Get the base URL for the SEA API.
-    fn base_url(&self) -> String {
-        format!("{}/api/2.0/sql", self.host)
+    ///
+    /// Returns the URL in the format: `{host}/api/2.0/sql`
+    /// The host is normalized to remove any trailing slashes.
+    pub fn base_url(&self) -> String {
+        format!("{}/api/2.0/sql", self.host.trim_end_matches('/'))
     }
 
-    /// Execute a SQL statement.
-    pub async fn execute_statement(
-        &self,
-        _request: &ExecuteStatementRequest,
-    ) -> Result<StatementResponse> {
-        // TODO: Implement execute statement API call
-        // POST /api/2.0/sql/statements/
-        unimplemented!("execute_statement not yet implemented")
+    /// Get the URL for statement operations (create new statement).
+    ///
+    /// Returns: `{base_url}/statements`
+    pub fn statements_url(&self) -> String {
+        format!("{}/statements", self.base_url())
     }
 
-    /// Get the status and result of a statement.
-    pub async fn get_statement(&self, _statement_id: &str) -> Result<StatementResponse> {
-        // TODO: Implement get statement API call
-        // GET /api/2.0/sql/statements/{statement_id}
-        unimplemented!("get_statement not yet implemented")
+    /// Get the URL for a specific statement.
+    ///
+    /// Returns: `{base_url}/statements/{statement_id}`
+    pub fn statement_url(&self, statement_id: &str) -> String {
+        format!("{}/statements/{}", self.base_url(), statement_id)
     }
 
-    /// Get a result chunk.
-    pub async fn get_chunk(&self, _statement_id: &str, _chunk_index: usize) -> Result<ChunkResponse> {
-        // TODO: Implement get chunk API call
-        // GET /api/2.0/sql/statements/{statement_id}/result/chunks/{chunk_index}
-        unimplemented!("get_chunk not yet implemented")
+    /// Get the URL for cancelling a statement.
+    ///
+    /// Returns: `{base_url}/statements/{statement_id}/cancel`
+    pub fn statement_cancel_url(&self, statement_id: &str) -> String {
+        format!("{}/statements/{}/cancel", self.base_url(), statement_id)
     }
 
-    /// Cancel a statement.
-    pub async fn cancel_statement(&self, _statement_id: &str) -> Result<()> {
-        // TODO: Implement cancel statement API call
-        // POST /api/2.0/sql/statements/{statement_id}/cancel
-        unimplemented!("cancel_statement not yet implemented")
+    /// Get the URL for fetching a result chunk.
+    ///
+    /// Returns: `{base_url}/statements/{statement_id}/result/chunks/{chunk_index}`
+    pub fn chunk_url(&self, statement_id: &str, chunk_index: usize) -> String {
+        format!(
+            "{}/statements/{}/result/chunks/{}",
+            self.base_url(),
+            statement_id,
+            chunk_index
+        )
     }
 
-    /// Close a statement.
-    pub async fn close_statement(&self, _statement_id: &str) -> Result<()> {
-        // TODO: Implement close statement API call
-        // DELETE /api/2.0/sql/statements/{statement_id}
-        unimplemented!("close_statement not yet implemented")
+    /// Get the URL for session operations (create new session).
+    ///
+    /// Returns: `{base_url}/sessions`
+    pub fn sessions_url(&self) -> String {
+        format!("{}/sessions", self.base_url())
     }
 
-    /// Create a new session.
-    pub async fn create_session(
-        &self,
-        _request: &CreateSessionRequest,
-    ) -> Result<SessionResponse> {
-        // TODO: Implement create session API call
-        // POST /api/2.0/sql/sessions/
-        unimplemented!("create_session not yet implemented")
+    /// Get the URL for a specific session.
+    ///
+    /// Returns: `{base_url}/sessions/{session_id}`
+    pub fn session_url(&self, session_id: &str) -> String {
+        format!("{}/sessions/{}", self.base_url(), session_id)
     }
 
-    /// Delete a session.
-    pub async fn delete_session(&self, _session_id: &str) -> Result<()> {
-        // TODO: Implement delete session API call
-        // DELETE /api/2.0/sql/sessions/{session_id}
-        unimplemented!("delete_session not yet implemented")
-    }
+    // ========================================================================
+    // Accessor Methods
+    // ========================================================================
 
     /// Get the warehouse ID.
     pub fn warehouse_id(&self) -> &str {
@@ -139,5 +280,493 @@ impl SeaClient {
     /// Get the host URL.
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// Get the token (for debugging purposes only - be careful with logging).
+    #[cfg(test)]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    // ========================================================================
+    // Generic HTTP Methods
+    // ========================================================================
+
+    /// Send a POST request with a JSON body and parse the JSON response.
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The full URL to send the request to
+    /// * `body` - The request body to serialize as JSON
+    ///
+    /// # Type Parameters
+    ///
+    /// * `Req` - The request body type (must implement `Serialize`)
+    /// * `Resp` - The response body type (must implement `DeserializeOwned`)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The request fails (network error, timeout)
+    /// - The response status is not successful (4xx, 5xx)
+    /// - The response body cannot be parsed as JSON
+    pub async fn post<Req, Resp>(&self, url: &str, body: &Req) -> Result<Resp>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let response = self
+            .http_client
+            .post(url)
+            .json(body)
+            .send()
+            .await
+            .map_err(Error::Http)?;
+
+        self.handle_response(response).await
+    }
+
+    /// Send a GET request and parse the JSON response.
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The full URL to send the request to
+    ///
+    /// # Type Parameters
+    ///
+    /// * `Resp` - The response body type (must implement `DeserializeOwned`)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The request fails (network error, timeout)
+    /// - The response status is not successful (4xx, 5xx)
+    /// - The response body cannot be parsed as JSON
+    pub async fn get<Resp>(&self, url: &str) -> Result<Resp>
+    where
+        Resp: DeserializeOwned,
+    {
+        let response = self
+            .http_client
+            .get(url)
+            .send()
+            .await
+            .map_err(Error::Http)?;
+
+        self.handle_response(response).await
+    }
+
+    /// Send a DELETE request.
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The full URL to send the request to
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The request fails (network error, timeout)
+    /// - The response status is not successful (4xx, 5xx)
+    pub async fn delete(&self, url: &str) -> Result<()> {
+        let response = self
+            .http_client
+            .delete(url)
+            .send()
+            .await
+            .map_err(Error::Http)?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            self.handle_error_response(response).await
+        }
+    }
+
+    /// Send a DELETE request with query parameters.
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The full URL to send the request to
+    /// * `params` - Query parameters to append to the URL
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The request fails (network error, timeout)
+    /// - The response status is not successful (4xx, 5xx)
+    pub async fn delete_with_params<P>(&self, url: &str, params: &P) -> Result<()>
+    where
+        P: Serialize + ?Sized,
+    {
+        let response = self
+            .http_client
+            .delete(url)
+            .query(params)
+            .send()
+            .await
+            .map_err(Error::Http)?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            self.handle_error_response(response).await
+        }
+    }
+
+    /// Handle a successful or error response.
+    ///
+    /// If the response status is successful (2xx), parse the body as JSON.
+    /// Otherwise, parse the error response and return an appropriate error.
+    async fn handle_response<Resp>(&self, response: reqwest::Response) -> Result<Resp>
+    where
+        Resp: DeserializeOwned,
+    {
+        if response.status().is_success() {
+            response.json().await.map_err(Error::Http)
+        } else {
+            self.handle_error_response(response).await
+        }
+    }
+
+    /// Handle an error response from the SEA API.
+    ///
+    /// Parses the error body to extract the error code and message,
+    /// then returns an appropriate [`Error::SeaApi`] error.
+    async fn handle_error_response<T>(&self, response: reqwest::Response) -> Result<T> {
+        let http_status = response.status().as_u16();
+
+        // Try to parse the error body as JSON
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({}));
+
+        // Extract error code and message from the response
+        // SEA API error format: { "error_code": "...", "message": "..." }
+        let code = body["error_code"]
+            .as_str()
+            .unwrap_or("UNKNOWN")
+            .to_string();
+        let message = body["message"]
+            .as_str()
+            .unwrap_or("Unknown error")
+            .to_string();
+
+        Err(Error::SeaApi {
+            code,
+            message,
+            http_status,
+        })
+    }
+
+    // ========================================================================
+    // SEA API Methods (Stubs for future implementation)
+    // ========================================================================
+
+    /// Execute a SQL statement.
+    ///
+    /// Sends a POST request to `/api/2.0/sql/statements/` with the statement
+    /// execution request.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The statement execution request
+    ///
+    /// # Returns
+    ///
+    /// The statement response containing the statement ID and initial status.
+    pub async fn execute_statement(
+        &self,
+        request: &ExecuteStatementRequest,
+    ) -> Result<StatementResponse> {
+        let url = self.statements_url();
+        self.post(&url, request).await
+    }
+
+    /// Get the status and result of a statement.
+    ///
+    /// Sends a GET request to `/api/2.0/sql/statements/{statement_id}`.
+    ///
+    /// # Arguments
+    ///
+    /// * `statement_id` - The ID of the statement to query
+    ///
+    /// # Returns
+    ///
+    /// The statement response containing the current status and any available results.
+    pub async fn get_statement(&self, statement_id: &str) -> Result<StatementResponse> {
+        let url = self.statement_url(statement_id);
+        self.get(&url).await
+    }
+
+    /// Get a result chunk for a statement.
+    ///
+    /// Sends a GET request to `/api/2.0/sql/statements/{statement_id}/result/chunks/{chunk_index}`.
+    ///
+    /// # Arguments
+    ///
+    /// * `statement_id` - The ID of the statement
+    /// * `chunk_index` - The index of the chunk to retrieve
+    ///
+    /// # Returns
+    ///
+    /// The chunk response containing external links to the chunk data.
+    pub async fn get_chunk(&self, statement_id: &str, chunk_index: usize) -> Result<ChunkResponse> {
+        let url = self.chunk_url(statement_id, chunk_index);
+        self.get(&url).await
+    }
+
+    /// Cancel a running statement.
+    ///
+    /// Sends a POST request to `/api/2.0/sql/statements/{statement_id}/cancel`.
+    ///
+    /// # Arguments
+    ///
+    /// * `statement_id` - The ID of the statement to cancel
+    pub async fn cancel_statement(&self, statement_id: &str) -> Result<()> {
+        let url = self.statement_cancel_url(statement_id);
+        // Cancel returns an empty response on success
+        let _: serde_json::Value = self.post(&url, &serde_json::json!({})).await?;
+        Ok(())
+    }
+
+    /// Close a statement and release resources.
+    ///
+    /// Sends a DELETE request to `/api/2.0/sql/statements/{statement_id}`.
+    ///
+    /// # Arguments
+    ///
+    /// * `statement_id` - The ID of the statement to close
+    pub async fn close_statement(&self, statement_id: &str) -> Result<()> {
+        let url = self.statement_url(statement_id);
+        self.delete(&url).await
+    }
+
+    /// Create a new session.
+    ///
+    /// Sends a POST request to `/api/2.0/sql/sessions/` with the session
+    /// creation request.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The session creation request
+    ///
+    /// # Returns
+    ///
+    /// The session response containing the new session ID.
+    pub async fn create_session(&self, request: &CreateSessionRequest) -> Result<SessionResponse> {
+        let url = self.sessions_url();
+        self.post(&url, request).await
+    }
+
+    /// Delete a session.
+    ///
+    /// Sends a DELETE request to `/api/2.0/sql/sessions/{session_id}` with
+    /// the warehouse_id as a query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The ID of the session to delete
+    pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+        let url = self.session_url(session_id);
+        let params = [("warehouse_id", &self.warehouse_id)];
+        self.delete_with_params(&url, &params).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_client() -> SeaClient {
+        SeaClient::new(SeaClientConfig {
+            host: "https://workspace.cloud.databricks.com".into(),
+            token: "test_token".into(),
+            warehouse_id: "abc123".into(),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    // ========================================================================
+    // Configuration Tests
+    // ========================================================================
+
+    #[test]
+    fn test_sea_client_config_default() {
+        let config = SeaClientConfig::default();
+        assert_eq!(config.host, "");
+        assert_eq!(config.token, "");
+        assert_eq!(config.warehouse_id, "");
+        assert_eq!(config.connect_timeout, Duration::from_secs(10));
+        assert_eq!(config.read_timeout, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_sea_client_config_new() {
+        let config = SeaClientConfig::new("https://host.com", "token123", "wh456");
+        assert_eq!(config.host, "https://host.com");
+        assert_eq!(config.token, "token123");
+        assert_eq!(config.warehouse_id, "wh456");
+        assert_eq!(config.connect_timeout, Duration::from_secs(10));
+        assert_eq!(config.read_timeout, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_sea_client_config_with_timeouts() {
+        let config = SeaClientConfig::new("https://host.com", "token", "wh")
+            .with_connect_timeout(Duration::from_secs(30))
+            .with_read_timeout(Duration::from_secs(600));
+
+        assert_eq!(config.connect_timeout, Duration::from_secs(30));
+        assert_eq!(config.read_timeout, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn test_sea_client_instantiation() {
+        let client = create_test_client();
+        assert_eq!(client.host(), "https://workspace.cloud.databricks.com");
+        assert_eq!(client.token(), "test_token");
+        assert_eq!(client.warehouse_id(), "abc123");
+    }
+
+    // ========================================================================
+    // URL Construction Tests
+    // ========================================================================
+
+    #[test]
+    fn test_base_url_construction() {
+        let client = create_test_client();
+        assert_eq!(
+            client.base_url(),
+            "https://workspace.cloud.databricks.com/api/2.0/sql"
+        );
+    }
+
+    #[test]
+    fn test_base_url_with_trailing_slash() {
+        let client = SeaClient::new(SeaClientConfig {
+            host: "https://workspace.cloud.databricks.com/".into(),
+            token: "token".into(),
+            warehouse_id: "abc123".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            client.base_url(),
+            "https://workspace.cloud.databricks.com/api/2.0/sql"
+        );
+    }
+
+    #[test]
+    fn test_base_url_with_multiple_trailing_slashes() {
+        let client = SeaClient::new(SeaClientConfig {
+            host: "https://workspace.cloud.databricks.com///".into(),
+            token: "token".into(),
+            warehouse_id: "abc123".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            client.base_url(),
+            "https://workspace.cloud.databricks.com/api/2.0/sql"
+        );
+    }
+
+    #[test]
+    fn test_statements_url() {
+        let client = create_test_client();
+        assert_eq!(
+            client.statements_url(),
+            "https://workspace.cloud.databricks.com/api/2.0/sql/statements"
+        );
+    }
+
+    #[test]
+    fn test_statement_url() {
+        let client = create_test_client();
+        assert_eq!(
+            client.statement_url("stmt-123"),
+            "https://workspace.cloud.databricks.com/api/2.0/sql/statements/stmt-123"
+        );
+    }
+
+    #[test]
+    fn test_statement_cancel_url() {
+        let client = create_test_client();
+        assert_eq!(
+            client.statement_cancel_url("stmt-123"),
+            "https://workspace.cloud.databricks.com/api/2.0/sql/statements/stmt-123/cancel"
+        );
+    }
+
+    #[test]
+    fn test_chunk_url() {
+        let client = create_test_client();
+        assert_eq!(
+            client.chunk_url("stmt-123", 5),
+            "https://workspace.cloud.databricks.com/api/2.0/sql/statements/stmt-123/result/chunks/5"
+        );
+    }
+
+    #[test]
+    fn test_sessions_url() {
+        let client = create_test_client();
+        assert_eq!(
+            client.sessions_url(),
+            "https://workspace.cloud.databricks.com/api/2.0/sql/sessions"
+        );
+    }
+
+    #[test]
+    fn test_session_url() {
+        let client = create_test_client();
+        assert_eq!(
+            client.session_url("sess-456"),
+            "https://workspace.cloud.databricks.com/api/2.0/sql/sessions/sess-456"
+        );
+    }
+
+    // ========================================================================
+    // Header Tests
+    // ========================================================================
+
+    #[test]
+    fn test_default_headers() {
+        let headers = SeaClient::default_headers("test_token").unwrap();
+
+        assert!(headers.contains_key(AUTHORIZATION));
+        assert!(headers.contains_key(CONTENT_TYPE));
+        assert!(headers.contains_key(USER_AGENT));
+
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap().to_str().unwrap(),
+            "Bearer test_token"
+        );
+        assert_eq!(
+            headers.get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "application/json"
+        );
+        assert!(headers
+            .get(USER_AGENT)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("adbc-driver-databricks/"));
+    }
+
+    // ========================================================================
+    // Clone Tests
+    // ========================================================================
+
+    #[test]
+    fn test_sea_client_clone() {
+        let client1 = create_test_client();
+        let client2 = client1.clone();
+
+        assert_eq!(client1.host(), client2.host());
+        assert_eq!(client1.warehouse_id(), client2.warehouse_id());
     }
 }

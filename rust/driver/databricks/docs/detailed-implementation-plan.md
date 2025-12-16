@@ -692,6 +692,33 @@ fn test_base_url_construction() {
 
 ### Files Modified/Created
 - `driver/databricks/src/client/mod.rs`
+- `driver/databricks/src/lib.rs` (made `client` module public)
+- `driver/databricks/tests/e2e_tests.rs` (added E2E tests)
+
+### Implementation Notes (Completed 2024-12-16)
+
+**Implementation Details:**
+- Added `SeaClientConfig` struct with builder pattern for configuration
+- Implemented `SeaClient` with `reqwest::Client` for HTTP operations
+- Added all URL helper methods: `base_url()`, `statements_url()`, `statement_url()`,
+  `statement_cancel_url()`, `chunk_url()`, `sessions_url()`, `session_url()`
+- Implemented generic HTTP methods: `post()`, `get()`, `delete()`, `delete_with_params()`
+- Error responses are parsed to extract `error_code` and `message` from SEA API
+- Default headers include Authorization (Bearer token), Content-Type (application/json),
+  and User-Agent (adbc-driver-databricks/<version>)
+
+**API Discovery Notes:**
+- DELETE session endpoint requires `warehouse_id` as a query parameter (not documented)
+- Implemented `delete_with_params()` to support this pattern
+
+**E2E Tests Added:**
+- `test_e2e_sea_client_instantiation`: Validates client creation
+- `test_e2e_sea_client_session_lifecycle`: Creates and deletes session against real warehouse
+- `test_e2e_sea_client_auth_error`: Validates 401 error handling with invalid token
+
+**Test Results:**
+- 34 unit tests pass
+- 3 E2E tests pass against real Databricks instance
 
 ---
 

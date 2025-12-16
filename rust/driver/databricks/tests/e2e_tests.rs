@@ -285,3 +285,155 @@ fn test_can_execute_check() {
     // If env var is set and file exists, should return true
     // Otherwise should return false - both are valid
 }
+
+// ============================================================================
+// Work Item 1.3: SEA Client Core HTTP Infrastructure E2E Tests
+// ============================================================================
+
+/// Test that SeaClient can be instantiated with valid configuration.
+///
+/// This validates:
+/// - SeaClientConfig can be created from E2E config
+/// - SeaClient::new() succeeds with valid configuration
+/// - Client has correct host and warehouse_id
+#[test]
+#[ignore]
+fn test_e2e_sea_client_instantiation() {
+    use adbc_databricks::client::{SeaClient, SeaClientConfig};
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    // Create SeaClient config
+    let sea_config = SeaClientConfig::new(&host, &config.token, &warehouse_id);
+
+    // Create SeaClient
+    let client = SeaClient::new(sea_config).expect("Failed to create SeaClient");
+
+    // Verify configuration
+    assert_eq!(client.host(), host, "Host should match");
+    assert_eq!(client.warehouse_id(), warehouse_id, "Warehouse ID should match");
+
+    println!("SeaClient instantiated successfully!");
+    println!("  Host: {}", client.host());
+    println!("  Warehouse ID: {}", client.warehouse_id());
+}
+
+/// Test that SeaClient can create and delete a session on a real Databricks instance.
+///
+/// This validates the core HTTP infrastructure:
+/// - POST requests with JSON body work correctly
+/// - DELETE requests work correctly
+/// - Authorization headers are sent correctly
+/// - Response parsing works correctly
+/// - Error handling for 4xx responses works (tested implicitly)
+#[test]
+#[ignore]
+fn test_e2e_sea_client_session_lifecycle() {
+    use adbc_databricks::client::{CreateSessionRequest, SeaClient, SeaClientConfig};
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    // Create SeaClient
+    let sea_config = SeaClientConfig::new(&host, &config.token, &warehouse_id);
+    let client = SeaClient::new(sea_config).expect("Failed to create SeaClient");
+
+    // Create Tokio runtime for async operations
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+    // Test session creation
+    let session_id = rt.block_on(async {
+        let request = CreateSessionRequest {
+            warehouse_id: warehouse_id.clone(),
+            session_alias: Some("adbc_rust_e2e_test".to_string()),
+            catalog: config.metadata.catalog.clone().into(),
+            schema: config.metadata.schema.clone().into(),
+        };
+
+        println!("Creating session...");
+        let response = client.create_session(&request).await.expect("Failed to create session");
+
+        println!("Session created successfully!");
+        println!("  Session ID: {}", response.session_id);
+
+        response.session_id
+    });
+
+    // Test session deletion
+    rt.block_on(async {
+        println!("Deleting session...");
+        client
+            .delete_session(&session_id)
+            .await
+            .expect("Failed to delete session");
+
+        println!("Session deleted successfully!");
+    });
+
+    println!();
+    println!("=== SEA Client Session Lifecycle Test PASSED ===");
+    println!("Successfully created and deleted session: {}", session_id);
+}
+
+/// Test that SeaClient handles authentication errors correctly.
+///
+/// This validates:
+/// - Invalid token returns 401 error
+/// - Error is correctly mapped to SeaApi error with proper http_status
+#[test]
+#[ignore]
+fn test_e2e_sea_client_auth_error() {
+    use adbc_databricks::client::{CreateSessionRequest, SeaClient, SeaClientConfig};
+    use adbc_databricks::Error;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    // Create SeaClient with invalid token
+    let sea_config = SeaClientConfig::new(&host, "invalid_token_12345", &warehouse_id);
+    let client = SeaClient::new(sea_config).expect("Failed to create SeaClient");
+
+    // Create Tokio runtime for async operations
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+    // Attempt to create session - should fail with 401 or 403
+    let result = rt.block_on(async {
+        let request = CreateSessionRequest {
+            warehouse_id: warehouse_id.clone(),
+            session_alias: None,
+            catalog: None,
+            schema: None,
+        };
+
+        client.create_session(&request).await
+    });
+
+    // Verify we got an authentication error
+    match result {
+        Ok(_) => panic!("Expected authentication error, but request succeeded"),
+        Err(Error::SeaApi { http_status, code, message }) => {
+            println!("Got expected authentication error:");
+            println!("  HTTP Status: {}", http_status);
+            println!("  Error Code: {}", code);
+            println!("  Message: {}", message);
+
+            // Should be 401 (Unauthenticated) or 403 (Permission Denied)
+            assert!(
+                http_status == 401 || http_status == 403,
+                "Expected 401 or 403, got {}",
+                http_status
+            );
+        }
+        Err(e) => panic!("Expected SeaApi error, got: {:?}", e),
+    }
+
+    println!();
+    println!("=== SEA Client Auth Error Test PASSED ===");
+}
