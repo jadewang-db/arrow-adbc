@@ -51,6 +51,7 @@ impl ChunkFetcher {
     /// Create a new chunk fetcher.
     pub fn new(client: Arc<SeaClient>, concurrency: usize) -> Result<Self> {
         let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
             .build()
             .map_err(|e| crate::error::Error::Http(e))?;
 
@@ -61,45 +62,75 @@ impl ChunkFetcher {
         })
     }
 
-    /// Fetch all chunks for a result set.
+    /// Fetch all chunks for a result set sequentially.
     ///
-    /// Returns an iterator that yields RecordBatches in order.
+    /// This is a basic implementation that fetches chunks one at a time.
+    /// A parallel implementation will be added in Sprint 3 for better performance.
+    ///
+    /// Returns the concatenated record batches from all chunks.
     pub async fn fetch_chunks(
         &self,
         _statement_id: &str,
         _manifest: &ResultManifest,
-        _external_links: &[ExternalLink],
+        external_links: &[ExternalLink],
     ) -> Result<Vec<RecordBatch>> {
-        // TODO: Implement parallel chunk fetching
-        // 1. Create work queue with chunks in order
-        // 2. Spawn worker tasks (concurrency limit)
-        // 3. Workers download and decompress chunks
-        // 4. Collect results in ordered buffer
-        // 5. Return batches in order
+        let mut all_batches = Vec::new();
 
-        Ok(Vec::new())
+        for link in external_links {
+            let bytes = self.download_chunk(link).await?;
+            if bytes.is_empty() {
+                continue;
+            }
+
+            // Parse Arrow IPC data
+            let (_, batches) = ArrowResultReader::parse_ipc_stream(&bytes)?;
+            all_batches.extend(batches);
+        }
+
+        Ok(all_batches)
     }
 
-    /// Download a single chunk.
-    async fn download_chunk(&self, _link: &ExternalLink) -> Result<Vec<u8>> {
-        // TODO: Implement single chunk download
-        // 1. Make HTTP GET request to presigned URL
-        // 2. Handle errors (including expired URLs)
-        // 3. Return raw bytes
+    /// Download a single chunk from a presigned URL.
+    ///
+    /// This method fetches the Arrow IPC data from the external link URL.
+    pub async fn download_chunk(&self, link: &ExternalLink) -> Result<Vec<u8>> {
+        let mut request = self.http_client.get(&link.external_link);
 
-        Ok(Vec::new())
+        // Add custom headers if provided (e.g., for Azure blob storage)
+        if let Some(ref headers) = link.http_headers {
+            for (key, value) in headers {
+                request = request.header(key, value);
+            }
+        }
+
+        let response = request.send().await.map_err(crate::error::Error::Http)?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(crate::error::Error::Config(format!(
+                "Failed to download chunk: HTTP {} - {}",
+                status, body
+            )));
+        }
+
+        let bytes = response.bytes().await.map_err(crate::error::Error::Http)?;
+        Ok(bytes.to_vec())
     }
 
     /// Refresh an expired external link.
+    ///
+    /// Note: This will be implemented in Sprint 3 when parallel fetching is added.
+    /// For now, links should not expire during sequential fetching.
+    #[allow(dead_code)]
     async fn refresh_link(
         &self,
         _statement_id: &str,
         _chunk_index: usize,
     ) -> Result<ExternalLink> {
-        // TODO: Implement link refresh
-        // 1. Call get_chunk API to get new URL
-        // 2. Return refreshed link
-
-        unimplemented!("refresh_link not yet implemented")
+        // TODO: Implement link refresh using get_chunk API
+        // This will be needed for parallel fetching where links may expire
+        // before all chunks are downloaded.
+        unimplemented!("refresh_link not yet implemented - will be added in Sprint 3")
     }
 }

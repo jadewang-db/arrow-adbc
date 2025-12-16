@@ -3763,3 +3763,742 @@ fn test_e2e_inline_arrow_result_empty() {
     println!();
     println!("=== Work Item 2.7: Empty Result Set E2E Test PASSED ===");
 }
+
+// ============================================================================
+// Work Item 2.8: Statement Execute - Inline Path E2E Tests
+// ============================================================================
+
+/// Test inline execution with a simple SELECT 1.
+///
+/// This validates the complete inline execution path:
+/// - Statement executes successfully
+/// - Reader returns actual data (not empty)
+/// - Schema has correct field name
+/// - Data value is correct (1)
+#[test]
+#[ignore]
+fn test_e2e_execute_inline_select_simple() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::{Int32Array, RecordBatchReader};
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 2.8: Inline Execute SELECT 1 E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement and execute SELECT 1
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query("SELECT 1 AS value")
+        .expect("Failed to set SQL query");
+
+    println!("Executing: SELECT 1 AS value");
+    let reader = stmt.execute().expect("Failed to execute statement");
+
+    // Verify schema
+    let schema = reader.schema();
+    println!("Schema: {:?}", schema);
+    assert!(
+        schema.field_with_name("value").is_ok(),
+        "Schema should have 'value' field"
+    );
+
+    // Read batches
+    let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+    println!("Batches count: {}", batches.len());
+
+    // Verify we got data
+    assert!(!batches.is_empty(), "Should have at least one batch");
+
+    let batch = &batches[0];
+    println!("Batch rows: {}", batch.num_rows());
+    assert_eq!(batch.num_rows(), 1, "Expected 1 row");
+
+    // Verify actual value is 1
+    // Note: The exact type may vary (Int32, Int64, etc.) based on Databricks
+    let col = batch.column(0);
+    if let Some(int32_col) = col.as_any().downcast_ref::<Int32Array>() {
+        assert_eq!(int32_col.value(0), 1, "Value should be 1");
+        println!("Value (Int32): {}", int32_col.value(0));
+    } else if let Some(int64_col) = col
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+    {
+        assert_eq!(int64_col.value(0), 1, "Value should be 1");
+        println!("Value (Int64): {}", int64_col.value(0));
+    } else {
+        println!(
+            "Column type: {:?} - verifying string representation",
+            col.data_type()
+        );
+        // For other types, just ensure we got some data
+    }
+
+    println!();
+    println!("=== Work Item 2.8: Inline Execute SELECT 1 E2E Test PASSED ===");
+}
+
+/// Test inline execution with multiple columns.
+///
+/// This validates:
+/// - Multiple columns are returned correctly
+/// - Different data types work (INT, STRING, BOOLEAN)
+/// - Values are correct
+#[test]
+#[ignore]
+fn test_e2e_execute_inline_multiple_columns() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 2.8: Inline Execute Multiple Columns E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query("SELECT 42 AS num, 'hello' AS str, true AS bool")
+        .expect("Failed to set SQL query");
+
+    println!("Executing: SELECT 42 AS num, 'hello' AS str, true AS bool");
+    let reader = stmt.execute().expect("Failed to execute statement");
+
+    // Verify schema has all 3 columns
+    let schema = reader.schema();
+    println!("Schema fields: {}", schema.fields().len());
+    for field in schema.fields() {
+        println!("  {} ({:?})", field.name(), field.data_type());
+    }
+    assert_eq!(
+        schema.fields().len(),
+        3,
+        "Schema should have 3 fields"
+    );
+
+    // Read batches
+    let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+    assert!(!batches.is_empty(), "Should have at least one batch");
+
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 1, "Expected 1 row");
+
+    // Print values for debugging
+    for (i, field) in schema.fields().iter().enumerate() {
+        let col = batch.column(i);
+        println!("  Column '{}': {:?}", field.name(), col);
+    }
+
+    println!();
+    println!("=== Work Item 2.8: Inline Execute Multiple Columns E2E Test PASSED ===");
+}
+
+/// Test inline execution with multiple rows.
+///
+/// This validates:
+/// - Multiple rows are returned correctly
+/// - VALUES clause works
+#[test]
+#[ignore]
+fn test_e2e_execute_inline_multiple_rows() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 2.8: Inline Execute Multiple Rows E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement with VALUES clause
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query("SELECT * FROM (VALUES (1), (2), (3)) AS t(x)")
+        .expect("Failed to set SQL query");
+
+    println!("Executing: SELECT * FROM (VALUES (1), (2), (3)) AS t(x)");
+    let reader = stmt.execute().expect("Failed to execute statement");
+
+    // Verify schema
+    let schema = reader.schema();
+    println!("Schema fields: {}", schema.fields().len());
+    assert_eq!(schema.fields().len(), 1, "Schema should have 1 field");
+
+    // Read batches
+    let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+    assert!(!batches.is_empty(), "Should have at least one batch");
+
+    // Count total rows
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    println!("Total rows: {}", total_rows);
+    assert_eq!(total_rows, 3, "Expected 3 rows");
+
+    // Print values
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        let col = batch.column(0);
+        println!("Batch {} - Column x: {:?}", batch_idx, col);
+    }
+
+    println!();
+    println!("=== Work Item 2.8: Inline Execute Multiple Rows E2E Test PASSED ===");
+}
+
+/// Test inline execution with NULL values.
+///
+/// This validates:
+/// - NULL values are handled correctly
+/// - Nullable columns work
+#[test]
+#[ignore]
+fn test_e2e_execute_inline_null_values() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 2.8: Inline Execute NULL Values E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement with NULL value
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query("SELECT NULL AS nullable_col")
+        .expect("Failed to set SQL query");
+
+    println!("Executing: SELECT NULL AS nullable_col");
+    let reader = stmt.execute().expect("Failed to execute statement");
+
+    // Verify schema
+    let schema = reader.schema();
+    println!("Schema fields: {}", schema.fields().len());
+    assert_eq!(schema.fields().len(), 1, "Schema should have 1 field");
+
+    // Read batches
+    let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+    assert!(!batches.is_empty(), "Should have at least one batch");
+
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 1, "Expected 1 row");
+
+    // Verify the column has null
+    // Note: Databricks returns a NullArray for SELECT NULL, which has data_type() == DataType::Null
+    // NullArray doesn't track individual nulls - all values are null by definition, so null_count() == 0
+    let col = batch.column(0);
+    println!("Column nullable_col: {:?}", col);
+    println!("Column data_type: {:?}", col.data_type());
+
+    // Check if it's a NullArray (all values are null) or has null values in the validity buffer
+    let is_null_array = col.data_type() == &arrow_schema::DataType::Null;
+    let has_null_in_validity = col.null_count() > 0;
+    assert!(
+        is_null_array || has_null_in_validity,
+        "Column should be NullArray or have null values: is_null_array={}, null_count={}",
+        is_null_array, col.null_count()
+    );
+
+    println!();
+    println!("=== Work Item 2.8: Inline Execute NULL Values E2E Test PASSED ===");
+}
+
+/// Test inline execution with various Spark SQL types.
+///
+/// This validates:
+/// - TINYINT, SMALLINT, INT, BIGINT work
+/// - FLOAT, DOUBLE work
+/// - DECIMAL works
+/// - STRING works
+/// - DATE, TIMESTAMP work
+#[test]
+#[ignore]
+fn test_e2e_execute_inline_all_types() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 2.8: Inline Execute All Types E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement with all types
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query(
+        "SELECT
+            cast(1 as TINYINT) as col_tinyint,
+            cast(1 as SMALLINT) as col_smallint,
+            cast(1 as INT) as col_int,
+            cast(1 as BIGINT) as col_bigint,
+            cast(1.5 as FLOAT) as col_float,
+            cast(1.5 as DOUBLE) as col_double,
+            cast(1.23 as DECIMAL(10,2)) as col_decimal,
+            'hello' as col_string,
+            cast('2024-01-15' as DATE) as col_date,
+            cast('2024-01-15 12:30:00' as TIMESTAMP) as col_timestamp",
+    )
+    .expect("Failed to set SQL query");
+
+    println!("Executing query with all types...");
+    let reader = stmt.execute().expect("Failed to execute statement");
+
+    // Verify schema has all 10 columns
+    let schema = reader.schema();
+    println!("Schema fields: {}", schema.fields().len());
+    for field in schema.fields() {
+        println!("  {} ({:?})", field.name(), field.data_type());
+    }
+    assert_eq!(
+        schema.fields().len(),
+        10,
+        "Schema should have 10 fields"
+    );
+
+    // Read batches
+    let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+    assert!(!batches.is_empty(), "Should have at least one batch");
+
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 1, "Expected 1 row");
+
+    // Print all column values
+    println!();
+    println!("Column values:");
+    for (i, field) in schema.fields().iter().enumerate() {
+        let col = batch.column(i);
+        println!("  {}: {:?}", field.name(), col);
+    }
+
+    println!();
+    println!("=== Work Item 2.8: Inline Execute All Types E2E Test PASSED ===");
+}
+
+/// Test that SQL not set returns a clear error.
+///
+/// This validates:
+/// - execute() without set_sql_query returns InvalidState error
+/// - Error message is clear
+#[test]
+#[ignore]
+fn test_e2e_execute_without_sql_returns_error() {
+    use adbc_core::error::Status;
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 2.8: Execute Without SQL Error E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement but don't set SQL
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    println!("Executing without setting SQL query...");
+    let result = stmt.execute();
+
+    // Should return error
+    assert!(result.is_err(), "execute() without SQL should return error");
+    let err = result.err().expect("Expected error");
+    println!("Error status: {:?}", err.status);
+    println!("Error message: {}", err.message);
+
+    assert_eq!(
+        err.status,
+        Status::InvalidState,
+        "Should return InvalidState error"
+    );
+    assert!(
+        err.message.contains("SQL") || err.message.contains("query"),
+        "Error message should mention SQL query: {}",
+        err.message
+    );
+
+    println!();
+    println!("=== Work Item 2.8: Execute Without SQL Error E2E Test PASSED ===");
+}
+
+/// Test SQL syntax error returns appropriate error.
+///
+/// This validates:
+/// - SQL syntax error is detected
+/// - Error is returned (not a crash)
+/// - Error message includes SQL error info
+#[test]
+#[ignore]
+fn test_e2e_execute_sql_syntax_error() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 2.8: SQL Syntax Error E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement with invalid SQL
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query("SELEC 1")  // typo: SELEC instead of SELECT
+        .expect("Failed to set SQL query");
+
+    println!("Executing invalid SQL: SELEC 1");
+    let result = stmt.execute();
+
+    // Should return error
+    assert!(result.is_err(), "Invalid SQL should return error");
+    let err = result.err().expect("Expected an error");
+    println!("Error status: {:?}", err.status);
+    println!("Error message: {}", err.message);
+
+    // The error message should indicate SQL problem
+    assert!(
+        err.message.to_lowercase().contains("syntax")
+            || err.message.to_lowercase().contains("parse")
+            || err.message.to_lowercase().contains("sql")
+            || err.message.to_lowercase().contains("error"),
+        "Error message should indicate SQL problem: {}",
+        err.message
+    );
+
+    println!();
+    println!("=== Work Item 2.8: SQL Syntax Error E2E Test PASSED ===");
+}
+
+/// Test comprehensive inline execution flow.
+///
+/// This is the main E2E test that validates the complete inline execution path
+/// including all edge cases in a single test.
+#[test]
+#[ignore]
+fn test_e2e_execute_inline_comprehensive() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 2.8: Comprehensive Inline Execution E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session: {:?}", conn.session_id());
+
+    // Test 1: Simple SELECT
+    println!();
+    println!("Test 1: Simple SELECT");
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query("SELECT 1 AS x")
+            .expect("Failed to set SQL query");
+        let reader = stmt.execute().expect("Failed to execute statement");
+        let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        println!("  Rows: {}", total_rows);
+        assert_eq!(total_rows, 1, "Expected 1 row");
+        println!("  PASSED");
+    }
+
+    // Test 2: Multiple columns and types
+    println!();
+    println!("Test 2: Multiple columns and types");
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(
+            "SELECT
+                123 AS int_col,
+                45.67 AS double_col,
+                'test' AS string_col,
+                true AS bool_col",
+        )
+        .expect("Failed to set SQL query");
+        let reader = stmt.execute().expect("Failed to execute statement");
+        let schema = reader.schema();
+        println!("  Columns: {}", schema.fields().len());
+        assert_eq!(schema.fields().len(), 4, "Expected 4 columns");
+        let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+        assert!(!batches.is_empty(), "Should have data");
+        println!("  PASSED");
+    }
+
+    // Test 3: Multiple rows
+    println!();
+    println!("Test 3: Multiple rows");
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(
+            "SELECT * FROM (VALUES
+                ('Alice', 25),
+                ('Bob', 30),
+                ('Charlie', 35)) AS t(name, age)",
+        )
+        .expect("Failed to set SQL query");
+        let reader = stmt.execute().expect("Failed to execute statement");
+        let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        println!("  Rows: {}", total_rows);
+        assert_eq!(total_rows, 3, "Expected 3 rows");
+        println!("  PASSED");
+    }
+
+    // Test 4: NULL values
+    println!();
+    println!("Test 4: NULL values");
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(
+            "SELECT * FROM (VALUES
+                (1, 'a'),
+                (NULL, 'b'),
+                (3, NULL)) AS t(num, letter)",
+        )
+        .expect("Failed to set SQL query");
+        let reader = stmt.execute().expect("Failed to execute statement");
+        let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        println!("  Rows: {}", total_rows);
+        assert_eq!(total_rows, 3, "Expected 3 rows");
+        // Check that null_count > 0 for at least one column
+        let batch = &batches[0];
+        let has_nulls = (0..batch.num_columns()).any(|i| batch.column(i).null_count() > 0);
+        println!("  Has nulls: {}", has_nulls);
+        assert!(has_nulls, "Should have null values");
+        println!("  PASSED");
+    }
+
+    // Test 5: Empty result
+    println!();
+    println!("Test 5: Empty result");
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query("SELECT 1 AS x WHERE 1 = 0")
+            .expect("Failed to set SQL query");
+        let reader = stmt.execute().expect("Failed to execute statement");
+        let schema = reader.schema();
+        println!("  Schema fields: {}", schema.fields().len());
+        assert!(schema.fields().len() >= 1, "Should have schema");
+        let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        println!("  Rows: {}", total_rows);
+        assert_eq!(total_rows, 0, "Expected 0 rows");
+        println!("  PASSED");
+    }
+
+    // Test 6: Reuse statement
+    println!();
+    println!("Test 6: Reuse statement");
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+        // First query
+        stmt.set_sql_query("SELECT 'first' AS query")
+            .expect("Failed to set SQL query");
+        let reader = stmt.execute().expect("Failed to execute first query");
+        let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+        assert!(!batches.is_empty(), "First query should return data");
+        println!("  First query PASSED");
+
+        // Second query (reusing statement)
+        stmt.set_sql_query("SELECT 'second' AS query")
+            .expect("Failed to set SQL query");
+        let reader = stmt.execute().expect("Failed to execute second query");
+        let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+        assert!(!batches.is_empty(), "Second query should return data");
+        println!("  Second query PASSED");
+    }
+
+    println!();
+    println!("=== Work Item 2.8: Comprehensive Inline Execution E2E Test PASSED ===");
+    println!("All 6 sub-tests completed successfully!");
+}

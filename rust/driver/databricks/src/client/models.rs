@@ -114,13 +114,12 @@ impl ExecuteStatementRequest {
     /// The default settings are:
     /// - wait_timeout: "10s"
     /// - on_wait_timeout: "CONTINUE"
-    /// - disposition: "EXTERNAL_LINKS" (supports all formats and large results)
+    /// - disposition: "EXTERNAL_LINKS" (required for ARROW_STREAM format)
     /// - format: "ARROW_STREAM"
     ///
-    /// Note: EXTERNAL_LINKS disposition is preferred because:
-    /// - It works with all formats (ARROW_STREAM, JSON_ARRAY, CSV)
-    /// - It supports larger result sets (INLINE is limited to 25 MiB)
-    /// - It offers better throughput via Cloud Fetch technology
+    /// Note: ARROW_STREAM format requires EXTERNAL_LINKS disposition per SEA API constraints.
+    /// Even for small result sets, the data is returned via presigned URLs (external links).
+    /// The INLINE disposition only supports JSON_ARRAY format with a 25 MiB limit.
     pub fn new(warehouse_id: impl Into<String>, statement: impl Into<String>) -> Self {
         Self {
             warehouse_id: warehouse_id.into(),
@@ -200,7 +199,7 @@ pub struct StatementError {
 }
 
 /// Result manifest for external links.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ResultManifest {
     /// Result format.
     pub format: Option<String>,

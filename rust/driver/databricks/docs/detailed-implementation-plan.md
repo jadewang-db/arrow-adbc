@@ -2749,79 +2749,71 @@ fn test_reader_iteration() {
 
 ---
 
-## 2.8 Statement Execute - Inline Path
+## 2.8 Statement Execute - External Links Path
 
 ### Objective
-Complete the execute() method for queries returning inline results (small result sets).
+Complete the execute() method for queries returning results via external links (presigned URLs).
 
-### Actions
+> **Note**: The SEA API requires `EXTERNAL_LINKS` disposition when using `ARROW_STREAM` format. The `INLINE` disposition only supports `JSON_ARRAY` format. Therefore, all Arrow data is returned via presigned cloud storage URLs, even for small result sets.
 
-1. **Implement create_reader_from_result in DatabricksStatement**
+### Implementation (Completed)
+
+1. **ChunkFetcher for external links fetching**
    ```rust
-   impl DatabricksStatement {
-       async fn create_reader_from_result(
+   impl ChunkFetcher {
+       pub async fn fetch_chunks(
            &self,
-           response: ExecuteStatementResponse,
-       ) -> Result<ArrowResultReader> {
-           let manifest = response.manifest
-               .ok_or_else(|| Error::StatementFailed("No manifest in response".into()))?;
+           _statement_id: &str,
+           _manifest: &ResultManifest,
+           external_links: &[ExternalLink],
+       ) -> Result<Vec<RecordBatch>> {
+           let mut all_batches = Vec::new();
 
-           let schema = manifest_to_arrow_schema(&manifest.schema)?;
-
-           let result = response.result
-               .ok_or_else(|| Error::StatementFailed("No result in response".into()))?;
-
-           // Check if this is an inline result or external links
-           if let Some(ref external_links) = result.external_links {
-               // External links - will be handled in Sprint 3
-               todo!("External links handling in Sprint 3")
-           } else if manifest.total_row_count == Some(0) {
-               // Empty result
-               Ok(ArrowResultReader::empty(schema))
-           } else {
-               // Inline result - data should be in the response
-               // For ARROW_STREAM format, the inline data is base64 encoded
-               let data = self.extract_inline_arrow_data(&response)?;
-               ArrowResultReader::from_inline_data(schema, &data)
+           for link in external_links {
+               let bytes = self.download_chunk(link).await?;
+               if bytes.is_empty() {
+                   continue;
+               }
+               let (_, batches) = ArrowResultReader::parse_ipc_stream(&bytes)?;
+               all_batches.extend(batches);
            }
+
+           Ok(all_batches)
        }
 
-       fn extract_inline_arrow_data(&self, response: &ExecuteStatementResponse) -> Result<Vec<u8>> {
-           // The inline Arrow data may be in different locations depending on response
-           // This extracts and decodes it
+       pub async fn download_chunk(&self, link: &ExternalLink) -> Result<Vec<u8>> {
+           let mut request = self.http_client.get(&link.external_link);
 
-           // For ARROW_STREAM with inline disposition, data is typically base64 encoded
-           if let Some(ref result) = response.result {
-               // Check for inline binary data field
-               // Note: Actual field name may vary - check SEA API docs
-               // This is a placeholder implementation
-               Ok(Vec::new()) // Will be populated with actual parsing
-           } else {
-               Err(Error::StatementFailed("No inline data found".into()))
+           if let Some(ref headers) = link.http_headers {
+               for (key, value) in headers {
+                   request = request.header(key, value);
+               }
            }
+
+           let response = request.send().await.map_err(crate::error::Error::Http)?;
+           // ... error handling and return bytes
        }
    }
    ```
 
-2. **Add integration test for end-to-end inline query**
+2. **response_to_reader in DatabricksStatement**
    ```rust
-   #[test]
-   #[ignore] // Requires live Databricks
-   fn test_simple_select_query() {
-       let mut driver = DatabricksDriver::new();
-       let mut db = create_test_database(&mut driver);
-       let mut conn = db.new_connection().unwrap();
-       let mut stmt = conn.new_statement().unwrap();
+   fn response_to_reader(&self, response: StatementResponse) -> Result<ArrowResultReader> {
+       let schema = self.build_schema_from_response(&response)?;
 
-       stmt.set_sql_query("SELECT 1 as num, 'hello' as msg").unwrap();
-       let reader = stmt.execute().unwrap();
+       // Check for external links (primary path for ARROW_STREAM)
+       if let Some(ref external_links) = result.external_links {
+           if !external_links.is_empty() {
+               let fetcher = ChunkFetcher::new(self.client.clone(), 1)?;
+               let batches = block_on_async(&self.runtime, async move {
+                   fetcher.fetch_chunks(statement_id, &manifest, &links).await
+               })?;
+               return Ok(ArrowResultReader::new(schema, batches));
+           }
+       }
 
-       let schema = reader.schema();
-       assert_eq!(schema.fields().len(), 2);
-
-       let batches: Vec<_> = reader.collect::<std::result::Result<Vec<_>, _>>().unwrap();
-       assert!(!batches.is_empty());
-       assert_eq!(batches[0].num_rows(), 1);
+       // No data - return empty reader
+       Ok(ArrowResultReader::empty(schema))
    }
    ```
 
@@ -2839,7 +2831,16 @@ Complete the execute() method for queries returning inline results (small result
 | Data parseable | RecordBatch iteration succeeds | E2E |
 | Empty results handled | Zero-row queries work | E2E |
 
-### E2E Exit Criteria
+### E2E Exit Criteria (All Passing)
+
+The following E2E tests validate Work Item 2.8:
+- `test_e2e_execute_inline_select_simple` - SELECT 1 returns actual data
+- `test_e2e_execute_inline_multiple_columns` - Multiple columns work
+- `test_e2e_execute_inline_multiple_rows` - Multiple rows work
+- `test_e2e_execute_inline_null_values` - NULL values handled correctly
+- `test_e2e_execute_inline_all_types` - Various data types work
+- `test_e2e_execute_inline_comprehensive` - Full end-to-end workflow
+
 ✅ **E2E Test**: `test_e2e_query_select_basic` - Execute simple queries and verify results with real Databricks
 
 ```rust

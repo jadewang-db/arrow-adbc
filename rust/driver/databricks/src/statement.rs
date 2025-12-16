@@ -49,7 +49,7 @@ use tokio::runtime::Runtime;
 
 use crate::client::{SeaClient, StatementResponse};
 use crate::error::Error as DatabricksError;
-use crate::fetch::ArrowResultReader;
+use crate::fetch::{ArrowResultReader, ChunkFetcher};
 use crate::runtime::block_on_async;
 use crate::session::SessionManager;
 
@@ -173,7 +173,7 @@ impl DatabricksStatement {
     /// # External Links
     ///
     /// For larger result sets, Databricks returns external links (presigned URLs)
-    /// that point to Arrow IPC files in cloud storage. This is handled in Work Item 3.x.
+    /// that point to Arrow IPC files in cloud storage.
     fn response_to_reader(&self, response: StatementResponse) -> Result<ArrowResultReader> {
         // Build schema from manifest (used as fallback if IPC data is empty)
         let schema = self.build_schema_from_response(&response)?;
@@ -188,7 +188,7 @@ impl DatabricksStatement {
         };
 
         // Check for inline Arrow IPC data (base64 encoded)
-        // This is the primary path for ARROW_STREAM format with INLINE disposition
+        // This would be for INLINE disposition, but ARROW_STREAM requires EXTERNAL_LINKS
         if let Some(ref chunk) = result.chunk {
             return ArrowResultReader::from_inline_data(schema, Some(chunk)).map_err(|e| {
                 Error::with_message_and_status(
@@ -199,20 +199,50 @@ impl DatabricksStatement {
         }
 
         // Check for external links (cloud fetch)
-        if let Some(ref _external_links) = result.external_links {
-            // For now, external links are handled in a future work item
-            // Return empty reader - chunk fetching is Work Item 3.x
-            return Ok(ArrowResultReader::empty(schema));
+        // This is the primary path for ARROW_STREAM format results
+        if let Some(ref external_links) = result.external_links {
+            if !external_links.is_empty() {
+                // Use ChunkFetcher to download the Arrow IPC data from external links
+                let fetcher = ChunkFetcher::new(self.client.clone(), 1).map_err(|e| {
+                    Error::with_message_and_status(
+                        format!("Failed to create chunk fetcher: {}", e),
+                        Status::Internal,
+                    )
+                })?;
+
+                let manifest = response.manifest.as_ref();
+                let statement_id = &response.statement_id;
+                let links = external_links.clone();
+
+                // Fetch chunks using the runtime
+                let batches = block_on_async(&self.runtime, async move {
+                    fetcher
+                        .fetch_chunks(statement_id, manifest.unwrap_or(&Default::default()), &links)
+                        .await
+                })
+                .map_err(|e| {
+                    Error::with_message_and_status(
+                        format!("Failed to fetch result chunks: {}", e),
+                        Status::IO,
+                    )
+                })?;
+
+                // Return reader with fetched batches
+                return Ok(ArrowResultReader::new(schema, batches));
+            }
         }
 
         // Check for inline data (JSON array format)
         if result.data_array.is_some() {
             // Inline JSON results - convert to Arrow
-            // For now, return empty reader - JSON parsing is Work Item 3.x
-            return Ok(ArrowResultReader::empty(schema));
+            // JSON format is not supported - ARROW_STREAM is always used
+            return Err(Error::with_message_and_status(
+                "JSON_ARRAY format is not supported. The driver uses ARROW_STREAM format.",
+                Status::NotImplemented,
+            ));
         }
 
-        // No data available
+        // No data available - return empty reader with schema
         Ok(ArrowResultReader::empty(schema))
     }
 
@@ -1139,5 +1169,117 @@ mod tests {
 
         let batches: Vec<_> = reader.collect();
         assert!(batches.is_empty());
+    }
+
+    #[test]
+    fn test_response_to_reader_external_links_attempts_fetch() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        // Response with external links (not inline data)
+        // The URLs point to non-existent hosts, so the fetch will fail
+        let response = crate::client::StatementResponse {
+            statement_id: "test".to_string(),
+            status: crate::client::StatementStatus {
+                state: crate::client::StatementState::Succeeded,
+                error: None,
+            },
+            manifest: Some(crate::client::ResultManifest {
+                format: Some("ARROW_STREAM".to_string()),
+                schema: Some(crate::client::ResultSchema {
+                    column_count: Some(1),
+                    columns: Some(vec![crate::client::ColumnInfo {
+                        name: "id".to_string(),
+                        type_text: Some("INT".to_string()),
+                        type_name: Some("INT".to_string()),
+                        position: Some(0),
+                    }]),
+                }),
+                total_chunk_count: Some(2),
+                total_row_count: Some(10000),
+                total_byte_count: Some(1000000),
+                truncated: Some(false),
+                chunks: None,
+            }),
+            result: Some(crate::client::ResultData {
+                data_array: None,
+                chunk: None,
+                external_links: Some(vec![
+                    crate::client::ExternalLink {
+                        chunk_index: 0,
+                        external_link: "https://invalid-host-that-does-not-exist.example.com/chunk0".to_string(),
+                        expiration: Some("2024-01-01T00:00:00Z".to_string()),
+                        row_offset: Some(0),
+                        row_count: Some(5000),
+                        byte_count: Some(500000),
+                        http_headers: None,
+                    },
+                ]),
+                row_count: Some(10000),
+                byte_count: Some(1000000),
+            }),
+        };
+
+        let result = stmt.response_to_reader(response);
+
+        // Should return an IO error because the fetch will fail
+        // (the host doesn't exist)
+        assert!(result.is_err(), "External links fetch should fail with invalid URL");
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::IO, "Expected IO error status, got {:?}", err.status);
+    }
+
+    #[test]
+    fn test_response_to_reader_empty_external_links_is_ok() {
+        use arrow_array::RecordBatchReader;
+
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        // Response with empty external links (should be OK)
+        let response = crate::client::StatementResponse {
+            statement_id: "test".to_string(),
+            status: crate::client::StatementStatus {
+                state: crate::client::StatementState::Succeeded,
+                error: None,
+            },
+            manifest: Some(crate::client::ResultManifest {
+                format: Some("ARROW_STREAM".to_string()),
+                schema: Some(crate::client::ResultSchema {
+                    column_count: Some(1),
+                    columns: Some(vec![crate::client::ColumnInfo {
+                        name: "id".to_string(),
+                        type_text: Some("INT".to_string()),
+                        type_name: Some("INT".to_string()),
+                        position: Some(0),
+                    }]),
+                }),
+                total_chunk_count: Some(0),
+                total_row_count: Some(0),
+                total_byte_count: Some(0),
+                truncated: Some(false),
+                chunks: None,
+            }),
+            result: Some(crate::client::ResultData {
+                data_array: None,
+                chunk: None,
+                external_links: Some(vec![]), // Empty vector
+                row_count: Some(0),
+                byte_count: Some(0),
+            }),
+        };
+
+        let reader = stmt.response_to_reader(response).unwrap();
+
+        // Should return empty reader with schema
+        let reader_schema = reader.schema();
+        assert_eq!(reader_schema.fields().len(), 1);
+        assert_eq!(reader_schema.field(0).name(), "id");
     }
 }

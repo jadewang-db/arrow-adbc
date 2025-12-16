@@ -32,11 +32,13 @@ This document describes the design of a native Rust ADBC (Arrow Database Connect
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Authentication | PAT only | Simplest to implement; OAuth can be added later |
-| Result Disposition | INLINE_OR_EXTERNAL_LINKS | Auto-selects optimal mode based on result size |
+| Result Disposition | EXTERNAL_LINKS | Required for ARROW_STREAM format per SEA API |
 | Result Format | ARROW_STREAM | Native Arrow format for ADBC |
 | Async Runtime | Tokio | Industry standard; sync wrappers for ADBC traits |
 | Session Management | Always use sessions | Maintains connection state, enables temp tables |
 | Compression | LZ4_FRAME | Reduces network transfer, ~3-5x compression |
+
+> **Note on Disposition**: The SEA API requires `EXTERNAL_LINKS` disposition when using `ARROW_STREAM` format. The `INLINE` disposition only supports `JSON_ARRAY` format. Even for small result sets, Arrow data is returned via presigned cloud storage URLs.
 
 ---
 
