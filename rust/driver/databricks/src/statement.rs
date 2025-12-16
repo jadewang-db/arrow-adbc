@@ -163,8 +163,19 @@ impl DatabricksStatement {
     ///
     /// This handles both inline results (for small result sets) and external links
     /// (for larger result sets that need to be fetched from cloud storage).
+    ///
+    /// # Inline Results
+    ///
+    /// When using ARROW_STREAM format with INLINE disposition, the data is returned
+    /// as a base64-encoded Arrow IPC stream in `result.chunk`. This method decodes
+    /// and parses that data.
+    ///
+    /// # External Links
+    ///
+    /// For larger result sets, Databricks returns external links (presigned URLs)
+    /// that point to Arrow IPC files in cloud storage. This is handled in Work Item 3.x.
     fn response_to_reader(&self, response: StatementResponse) -> Result<ArrowResultReader> {
-        // Build schema from manifest
+        // Build schema from manifest (used as fallback if IPC data is empty)
         let schema = self.build_schema_from_response(&response)?;
 
         // Check if we have results
@@ -176,10 +187,21 @@ impl DatabricksStatement {
             }
         };
 
+        // Check for inline Arrow IPC data (base64 encoded)
+        // This is the primary path for ARROW_STREAM format with INLINE disposition
+        if let Some(ref chunk) = result.chunk {
+            return ArrowResultReader::from_inline_data(schema, Some(chunk)).map_err(|e| {
+                Error::with_message_and_status(
+                    format!("Failed to parse inline Arrow data: {}", e),
+                    Status::Internal,
+                )
+            });
+        }
+
         // Check for external links (cloud fetch)
         if let Some(ref _external_links) = result.external_links {
             // For now, external links are handled in a future work item
-            // Return empty reader - chunk fetching is Work Item 2.6
+            // Return empty reader - chunk fetching is Work Item 3.x
             return Ok(ArrowResultReader::empty(schema));
         }
 
@@ -974,5 +996,148 @@ mod tests {
         assert_eq!(schema.fields().len(), 1);
         assert_eq!(schema.field(0).name(), "value");
         assert_eq!(*schema.field(0).data_type(), arrow_schema::DataType::Int64);
+    }
+
+    #[test]
+    fn test_response_to_reader_with_inline_arrow_data() {
+        use arrow_array::{Int64Array, RecordBatchReader};
+        use arrow_ipc::writer::StreamWriter;
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        // Create test Arrow data
+        let schema = Arc::new(Schema::new(vec![arrow_schema::Field::new(
+            "value",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![100, 200, 300]))],
+        )
+        .unwrap();
+
+        // Encode to base64 Arrow IPC
+        let mut buffer = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buffer, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        let base64_chunk = STANDARD.encode(&buffer);
+
+        // Create response with inline Arrow data
+        let response = crate::client::StatementResponse {
+            statement_id: "test".to_string(),
+            status: crate::client::StatementStatus {
+                state: crate::client::StatementState::Succeeded,
+                error: None,
+            },
+            manifest: Some(crate::client::ResultManifest {
+                format: Some("ARROW_STREAM".to_string()),
+                schema: Some(crate::client::ResultSchema {
+                    column_count: Some(1),
+                    columns: Some(vec![crate::client::ColumnInfo {
+                        name: "value".to_string(),
+                        type_text: Some("BIGINT".to_string()),
+                        type_name: Some("BIGINT".to_string()),
+                        position: Some(0),
+                    }]),
+                }),
+                total_chunk_count: Some(1),
+                total_row_count: Some(3),
+                total_byte_count: Some(100),
+                truncated: Some(false),
+                chunks: None,
+            }),
+            result: Some(crate::client::ResultData {
+                data_array: None,
+                chunk: Some(base64_chunk),
+                external_links: None,
+                row_count: Some(3),
+                byte_count: Some(100),
+            }),
+        };
+
+        let reader = stmt.response_to_reader(response).unwrap();
+
+        // Verify schema
+        let reader_schema = reader.schema();
+        assert_eq!(reader_schema.fields().len(), 1);
+        assert_eq!(reader_schema.field(0).name(), "value");
+
+        // Verify data
+        let batches: Vec<_> = reader.map(|r| r.unwrap()).collect();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 3);
+
+        // Verify column values
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Expected Int64Array");
+        assert_eq!(col.value(0), 100);
+        assert_eq!(col.value(1), 200);
+        assert_eq!(col.value(2), 300);
+    }
+
+    #[test]
+    fn test_response_to_reader_with_empty_chunk() {
+        use arrow_array::RecordBatchReader;
+
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        // Response with empty chunk field
+        let response = crate::client::StatementResponse {
+            statement_id: "test".to_string(),
+            status: crate::client::StatementStatus {
+                state: crate::client::StatementState::Succeeded,
+                error: None,
+            },
+            manifest: Some(crate::client::ResultManifest {
+                format: Some("ARROW_STREAM".to_string()),
+                schema: Some(crate::client::ResultSchema {
+                    column_count: Some(1),
+                    columns: Some(vec![crate::client::ColumnInfo {
+                        name: "id".to_string(),
+                        type_text: Some("INT".to_string()),
+                        type_name: Some("INT".to_string()),
+                        position: Some(0),
+                    }]),
+                }),
+                total_chunk_count: Some(0),
+                total_row_count: Some(0),
+                total_byte_count: Some(0),
+                truncated: Some(false),
+                chunks: None,
+            }),
+            result: Some(crate::client::ResultData {
+                data_array: None,
+                chunk: Some(String::new()), // Empty string
+                external_links: None,
+                row_count: Some(0),
+                byte_count: Some(0),
+            }),
+        };
+
+        let reader = stmt.response_to_reader(response).unwrap();
+
+        // Should return an empty reader with schema
+        let reader_schema = reader.schema();
+        assert_eq!(reader_schema.fields().len(), 1);
+        assert_eq!(reader_schema.field(0).name(), "id");
+
+        let batches: Vec<_> = reader.collect();
+        assert!(batches.is_empty());
     }
 }

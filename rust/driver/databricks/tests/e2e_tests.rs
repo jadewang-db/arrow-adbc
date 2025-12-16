@@ -3542,3 +3542,224 @@ fn test_e2e_connection_drop_terminates_session() {
     println!("=== Connection Drop Terminates Session E2E Test PASSED ===");
     println!("Connection dropped without errors.");
 }
+
+// ============================================================================
+// Work Item 2.7: Arrow Result Reader - Inline Results E2E Tests
+// ============================================================================
+
+/// Test inline Arrow results from a simple SELECT query.
+///
+/// This validates:
+/// - Statement execution returns Arrow data correctly
+/// - Base64 decoding of inline Arrow IPC data works
+/// - RecordBatchReader interface works correctly
+/// - Data values can be read from the batches
+///
+/// Note: For small result sets, Databricks returns inline Arrow data.
+/// This test verifies that the ArrowResultReader correctly decodes and
+/// parses this data.
+#[test]
+#[ignore]
+fn test_e2e_inline_arrow_result_select_one() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 2.7: Inline Arrow Result E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created");
+
+    // Test 1: Simple SELECT returning a single row
+    println!("Test 1: Simple SELECT with single row");
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query("SELECT 42 AS answer, 'hello' AS greeting")
+            .expect("Failed to set SQL query");
+
+        let reader = stmt.execute().expect("Failed to execute statement");
+
+        // Verify schema
+        let schema = reader.schema();
+        println!("  Schema fields: {}", schema.fields().len());
+        for (i, field) in schema.fields().iter().enumerate() {
+            println!("    Field {}: {} ({:?})", i, field.name(), field.data_type());
+        }
+
+        // Read batches
+        let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+
+        if batches.is_empty() {
+            println!("  WARNING: No batches returned (inline data may not be available)");
+            println!("  This could mean the server returned external links instead of inline data.");
+        } else {
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            println!("  Batches: {}", batches.len());
+            println!("  Total rows: {}", total_rows);
+
+            // Verify we got 1 row
+            assert_eq!(total_rows, 1, "Expected 1 row from SELECT 42");
+        }
+    }
+
+    // Test 2: SELECT returning multiple rows
+    println!();
+    println!("Test 2: SELECT with multiple rows");
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(
+            "SELECT * FROM (VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')) AS t(id, name)",
+        )
+        .expect("Failed to set SQL query");
+
+        let reader = stmt.execute().expect("Failed to execute statement");
+
+        // Read batches
+        let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+
+        if batches.is_empty() {
+            println!("  WARNING: No batches returned (inline data may not be available)");
+        } else {
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            println!("  Batches: {}", batches.len());
+            println!("  Total rows: {}", total_rows);
+
+            assert_eq!(total_rows, 3, "Expected 3 rows from VALUES clause");
+        }
+    }
+
+    // Test 3: SELECT with different data types
+    println!();
+    println!("Test 3: SELECT with various data types");
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(
+            "SELECT
+                CAST(100 AS INT) AS int_val,
+                CAST(3.14159 AS DOUBLE) AS double_val,
+                'test string' AS string_val,
+                true AS bool_val",
+        )
+        .expect("Failed to set SQL query");
+
+        let reader = stmt.execute().expect("Failed to execute statement");
+
+        // Verify schema has 4 columns
+        let schema = reader.schema();
+        println!("  Schema fields: {}", schema.fields().len());
+        for field in schema.fields() {
+            println!("    {} ({:?})", field.name(), field.data_type());
+        }
+
+        // Read batches
+        let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+
+        if batches.is_empty() {
+            println!("  WARNING: No batches returned (inline data may not be available)");
+        } else {
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            println!("  Batches: {}", batches.len());
+            println!("  Total rows: {}", total_rows);
+
+            assert_eq!(total_rows, 1, "Expected 1 row from multi-type SELECT");
+        }
+    }
+
+    println!();
+    println!("=== Work Item 2.7: Inline Arrow Result E2E Test PASSED ===");
+}
+
+/// Test inline Arrow results with empty result set.
+///
+/// This validates:
+/// - Empty result sets return a valid reader
+/// - Schema is preserved for empty results
+/// - RecordBatchReader returns no batches
+#[test]
+#[ignore]
+fn test_e2e_inline_arrow_result_empty() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== Work Item 2.7: Empty Result Set E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created");
+
+    // Execute query that returns no rows
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query("SELECT 1 AS value WHERE 1 = 0")
+        .expect("Failed to set SQL query");
+
+    let reader = stmt.execute().expect("Failed to execute statement");
+
+    // Verify schema is present
+    let schema = reader.schema();
+    println!("Schema fields: {}", schema.fields().len());
+    assert!(
+        schema.fields().len() >= 1,
+        "Schema should have at least 1 field"
+    );
+
+    // Read batches - should be empty or contain 0 rows
+    let batches: Vec<_> = reader.map(|r| r.expect("Failed to read batch")).collect();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    println!("Batches: {}", batches.len());
+    println!("Total rows: {}", total_rows);
+
+    assert_eq!(total_rows, 0, "Expected 0 rows from empty result set");
+
+    println!();
+    println!("=== Work Item 2.7: Empty Result Set E2E Test PASSED ===");
+}

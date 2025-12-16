@@ -256,8 +256,12 @@ pub struct ChunkInfo {
 /// Result data (for inline results).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResultData {
-    /// Inline data (for small results).
+    /// Inline data as JSON array (for JSON_ARRAY format).
     pub data_array: Option<Vec<Vec<serde_json::Value>>>,
+    /// Inline data as base64-encoded Arrow IPC (for ARROW_STREAM format).
+    /// This field contains the Arrow IPC stream data when using INLINE disposition
+    /// with ARROW_STREAM format.
+    pub chunk: Option<String>,
     /// External links (for large results).
     pub external_links: Option<Vec<ExternalLink>>,
     /// Row count.
@@ -605,6 +609,38 @@ mod tests {
         assert_eq!(data_array[0][1].as_str(), Some("Alice"));
         assert_eq!(data_array[1][0].as_i64(), Some(2));
         assert_eq!(data_array[1][1].as_str(), Some("Bob"));
+    }
+
+    #[test]
+    fn test_statement_response_with_inline_arrow_chunk() {
+        // Test inline Arrow IPC data (base64 encoded)
+        let json = r#"{
+            "statement_id": "stmt-arrow-inline",
+            "status": {
+                "state": "SUCCEEDED"
+            },
+            "result": {
+                "chunk": "QVJST1cxAAD/////0AAAABQAAAAAAAAA",
+                "row_count": 10,
+                "byte_count": 500
+            }
+        }"#;
+
+        let response: StatementResponse =
+            serde_json::from_str(json).expect("Failed to deserialize");
+
+        assert!(response.result.is_some());
+
+        let result = response.result.unwrap();
+        assert!(result.chunk.is_some());
+        assert!(result.data_array.is_none());
+        assert_eq!(result.row_count, Some(10));
+        assert_eq!(result.byte_count, Some(500));
+
+        let chunk = result.chunk.unwrap();
+        assert!(!chunk.is_empty());
+        // The chunk is base64 encoded Arrow IPC data
+        assert!(chunk.starts_with("QVJST1cx")); // Base64 for "ARROW1"
     }
 
     #[test]
