@@ -19,6 +19,23 @@
 //!
 //! This module provides the statement type that executes SQL statements
 //! and returns results as Arrow RecordBatches.
+//!
+//! # Example
+//!
+//! ```ignore
+//! // Get a statement from a connection
+//! let mut stmt = conn.new_statement()?;
+//!
+//! // Set the SQL query
+//! stmt.set_sql_query("SELECT * FROM my_table LIMIT 10")?;
+//!
+//! // Execute and get results
+//! let reader = stmt.execute()?;
+//! for batch in reader {
+//!     let batch = batch?;
+//!     println!("Got {} rows", batch.num_rows());
+//! }
+//! ```
 
 use std::sync::Arc;
 
@@ -29,7 +46,8 @@ use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::Schema;
 use tokio::runtime::Runtime;
 
-use crate::options::DatabaseConfig;
+use crate::client::SeaClient;
+use crate::session::SessionManager;
 
 /// Statement option keys.
 pub mod option_keys {
@@ -44,17 +62,20 @@ pub mod option_keys {
 /// Databricks statement.
 ///
 /// Executes SQL statements and returns results as Arrow RecordBatches.
+///
+/// # Session Management
+///
+/// Each statement holds a reference to the connection's `SessionManager`. When
+/// a statement is executed, it gets the session ID from the manager, which
+/// refreshes the session's idle timeout.
 #[derive(Debug)]
 pub struct DatabricksStatement {
-    /// Database configuration.
-    #[allow(dead_code)]
-    config: Arc<DatabaseConfig>,
-    /// Tokio runtime.
-    #[allow(dead_code)]
+    /// SEA client for API calls.
+    client: Arc<SeaClient>,
+    /// Session manager (shared with connection).
+    session_manager: Arc<SessionManager>,
+    /// Tokio runtime (shared with connection).
     runtime: Arc<Runtime>,
-    /// Session ID.
-    #[allow(dead_code)]
-    session_id: Option<String>,
     /// SQL query to execute.
     sql_query: Option<String>,
     /// Statement ID from the last execution.
@@ -72,15 +93,21 @@ pub struct DatabricksStatement {
 
 impl DatabricksStatement {
     /// Create a new statement.
+    ///
+    /// # Arguments
+    ///
+    /// * `client` - SEA client for API calls
+    /// * `session_manager` - Session manager for session lifecycle
+    /// * `runtime` - Shared Tokio runtime for async operations
     pub(crate) fn new(
-        config: Arc<DatabaseConfig>,
+        client: Arc<SeaClient>,
+        session_manager: Arc<SessionManager>,
         runtime: Arc<Runtime>,
-        session_id: Option<String>,
     ) -> Result<Self> {
         Ok(Self {
-            config,
+            client,
+            session_manager,
             runtime,
-            session_id,
             sql_query: None,
             statement_id: None,
             wait_timeout: None,
@@ -97,6 +124,21 @@ impl DatabricksStatement {
     /// Get the statement ID.
     pub fn statement_id(&self) -> Option<&str> {
         self.statement_id.as_deref()
+    }
+
+    /// Get the SEA client.
+    pub fn client(&self) -> &Arc<SeaClient> {
+        &self.client
+    }
+
+    /// Get the session manager.
+    pub fn session_manager(&self) -> &Arc<SessionManager> {
+        &self.session_manager
+    }
+
+    /// Get the runtime.
+    pub fn runtime(&self) -> &Arc<Runtime> {
+        &self.runtime
     }
 }
 
@@ -254,10 +296,11 @@ impl Statement for DatabricksStatement {
         })?;
 
         // TODO: Implement statement execution via SEA API
-        // 1. Call execute_statement API
-        // 2. Poll until complete if needed
-        // 3. Fetch results (inline or external links)
-        // 4. Return as RecordBatchReader
+        // 1. Get session ID from session manager
+        // 2. Call execute_statement API
+        // 3. Poll until complete if needed
+        // 4. Fetch results (inline or external links)
+        // 5. Return as RecordBatchReader
 
         Ok(EmptyRecordBatchReader::new(Schema::empty()))
     }
@@ -313,5 +356,193 @@ impl Statement for DatabricksStatement {
             "Substrait plans not supported",
             Status::NotImplemented,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::SeaClientConfig;
+
+    /// Create a multi-threaded runtime that supports block_on operations.
+    fn create_mt_runtime() -> Arc<Runtime> {
+        Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("Failed to create multi-threaded runtime"),
+        )
+    }
+
+    /// Create a test SEA client and session manager (no session created yet).
+    fn create_test_client_and_session(mock_uri: &str) -> (Arc<SeaClient>, Arc<SessionManager>) {
+        let config = SeaClientConfig::new(mock_uri, "test_token", "test_warehouse");
+        let client = Arc::new(SeaClient::new(config).expect("Failed to create test client"));
+        let session_manager = Arc::new(SessionManager::new(client.clone(), None, None));
+        (client, session_manager)
+    }
+
+    // Statement tests don't need mock servers because DatabricksStatement::new()
+    // doesn't create any sessions - it just stores references to client and session_manager.
+    // The session is only accessed during execute().
+
+    #[test]
+    fn test_statement_creation() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234"; // Mock URI (not used since we don't create sessions)
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let stmt = DatabricksStatement::new(client, session_manager, runtime);
+        assert!(stmt.is_ok(), "Statement creation should succeed");
+
+        let stmt = stmt.unwrap();
+        assert!(stmt.sql_query().is_none(), "SQL query should be None initially");
+        assert!(stmt.statement_id().is_none(), "Statement ID should be None initially");
+    }
+
+    #[test]
+    fn test_statement_set_sql_query() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        stmt.set_sql_query("SELECT 1").unwrap();
+        assert_eq!(stmt.sql_query(), Some("SELECT 1"));
+
+        stmt.set_sql_query("SELECT * FROM test_table").unwrap();
+        assert_eq!(stmt.sql_query(), Some("SELECT * FROM test_table"));
+    }
+
+    #[test]
+    fn test_statement_set_wait_timeout() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        stmt.set_option(
+            OptionStatement::Other(option_keys::WAIT_TIMEOUT.into()),
+            OptionValue::String("60s".into()),
+        )
+        .unwrap();
+
+        let timeout = stmt
+            .get_option_string(OptionStatement::Other(option_keys::WAIT_TIMEOUT.into()))
+            .unwrap();
+        assert_eq!(timeout, "60s");
+    }
+
+    #[test]
+    fn test_statement_set_row_limit() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        stmt.set_option(
+            OptionStatement::Other(option_keys::ROW_LIMIT.into()),
+            OptionValue::String("1000".into()),
+        )
+        .unwrap();
+
+        assert_eq!(stmt.row_limit, Some(1000));
+    }
+
+    #[test]
+    fn test_statement_invalid_row_limit() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        let result = stmt.set_option(
+            OptionStatement::Other(option_keys::ROW_LIMIT.into()),
+            OptionValue::String("not_a_number".into()),
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains("must be a positive integer"));
+    }
+
+    #[test]
+    fn test_statement_execute_requires_sql() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        let result = stmt.execute();
+        assert!(result.is_err());
+        let err = result.err().expect("Expected an error");
+        assert_eq!(err.status, Status::InvalidState);
+        assert!(err.message.contains("SQL query not set"));
+    }
+
+    #[test]
+    fn test_statement_bind_not_implemented() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        // Create an empty record batch for testing
+        let schema = Arc::new(Schema::empty());
+        let batch = RecordBatch::new_empty(schema);
+
+        let result = stmt.bind(batch);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+    }
+
+    #[test]
+    fn test_statement_prepare_not_implemented() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        let result = stmt.prepare();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+    }
+
+    #[test]
+    fn test_statement_substrait_not_supported() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        let result = stmt.set_substrait_plan(&[1, 2, 3]);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+        assert!(err.message.contains("Substrait"));
+    }
+
+    #[test]
+    fn test_statement_cancel_succeeds() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        let result = stmt.cancel();
+        assert!(result.is_ok(), "cancel() should succeed");
     }
 }

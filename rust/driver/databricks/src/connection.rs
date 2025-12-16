@@ -19,6 +19,35 @@
 //!
 //! This module provides the connection type that represents an active session
 //! with a Databricks SQL Warehouse.
+//!
+//! # Session Lifecycle
+//!
+//! - Session is created eagerly on `new_connection()`
+//! - Session is kept alive automatically (statements refresh the idle timeout)
+//! - Session is terminated on Connection drop
+//!
+//! # Example
+//!
+//! ```ignore
+//! use adbc_core::{Driver, Database};
+//! use adbc_databricks::DatabricksDriver;
+//!
+//! let mut driver = DatabricksDriver::new();
+//! let db = driver.new_database_with_opts([
+//!     (OptionDatabase::Uri, OptionValue::String("https://...".into())),
+//!     (OptionDatabase::Password, OptionValue::String("dapi...".into())),
+//!     (OptionDatabase::Other("databricks.warehouse_id".into()), OptionValue::String("...".into())),
+//! ])?;
+//!
+//! // Connection is created with an active session
+//! let conn = db.new_connection()?;
+//! assert!(conn.session_id().is_some());
+//!
+//! // Create statements from the connection
+//! let mut stmt = conn.new_statement()?;
+//! stmt.set_sql_query("SELECT 1")?;
+//! let reader = stmt.execute()?;
+//! ```
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -30,26 +59,33 @@ use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::Schema;
 use tokio::runtime::Runtime;
 
+use crate::client::{SeaClient, SeaClientConfig};
 use crate::options::DatabaseConfig;
+use crate::session::SessionManager;
 use crate::statement::DatabricksStatement;
 
 /// Databricks connection.
 ///
 /// Represents an active session with a Databricks SQL Warehouse.
 ///
-/// # Lifecycle
+/// # Session Lifecycle
 ///
-/// - Session created on `new_connection()`
+/// - Session created eagerly on `new_connection()` via [`SessionManager`]
 /// - Session kept alive automatically (statements refresh the idle timeout)
 /// - Session terminated on Connection drop
+///
+/// # Thread Safety
+///
+/// The connection holds an `Arc<SessionManager>` which is thread-safe. Multiple
+/// statements can be created from the same connection and used concurrently.
 #[derive(Debug)]
 pub struct DatabricksConnection {
-    /// Shared database configuration.
-    config: Arc<DatabaseConfig>,
+    /// SEA client for API calls.
+    client: Arc<SeaClient>,
+    /// Session manager for session lifecycle.
+    session_manager: Arc<SessionManager>,
     /// Shared Tokio runtime.
     runtime: Arc<Runtime>,
-    /// Session ID for the connection.
-    session_id: Option<String>,
     /// Current catalog.
     current_catalog: Option<String>,
     /// Current schema.
@@ -58,48 +94,98 @@ pub struct DatabricksConnection {
 
 impl DatabricksConnection {
     /// Create a new connection.
+    ///
+    /// Creates a connection and eagerly establishes a session with the SQL Warehouse.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Database configuration including host, token, warehouse_id
+    /// * `runtime` - Shared Tokio runtime for async operations
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - SeaClient creation fails
+    /// - Session creation fails (network error, authentication failure, etc.)
     pub(crate) fn new(config: Arc<DatabaseConfig>, runtime: Arc<Runtime>) -> Result<Self> {
-        let mut connection = Self {
-            config: config.clone(),
+        // Create SEA client configuration
+        let client_config = SeaClientConfig::new(
+            &config.host,
+            &config.token,
+            &config.warehouse_id,
+        )
+        .with_connect_timeout(config.http_config.connect_timeout)
+        .with_read_timeout(config.http_config.read_timeout);
+
+        // Create SEA client
+        let client = SeaClient::new(client_config).map_err(|e| {
+            Error::with_message_and_status(
+                format!("Failed to create SEA client: {}", e),
+                Status::Internal,
+            )
+        })?;
+        let client = Arc::new(client);
+
+        // Create session manager with default catalog/schema from config
+        let session_manager = Arc::new(SessionManager::new(
+            client.clone(),
+            config.default_catalog.clone(),
+            config.default_schema.clone(),
+        ));
+
+        // Create session eagerly
+        let session_id = runtime.block_on(session_manager.get_session_id()).map_err(|e| {
+            Error::with_message_and_status(
+                format!("Failed to create session: {}", e),
+                Status::IO,
+            )
+        })?;
+
+        // Session created successfully
+        let _ = session_id; // Suppress unused variable warning
+
+        Ok(Self {
+            client,
+            session_manager,
             runtime,
-            session_id: None,
             current_catalog: config.default_catalog.clone(),
             current_schema: config.default_schema.clone(),
-        };
-
-        // Create session on connection
-        connection.create_session()?;
-
-        Ok(connection)
-    }
-
-    /// Create a new session with the SQL Warehouse.
-    fn create_session(&mut self) -> Result<()> {
-        // TODO: Implement session creation via SEA API
-        // For now, we'll just use a placeholder session ID
-        self.session_id = Some("placeholder-session-id".to_string());
-        Ok(())
-    }
-
-    /// Close the session.
-    fn close_session(&mut self) -> Result<()> {
-        if let Some(_session_id) = self.session_id.take() {
-            // TODO: Implement session deletion via SEA API
-        }
-        Ok(())
+        })
     }
 
     /// Get the session ID.
-    pub fn session_id(&self) -> Option<&str> {
-        self.session_id.as_deref()
+    ///
+    /// Returns the session ID if a session is active.
+    pub fn session_id(&self) -> Option<String> {
+        // Use block_on to get the session ID synchronously
+        // This is safe because we create the session eagerly in new()
+        // so is_active() will return cached state
+        if self.runtime.block_on(self.session_manager.is_active()) {
+            self.runtime
+                .block_on(self.session_manager.get_session_id())
+                .ok()
+        } else {
+            None
+        }
     }
 
-    /// Get the database configuration.
-    pub fn config(&self) -> &DatabaseConfig {
-        &self.config
+    /// Get the SEA client.
+    ///
+    /// Returns a reference to the underlying SEA client for direct API access.
+    pub fn client(&self) -> &Arc<SeaClient> {
+        &self.client
+    }
+
+    /// Get the session manager.
+    ///
+    /// Returns a reference to the session manager for session lifecycle operations.
+    pub fn session_manager(&self) -> &Arc<SessionManager> {
+        &self.session_manager
     }
 
     /// Get the Tokio runtime.
+    ///
+    /// Returns a reference to the shared Tokio runtime.
     pub fn runtime(&self) -> &Arc<Runtime> {
         &self.runtime
     }
@@ -107,7 +193,32 @@ impl DatabricksConnection {
 
 impl Drop for DatabricksConnection {
     fn drop(&mut self) {
-        let _ = self.close_session();
+        // Terminate session on drop
+        // We ignore errors here since we're in drop and can't propagate them
+        //
+        // Handle different runtime contexts:
+        // 1. If we're already inside a tokio runtime, we can't call block_on
+        //    (it would panic with "Cannot start a runtime from within a runtime")
+        // 2. If we're outside a tokio runtime, use block_on to terminate synchronously
+        let session_manager = self.session_manager.clone();
+
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // We're inside a tokio runtime - spawn a task to terminate asynchronously
+            // The task will run on the current runtime, not our owned runtime
+            tokio::spawn(async move {
+                if let Err(_e) = session_manager.terminate().await {
+                    #[cfg(debug_assertions)]
+                    eprintln!("Failed to terminate session on connection drop: {}", _e);
+                }
+            });
+        } else {
+            // We're outside a tokio runtime - safe to use block_on
+            let result = self.runtime.block_on(session_manager.terminate());
+            if let Err(_e) = result {
+                #[cfg(debug_assertions)]
+                eprintln!("Failed to terminate session on connection drop: {}", _e);
+            }
+        }
     }
 }
 
@@ -219,14 +330,15 @@ impl Connection for DatabricksConnection {
 
     fn new_statement(&mut self) -> Result<Self::StatementType> {
         DatabricksStatement::new(
-            self.config.clone(),
+            self.client.clone(),
+            self.session_manager.clone(),
             self.runtime.clone(),
-            self.session_id.clone(),
         )
     }
 
     fn cancel(&mut self) -> Result<()> {
-        // TODO: Implement connection cancellation
+        // Connection-level cancel is a no-op for now
+        // Statement-level cancel is handled in DatabricksStatement
         Ok(())
     }
 
@@ -307,5 +419,498 @@ impl Connection for DatabricksConnection {
     ) -> Result<impl RecordBatchReader + Send> {
         // TODO: Implement partition reading
         Ok(EmptyRecordBatchReader::new(Schema::empty()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Create a test database config.
+    fn create_test_config(host: &str, warehouse_id: &str) -> Arc<DatabaseConfig> {
+        Arc::new(DatabaseConfig {
+            host: host.to_string(),
+            warehouse_id: warehouse_id.to_string(),
+            token: "test_token".to_string(),
+            default_catalog: Some("main".to_string()),
+            default_schema: Some("default".to_string()),
+            http_config: crate::options::HttpConfig::default(),
+            fetch_concurrency: 8,
+        })
+    }
+
+    /// Create a multi-threaded runtime that supports nested block_on operations.
+    fn create_mt_runtime() -> Arc<Runtime> {
+        Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("Failed to create multi-threaded runtime"),
+        )
+    }
+
+    // ============================================================================
+    // Connection Creation Tests
+    // ============================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_creates_session_eagerly() {
+        let mock_server = MockServer::start().await;
+
+        // Set up mock for session creation
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "test-session-abc123"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Set up mock for session deletion (for drop)
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        // Use spawn_blocking for all connection operations to avoid nested runtime issues
+        // All connection usage (including session_id() which uses block_on) must be inside spawn_blocking
+        let (is_ok, session_id) = tokio::task::spawn_blocking(move || {
+            let conn = DatabricksConnection::new(config, runtime);
+            match conn {
+                Ok(conn) => (true, conn.session_id()),
+                Err(_) => (false, None),
+            }
+            // Connection is dropped here within spawn_blocking
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(is_ok, "Connection creation should succeed");
+        assert_eq!(
+            session_id,
+            Some("test-session-abc123".to_string()),
+            "Session ID should be set"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_fails_when_session_creation_fails() {
+        let mock_server = MockServer::start().await;
+
+        // Set up mock to return an error
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error_code": "UNAUTHENTICATED",
+                "message": "Invalid token"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let conn = tokio::task::spawn_blocking(move || {
+            DatabricksConnection::new(config, runtime)
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(conn.is_err(), "Connection should fail when session creation fails");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_inherits_catalog_schema_from_config() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "catalog-schema-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = Arc::new(DatabaseConfig {
+            host: mock_server.uri(),
+            warehouse_id: "test_warehouse".to_string(),
+            token: "test_token".to_string(),
+            default_catalog: Some("my_catalog".to_string()),
+            default_schema: Some("my_schema".to_string()),
+            http_config: crate::options::HttpConfig::default(),
+            fetch_concurrency: 8,
+        });
+        let runtime = create_mt_runtime();
+
+        // All connection operations must happen inside spawn_blocking
+        let (catalog, schema) = tokio::task::spawn_blocking(move || {
+            let conn = DatabricksConnection::new(config, runtime).unwrap();
+            let result = (conn.current_catalog.clone(), conn.current_schema.clone());
+            // Connection is dropped here within spawn_blocking
+            result
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert_eq!(catalog, Some("my_catalog".to_string()));
+        assert_eq!(schema, Some("my_schema".to_string()));
+    }
+
+    // ============================================================================
+    // Session Lifecycle Tests
+    // ============================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_terminates_session_on_drop() {
+        let mock_server = MockServer::start().await;
+
+        let delete_count = Arc::new(AtomicUsize::new(0));
+        let delete_count_clone = delete_count.clone();
+
+        // Set up mock for session creation
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "drop-test-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Set up mock for session deletion
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/drop-test-session"))
+            .respond_with(move |_: &wiremock::Request| {
+                delete_count_clone.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+            })
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = DatabricksConnection::new(config, runtime).unwrap();
+            assert_eq!(conn.session_id(), Some("drop-test-session".to_string()));
+            // Connection is dropped here
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        // Give the spawned cleanup task time to complete
+        // Since drop spawns an async task when inside a runtime, we need to yield
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Verify session was terminated
+        assert_eq!(
+            delete_count.load(Ordering::SeqCst),
+            1,
+            "Session should be terminated on drop"
+        );
+    }
+
+    // ============================================================================
+    // Optionable Tests
+    // ============================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_set_current_catalog() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "option-test-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut conn = DatabricksConnection::new(config, runtime).unwrap();
+
+            conn.set_option(
+                OptionConnection::CurrentCatalog,
+                OptionValue::String("new_catalog".into()),
+            )
+            .unwrap();
+
+            let catalog = conn
+                .get_option_string(OptionConnection::CurrentCatalog)
+                .unwrap();
+            catalog
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert_eq!(result, "new_catalog");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_set_current_schema() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "schema-test-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut conn = DatabricksConnection::new(config, runtime).unwrap();
+
+            conn.set_option(
+                OptionConnection::CurrentSchema,
+                OptionValue::String("new_schema".into()),
+            )
+            .unwrap();
+
+            let schema = conn
+                .get_option_string(OptionConnection::CurrentSchema)
+                .unwrap();
+            schema
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert_eq!(result, "new_schema");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_autocommit_always_true() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "autocommit-test-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = DatabricksConnection::new(config, runtime).unwrap();
+            conn.get_option_string(OptionConnection::AutoCommit).unwrap()
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert_eq!(result, "true");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_set_invalid_option_type() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "invalid-opt-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut conn = DatabricksConnection::new(config, runtime).unwrap();
+            conn.set_option(OptionConnection::CurrentCatalog, OptionValue::Int(42))
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains("must be a string"));
+    }
+
+    // ============================================================================
+    // Connection Trait Tests
+    // ============================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_commit_not_supported() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "commit-test-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut conn = DatabricksConnection::new(config, runtime).unwrap();
+            conn.commit()
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+        assert!(err.message.contains("Transactions are not supported"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_rollback_not_supported() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "rollback-test-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut conn = DatabricksConnection::new(config, runtime).unwrap();
+            conn.rollback()
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+        assert!(err.message.contains("Transactions are not supported"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_cancel_succeeds() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "cancel-test-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut conn = DatabricksConnection::new(config, runtime).unwrap();
+            conn.cancel()
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(result.is_ok(), "cancel() should succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connection_new_statement() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "stmt-test-session"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/api/2\.0/sql/sessions/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri(), "test_warehouse");
+        let runtime = create_mt_runtime();
+
+        // All connection operations must happen inside spawn_blocking
+        // new_statement() returns a DatabricksStatement which holds Arc references,
+        // so it's safe to return it, but we must let the connection drop inside spawn_blocking
+        let stmt_is_ok = tokio::task::spawn_blocking(move || {
+            let mut conn = DatabricksConnection::new(config, runtime).unwrap();
+            let stmt_result = conn.new_statement();
+            let is_ok = stmt_result.is_ok();
+            // Both connection and statement are dropped here within spawn_blocking
+            is_ok
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        assert!(stmt_is_ok, "new_statement() should succeed");
     }
 }
