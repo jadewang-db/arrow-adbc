@@ -292,3 +292,556 @@ impl Database for DatabricksDatabase {
         Ok(connection)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adbc_core::error::Status;
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Database, Optionable};
+
+    // ============================================================================
+    // Database Creation Tests
+    // ============================================================================
+
+    #[test]
+    fn test_database_new() {
+        let db = DatabricksDatabase::new();
+        // All options should be unset initially
+        assert!(db.host.read().unwrap().is_none());
+        assert!(db.warehouse_id.read().unwrap().is_none());
+        assert!(db.token.read().unwrap().is_none());
+        assert!(db.default_catalog.read().unwrap().is_none());
+        assert!(db.default_schema.read().unwrap().is_none());
+        // Runtime should be None (lazy creation)
+        assert!(db.runtime.read().unwrap().is_none());
+        // Default fetch concurrency should be 8
+        assert_eq!(*db.fetch_concurrency.read().unwrap(), 8);
+    }
+
+    #[test]
+    fn test_database_default() {
+        let db = DatabricksDatabase::default();
+        assert!(db.host.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_database_is_debug() {
+        let db = DatabricksDatabase::new();
+        let debug_str = format!("{:?}", db);
+        assert!(
+            debug_str.contains("DatabricksDatabase"),
+            "Debug output should contain struct name"
+        );
+    }
+
+    // ============================================================================
+    // Set Option Tests
+    // ============================================================================
+
+    #[test]
+    fn test_database_set_uri_option() {
+        let mut db = DatabricksDatabase::new();
+        let result = db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("https://example.cloud.databricks.com".into()),
+        );
+        assert!(result.is_ok(), "Setting uri should succeed");
+
+        let host = db.host.read().unwrap();
+        assert_eq!(
+            host.as_deref(),
+            Some("https://example.cloud.databricks.com")
+        );
+    }
+
+    #[test]
+    fn test_database_set_password_option() {
+        let mut db = DatabricksDatabase::new();
+        let result = db.set_option(
+            OptionDatabase::Password,
+            OptionValue::String("dapi_token_12345".into()),
+        );
+        assert!(result.is_ok(), "Setting password should succeed");
+
+        let token = db.token.read().unwrap();
+        assert_eq!(token.as_deref(), Some("dapi_token_12345"));
+    }
+
+    #[test]
+    fn test_database_set_warehouse_id_option() {
+        let mut db = DatabricksDatabase::new();
+        let result = db.set_option(
+            OptionDatabase::Other(keys::WAREHOUSE_ID.into()),
+            OptionValue::String("abc123def456".into()),
+        );
+        assert!(result.is_ok(), "Setting warehouse_id should succeed");
+
+        let warehouse_id = db.warehouse_id.read().unwrap();
+        assert_eq!(warehouse_id.as_deref(), Some("abc123def456"));
+    }
+
+    #[test]
+    fn test_database_set_token_via_other() {
+        let mut db = DatabricksDatabase::new();
+        let result = db.set_option(
+            OptionDatabase::Other(keys::TOKEN.into()),
+            OptionValue::String("dapi_token_via_other".into()),
+        );
+        assert!(result.is_ok(), "Setting token via Other should succeed");
+
+        let token = db.token.read().unwrap();
+        assert_eq!(token.as_deref(), Some("dapi_token_via_other"));
+    }
+
+    #[test]
+    fn test_database_set_catalog_option() {
+        let mut db = DatabricksDatabase::new();
+        let result = db.set_option(
+            OptionDatabase::Other(keys::CATALOG.into()),
+            OptionValue::String("main".into()),
+        );
+        assert!(result.is_ok(), "Setting catalog should succeed");
+
+        let catalog = db.default_catalog.read().unwrap();
+        assert_eq!(catalog.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn test_database_set_schema_option() {
+        let mut db = DatabricksDatabase::new();
+        let result = db.set_option(
+            OptionDatabase::Other(keys::SCHEMA.into()),
+            OptionValue::String("default".into()),
+        );
+        assert!(result.is_ok(), "Setting schema should succeed");
+
+        let schema = db.default_schema.read().unwrap();
+        assert_eq!(schema.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn test_database_set_fetch_concurrency_option() {
+        let mut db = DatabricksDatabase::new();
+        let result = db.set_option(
+            OptionDatabase::Other(keys::FETCH_CONCURRENCY.into()),
+            OptionValue::String("16".into()),
+        );
+        assert!(result.is_ok(), "Setting fetch_concurrency should succeed");
+
+        let concurrency = *db.fetch_concurrency.read().unwrap();
+        assert_eq!(concurrency, 16);
+    }
+
+    #[test]
+    fn test_database_set_required_options() {
+        let mut db = DatabricksDatabase::new();
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("https://example.cloud.databricks.com".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Password,
+            OptionValue::String("dapi_token".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(keys::WAREHOUSE_ID.into()),
+            OptionValue::String("abc123".into()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Uri).unwrap(),
+            "https://example.cloud.databricks.com"
+        );
+        assert_eq!(
+            db.get_option_string(OptionDatabase::Other(keys::WAREHOUSE_ID.into()))
+                .unwrap(),
+            "abc123"
+        );
+    }
+
+    #[test]
+    fn test_database_set_unknown_option_fails() {
+        let mut db = DatabricksDatabase::new();
+        let result = db.set_option(
+            OptionDatabase::Other("unknown.option".into()),
+            OptionValue::String("value".into()),
+        );
+        assert!(result.is_err(), "Unknown option should fail");
+
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains("Unknown option"));
+    }
+
+    #[test]
+    fn test_database_set_wrong_value_type_fails() {
+        let mut db = DatabricksDatabase::new();
+        let result = db.set_option(OptionDatabase::Uri, OptionValue::Int(42));
+        assert!(result.is_err(), "Non-string value for uri should fail");
+
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains("must be a string"));
+    }
+
+    #[test]
+    fn test_database_set_invalid_concurrency_fails() {
+        let mut db = DatabricksDatabase::new();
+        let result = db.set_option(
+            OptionDatabase::Other(keys::FETCH_CONCURRENCY.into()),
+            OptionValue::String("not_a_number".into()),
+        );
+        assert!(result.is_err(), "Invalid concurrency should fail");
+
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains("must be a positive integer"));
+    }
+
+    // ============================================================================
+    // Get Option Tests
+    // ============================================================================
+
+    #[test]
+    fn test_database_get_option_string_unset() {
+        let db = DatabricksDatabase::new();
+        let result = db.get_option_string(OptionDatabase::Uri);
+        assert!(result.is_err(), "Getting unset uri should fail");
+
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains("not set"));
+    }
+
+    #[test]
+    fn test_database_get_option_string_unknown() {
+        let db = DatabricksDatabase::new();
+        let result = db.get_option_string(OptionDatabase::Other("unknown.option".into()));
+        assert!(result.is_err(), "Getting unknown option should fail");
+
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains("Unknown option"));
+    }
+
+    #[test]
+    fn test_database_get_option_bytes_not_implemented() {
+        let db = DatabricksDatabase::new();
+        let result = db.get_option_bytes(OptionDatabase::Uri);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+    }
+
+    #[test]
+    fn test_database_get_option_double_not_implemented() {
+        let db = DatabricksDatabase::new();
+        let result = db.get_option_double(OptionDatabase::Uri);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+    }
+
+    #[test]
+    fn test_database_get_option_int_not_implemented() {
+        let db = DatabricksDatabase::new();
+        let result = db.get_option_int(OptionDatabase::Uri);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+    }
+
+    // ============================================================================
+    // Validation and Connection Tests
+    // ============================================================================
+
+    #[test]
+    fn test_database_validation_fails_without_uri() {
+        let mut db = DatabricksDatabase::new();
+        db.set_option(
+            OptionDatabase::Password,
+            OptionValue::String("dapi_token".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(keys::WAREHOUSE_ID.into()),
+            OptionValue::String("abc123".into()),
+        )
+        .unwrap();
+
+        let result = db.new_connection();
+        assert!(result.is_err(), "Connection without uri should fail");
+
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains("uri is required"));
+    }
+
+    #[test]
+    fn test_database_validation_fails_without_warehouse_id() {
+        let mut db = DatabricksDatabase::new();
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("https://example.cloud.databricks.com".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Password,
+            OptionValue::String("dapi_token".into()),
+        )
+        .unwrap();
+
+        let result = db.new_connection();
+        assert!(
+            result.is_err(),
+            "Connection without warehouse_id should fail"
+        );
+
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains("warehouse_id is required"));
+    }
+
+    #[test]
+    fn test_database_validation_fails_without_token() {
+        let mut db = DatabricksDatabase::new();
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("https://example.cloud.databricks.com".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(keys::WAREHOUSE_ID.into()),
+            OptionValue::String("abc123".into()),
+        )
+        .unwrap();
+
+        let result = db.new_connection();
+        assert!(result.is_err(), "Connection without token should fail");
+
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains("token is required"));
+    }
+
+    #[test]
+    fn test_database_validation_fails_with_no_options() {
+        let db = DatabricksDatabase::new();
+        let result = db.new_connection();
+        assert!(result.is_err(), "Connection with no options should fail");
+    }
+
+    // ============================================================================
+    // Runtime Sharing Tests
+    // ============================================================================
+
+    #[test]
+    fn test_database_runtime_shared_across_connections() {
+        let mut db = DatabricksDatabase::new();
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("https://example.cloud.databricks.com".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Password,
+            OptionValue::String("dapi_token".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(keys::WAREHOUSE_ID.into()),
+            OptionValue::String("abc123".into()),
+        )
+        .unwrap();
+
+        // Create first connection - this should create the runtime
+        let conn1 = db.new_connection().unwrap();
+
+        // Runtime should now be initialized
+        assert!(db.runtime.read().unwrap().is_some());
+
+        // Get runtime Arc pointer
+        let runtime1 = db.runtime.read().unwrap().clone().unwrap();
+        let ptr1 = Arc::as_ptr(&runtime1);
+
+        // Create second connection - should use the same runtime
+        let conn2 = db.new_connection().unwrap();
+        let runtime2 = db.runtime.read().unwrap().clone().unwrap();
+        let ptr2 = Arc::as_ptr(&runtime2);
+
+        // Both connections should share the same runtime instance
+        assert_eq!(ptr1, ptr2, "Runtime should be shared across connections");
+
+        // Both connections should have sessions
+        assert!(
+            conn1.session_id().is_some(),
+            "First connection should have a session"
+        );
+        assert!(
+            conn2.session_id().is_some(),
+            "Second connection should have a session"
+        );
+    }
+
+    #[test]
+    fn test_database_runtime_lazy_creation() {
+        let mut db = DatabricksDatabase::new();
+
+        // Runtime should not be created initially
+        assert!(
+            db.runtime.read().unwrap().is_none(),
+            "Runtime should not exist before first connection"
+        );
+
+        // Set required options
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("https://example.cloud.databricks.com".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Password,
+            OptionValue::String("dapi_token".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(keys::WAREHOUSE_ID.into()),
+            OptionValue::String("abc123".into()),
+        )
+        .unwrap();
+
+        // Runtime still should not be created after setting options
+        assert!(
+            db.runtime.read().unwrap().is_none(),
+            "Runtime should not exist after setting options but before connection"
+        );
+
+        // Create connection - this should create the runtime
+        let _conn = db.new_connection().unwrap();
+
+        // Now runtime should exist
+        assert!(
+            db.runtime.read().unwrap().is_some(),
+            "Runtime should exist after first connection"
+        );
+    }
+
+    // ============================================================================
+    // Connection with Options Tests
+    // ============================================================================
+
+    #[test]
+    fn test_database_new_connection_with_opts() {
+        let mut db = DatabricksDatabase::new();
+        db.set_option(
+            OptionDatabase::Uri,
+            OptionValue::String("https://example.cloud.databricks.com".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Password,
+            OptionValue::String("dapi_token".into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(keys::WAREHOUSE_ID.into()),
+            OptionValue::String("abc123".into()),
+        )
+        .unwrap();
+
+        use adbc_core::options::OptionConnection;
+
+        let conn = db.new_connection_with_opts([
+            (
+                OptionConnection::CurrentCatalog,
+                OptionValue::String("main".into()),
+            ),
+            (
+                OptionConnection::CurrentSchema,
+                OptionValue::String("test_schema".into()),
+            ),
+        ]);
+
+        assert!(conn.is_ok(), "new_connection_with_opts should succeed");
+
+        let conn = conn.unwrap();
+
+        // Verify connection options were set
+        let catalog = conn
+            .get_option_string(OptionConnection::CurrentCatalog)
+            .unwrap();
+        assert_eq!(catalog, "main");
+
+        let schema = conn
+            .get_option_string(OptionConnection::CurrentSchema)
+            .unwrap();
+        assert_eq!(schema, "test_schema");
+    }
+
+    // ============================================================================
+    // Connection Type Tests
+    // ============================================================================
+
+    #[test]
+    fn test_database_connection_type_is_databricks_connection() {
+        // This is a compile-time check that ConnectionType is DatabricksConnection
+        fn assert_connection_type<T: Database<ConnectionType = DatabricksConnection>>(_: &T) {}
+
+        let db = DatabricksDatabase::new();
+        assert_connection_type(&db);
+    }
+
+    // ============================================================================
+    // Configuration Propagation Tests
+    // ============================================================================
+
+    #[test]
+    fn test_database_config_propagates_to_connection() {
+        let mut db = DatabricksDatabase::new();
+        let host = "https://my-workspace.cloud.databricks.com";
+        let token = "dapi_my_token";
+        let warehouse_id = "warehouse123";
+        let catalog = "my_catalog";
+        let schema = "my_schema";
+
+        db.set_option(OptionDatabase::Uri, OptionValue::String(host.into()))
+            .unwrap();
+        db.set_option(
+            OptionDatabase::Password,
+            OptionValue::String(token.into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(keys::WAREHOUSE_ID.into()),
+            OptionValue::String(warehouse_id.into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(keys::CATALOG.into()),
+            OptionValue::String(catalog.into()),
+        )
+        .unwrap();
+        db.set_option(
+            OptionDatabase::Other(keys::SCHEMA.into()),
+            OptionValue::String(schema.into()),
+        )
+        .unwrap();
+
+        let conn = db.new_connection().unwrap();
+
+        // Verify configuration is accessible through connection
+        let config = conn.config();
+        assert_eq!(config.host, host);
+        assert_eq!(config.token, token);
+        assert_eq!(config.warehouse_id, warehouse_id);
+        assert_eq!(config.default_catalog.as_deref(), Some(catalog));
+        assert_eq!(config.default_schema.as_deref(), Some(schema));
+    }
+}
