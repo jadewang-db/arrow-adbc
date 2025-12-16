@@ -22,6 +22,7 @@ dependencies = [
  "base64",
  "futures",
  "lz4_flex 0.11.5",
+ "once_cell",
  "reqwest",
  "serde",
  "serde_json",
