@@ -43,7 +43,7 @@ pub fn decompress_lz4(data: &[u8]) -> Result<Vec<u8>> {
     let mut decompressed = Vec::new();
     decoder
         .read_to_end(&mut decompressed)
-        .map_err(|e| Error::Io(format!("LZ4 decompression failed: {}", e)))?;
+        .map_err(|e| Error::Io(std::io::Error::new(e.kind(), format!("LZ4 decompression failed: {}", e))))?;
     Ok(decompressed)
 }
 

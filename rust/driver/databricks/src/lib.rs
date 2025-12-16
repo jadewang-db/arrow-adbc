@@ -64,5 +64,5 @@ mod statement;
 pub use connection::DatabricksConnection;
 pub use database::DatabricksDatabase;
 pub use driver::DatabricksDriver;
-pub use error::Error;
+pub use error::{Error, Result};
 pub use statement::DatabricksStatement;

@@ -151,13 +151,13 @@ impl DatabaseConfigBuilder {
     pub fn build(self) -> crate::error::Result<DatabaseConfig> {
         let host = self
             .host
-            .ok_or_else(|| crate::error::Error::InvalidArgument("host is required".to_string()))?;
-        let warehouse_id = self.warehouse_id.ok_or_else(|| {
-            crate::error::Error::InvalidArgument("warehouse_id is required".to_string())
-        })?;
-        let token = self.token.ok_or_else(|| {
-            crate::error::Error::InvalidArgument("token is required".to_string())
-        })?;
+            .ok_or_else(|| crate::error::Error::config("host is required"))?;
+        let warehouse_id = self
+            .warehouse_id
+            .ok_or_else(|| crate::error::Error::config("warehouse_id is required"))?;
+        let token = self
+            .token
+            .ok_or_else(|| crate::error::Error::config("token is required"))?;
 
         Ok(DatabaseConfig {
             host,
