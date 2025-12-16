@@ -334,9 +334,10 @@ sequenceDiagram
 
 | Option Key | Type | Description |
 |------------|------|-------------|
-| `databricks.statement.wait_timeout` | String | Wait timeout (default: "10s") |
+| `databricks.statement.wait_timeout` | String | Wait timeout for initial API call (default: "10s") |
 | `databricks.statement.row_limit` | Int | Maximum rows to return |
 | `databricks.statement.byte_limit` | Int | Maximum bytes to return |
+| `databricks.statement.max_wait` | Int | Maximum wait time in seconds for statement completion (default: 300s) |
 
 ### 3.5 ChunkFetcher
 

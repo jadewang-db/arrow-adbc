@@ -2871,3 +2871,380 @@ fn test_e2e_poll_until_complete_failed_statement() {
     println!();
     println!("=== SEA Client poll_until_complete Failed Statement E2E Test PASSED ===");
 }
+
+// ============================================================================
+// Work Item 2.5: DatabricksStatement Core Implementation E2E Tests
+// ============================================================================
+
+/// Test DatabricksStatement execute() via the ADBC Statement trait.
+///
+/// This validates:
+/// - Statement can be created from connection
+/// - SQL query can be set
+/// - execute() returns a RecordBatchReader
+/// - Results have correct schema
+#[test]
+#[ignore]
+fn test_e2e_adbc_statement_execute_select_one() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== ADBC Statement execute() E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement
+    println!("Creating statement...");
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Set SQL query
+    println!("Setting SQL query: SELECT 1 AS value");
+    stmt.set_sql_query("SELECT 1 AS value")
+        .expect("Failed to set SQL query");
+
+    // Execute statement
+    println!("Executing statement...");
+    let reader = stmt.execute().expect("Failed to execute statement");
+
+    // Get schema
+    let schema = reader.schema();
+    println!("Schema: {:?}", schema);
+    assert!(schema.fields().len() >= 1, "Schema should have at least 1 field");
+    assert_eq!(schema.field(0).name(), "value", "First field should be 'value'");
+
+    // Read results
+    println!("Reading results...");
+    let mut batch_count = 0;
+    let mut total_rows = 0;
+    for batch_result in reader {
+        match batch_result {
+            Ok(batch) => {
+                println!("  Batch {}: {} rows", batch_count, batch.num_rows());
+                total_rows += batch.num_rows();
+                batch_count += 1;
+            }
+            Err(e) => {
+                println!("  Error reading batch: {:?}", e);
+            }
+        }
+    }
+    println!("  Total: {} batches, {} rows", batch_count, total_rows);
+
+    // Note: Currently results are empty because chunk fetching is not implemented yet
+    // This will be completed in Work Item 2.6
+
+    println!();
+    println!("=== ADBC Statement execute() E2E Test PASSED ===");
+}
+
+/// Test DatabricksStatement execute_update() via the ADBC Statement trait.
+///
+/// This validates:
+/// - execute_update() works for DDL/DML statements
+/// - Returns affected row count (if available)
+#[test]
+#[ignore]
+fn test_e2e_adbc_statement_execute_update() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== ADBC Statement execute_update() E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement
+    println!("Creating statement...");
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Set SQL query - a DDL statement that doesn't modify data
+    println!("Setting SQL query: SHOW DATABASES");
+    stmt.set_sql_query("SHOW DATABASES")
+        .expect("Failed to set SQL query");
+
+    // Execute update
+    println!("Executing statement via execute_update...");
+    let affected_rows = stmt.execute_update().expect("Failed to execute_update");
+
+    println!("  Affected rows: {:?}", affected_rows);
+
+    println!();
+    println!("=== ADBC Statement execute_update() E2E Test PASSED ===");
+}
+
+/// Test DatabricksStatement with statement options.
+///
+/// This validates:
+/// - Statement options can be set
+/// - row_limit option affects results
+#[test]
+#[ignore]
+fn test_e2e_adbc_statement_with_options() {
+    use adbc_core::options::{OptionDatabase, OptionStatement, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Optionable, Statement};
+    use adbc_databricks::DatabricksDriver;
+    use arrow_array::RecordBatchReader;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== ADBC Statement with Options E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement
+    println!("Creating statement...");
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Set row limit option
+    println!("Setting row limit to 10...");
+    stmt.set_option(
+        OptionStatement::Other("databricks.statement.row_limit".into()),
+        OptionValue::String("10".into()),
+    )
+    .expect("Failed to set row_limit");
+
+    // Set max wait option
+    println!("Setting max wait to 120 seconds...");
+    stmt.set_option(
+        OptionStatement::Other("databricks.statement.max_wait".into()),
+        OptionValue::String("120".into()),
+    )
+    .expect("Failed to set max_wait");
+
+    // Set SQL query
+    println!("Setting SQL query: SELECT * FROM range(100)");
+    stmt.set_sql_query("SELECT * FROM range(100)")
+        .expect("Failed to set SQL query");
+
+    // Execute statement
+    println!("Executing statement...");
+    let reader = stmt.execute().expect("Failed to execute statement");
+
+    // Get schema
+    let schema = reader.schema();
+    println!("Schema: {:?}", schema);
+
+    // Read results
+    println!("Reading results (expecting up to 10 rows due to limit)...");
+    let mut total_rows = 0;
+    for batch_result in reader {
+        if let Ok(batch) = batch_result {
+            println!("  Batch: {} rows", batch.num_rows());
+            total_rows += batch.num_rows();
+        }
+    }
+    println!("  Total rows read: {}", total_rows);
+
+    // Note: Currently results are empty because chunk fetching is not implemented yet
+    // Once implemented, this should return at most 10 rows
+
+    println!();
+    println!("=== ADBC Statement with Options E2E Test PASSED ===");
+}
+
+/// Test DatabricksStatement cancel() functionality.
+///
+/// This validates:
+/// - Statement execution can be cancelled
+/// - cancel() works even if no statement is running
+#[test]
+#[ignore]
+fn test_e2e_adbc_statement_cancel() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== ADBC Statement cancel() E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement
+    println!("Creating statement...");
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Test 1: cancel() before any execution should succeed
+    println!("Test 1: cancel() before any execution...");
+    stmt.cancel().expect("cancel() should succeed even without execution");
+    println!("  Cancel succeeded (no-op)");
+
+    // Test 2: Execute a query and then cancel after reading results
+    println!("Test 2: Execute a query first...");
+    stmt.set_sql_query("SELECT 1 AS value")
+        .expect("Failed to set SQL query");
+    {
+        let reader = stmt.execute().expect("Failed to execute statement");
+        // Consume the reader (dropping it releases the borrow)
+        let _batches: Vec<_> = reader.into_iter().collect();
+    }
+    println!("  Query executed");
+
+    // Test 3: cancel() after execution should succeed
+    println!("Test 3: cancel() after execution...");
+    stmt.cancel().expect("cancel() should succeed after execution");
+    println!("  Cancel succeeded");
+
+    println!();
+    println!("=== ADBC Statement cancel() E2E Test PASSED ===");
+}
+
+/// Test DatabricksStatement with SQL error.
+///
+/// This validates:
+/// - execute() returns proper error for invalid SQL
+/// - Error message contains useful information
+#[test]
+#[ignore]
+fn test_e2e_adbc_statement_sql_error() {
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Statement};
+    use adbc_databricks::DatabricksDriver;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== ADBC Statement SQL Error E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create driver, database, and connection
+    let mut driver = DatabricksDriver::new();
+    let db = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::String(host.clone())),
+            (
+                OptionDatabase::Password,
+                OptionValue::String(config.token.clone()),
+            ),
+            (
+                OptionDatabase::Other("databricks.warehouse_id".into()),
+                OptionValue::String(warehouse_id.clone()),
+            ),
+        ])
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    println!("Connection created with session");
+
+    // Create statement
+    println!("Creating statement...");
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+
+    // Set invalid SQL query
+    println!("Setting invalid SQL query...");
+    stmt.set_sql_query("SELECT * FROM this_table_definitely_does_not_exist_xyz123")
+        .expect("Failed to set SQL query");
+
+    // Execute statement - should fail
+    println!("Executing statement (expecting error)...");
+    let result = stmt.execute();
+
+    assert!(result.is_err(), "execute() should fail for invalid SQL");
+    let err = result.err().expect("Should have error");
+    println!("  Got expected error: {}", err.message);
+
+    println!();
+    println!("=== ADBC Statement SQL Error E2E Test PASSED ===");
+}

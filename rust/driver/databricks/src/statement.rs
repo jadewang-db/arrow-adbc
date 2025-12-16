@@ -38,6 +38,7 @@
 //! ```
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{OptionStatement, OptionValue};
@@ -46,18 +47,25 @@ use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::Schema;
 use tokio::runtime::Runtime;
 
-use crate::client::SeaClient;
+use crate::client::{SeaClient, StatementResponse};
+use crate::error::Error as DatabricksError;
+use crate::fetch::ArrowResultReader;
 use crate::session::SessionManager;
 
 /// Statement option keys.
 pub mod option_keys {
-    /// Wait timeout for statement execution.
+    /// Wait timeout for statement execution (in seconds).
     pub const WAIT_TIMEOUT: &str = "databricks.statement.wait_timeout";
     /// Maximum rows to return.
     pub const ROW_LIMIT: &str = "databricks.statement.row_limit";
     /// Maximum bytes to return.
     pub const BYTE_LIMIT: &str = "databricks.statement.byte_limit";
+    /// Maximum time to wait for statement completion (in seconds).
+    pub const MAX_WAIT: &str = "databricks.statement.max_wait";
 }
+
+/// Default maximum wait time for statement completion (5 minutes).
+const DEFAULT_MAX_WAIT_SECS: u64 = 300;
 
 /// Databricks statement.
 ///
@@ -68,6 +76,15 @@ pub mod option_keys {
 /// Each statement holds a reference to the connection's `SessionManager`. When
 /// a statement is executed, it gets the session ID from the manager, which
 /// refreshes the session's idle timeout.
+///
+/// # Statement Execution
+///
+/// Statements are executed synchronously by:
+/// 1. Getting or creating a session via the `SessionManager`
+/// 2. Calling `execute_and_wait` on the `SeaClient`, which handles polling
+/// 3. Converting the results to Arrow RecordBatches via `ArrowResultReader`
+///
+/// The statement tracks its ID so it can be cancelled if needed.
 #[derive(Debug)]
 pub struct DatabricksStatement {
     /// SEA client for API calls.
@@ -79,16 +96,15 @@ pub struct DatabricksStatement {
     /// SQL query to execute.
     sql_query: Option<String>,
     /// Statement ID from the last execution.
-    #[allow(dead_code)]
     statement_id: Option<String>,
-    /// Wait timeout for statement execution.
+    /// Wait timeout for statement execution (e.g., "10s").
     wait_timeout: Option<String>,
     /// Maximum rows to return.
-    #[allow(dead_code)]
     row_limit: Option<i64>,
     /// Maximum bytes to return.
-    #[allow(dead_code)]
     byte_limit: Option<i64>,
+    /// Maximum time to wait for statement completion.
+    max_wait: Option<Duration>,
 }
 
 impl DatabricksStatement {
@@ -113,6 +129,7 @@ impl DatabricksStatement {
             wait_timeout: None,
             row_limit: None,
             byte_limit: None,
+            max_wait: None,
         })
     }
 
@@ -140,32 +157,91 @@ impl DatabricksStatement {
     pub fn runtime(&self) -> &Arc<Runtime> {
         &self.runtime
     }
-}
 
-/// Empty record batch reader for placeholder implementations.
-struct EmptyRecordBatchReader {
-    schema: Arc<Schema>,
-}
+    /// Convert a statement response to an ArrowResultReader.
+    ///
+    /// This handles both inline results (for small result sets) and external links
+    /// (for larger result sets that need to be fetched from cloud storage).
+    fn response_to_reader(&self, response: StatementResponse) -> Result<ArrowResultReader> {
+        // Build schema from manifest
+        let schema = self.build_schema_from_response(&response)?;
 
-impl EmptyRecordBatchReader {
-    fn new(schema: Schema) -> Self {
-        Self {
-            schema: Arc::new(schema),
+        // Check if we have results
+        let result = match response.result {
+            Some(r) => r,
+            None => {
+                // No results - return empty reader with schema
+                return Ok(ArrowResultReader::empty(schema));
+            }
+        };
+
+        // Check for external links (cloud fetch)
+        if let Some(ref _external_links) = result.external_links {
+            // For now, external links are handled in a future work item
+            // Return empty reader - chunk fetching is Work Item 2.6
+            return Ok(ArrowResultReader::empty(schema));
         }
+
+        // Check for inline data (JSON array format)
+        if result.data_array.is_some() {
+            // Inline JSON results - convert to Arrow
+            // For now, return empty reader - JSON parsing is Work Item 3.x
+            return Ok(ArrowResultReader::empty(schema));
+        }
+
+        // No data available
+        Ok(ArrowResultReader::empty(schema))
     }
-}
 
-impl Iterator for EmptyRecordBatchReader {
-    type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
+    /// Build an Arrow schema from the statement response manifest.
+    fn build_schema_from_response(&self, response: &StatementResponse) -> Result<Schema> {
+        use arrow_schema::{DataType, Field};
 
-    fn next(&mut self) -> Option<Self::Item> {
-        None
-    }
-}
+        let manifest = match &response.manifest {
+            Some(m) => m,
+            None => return Ok(Schema::empty()),
+        };
 
-impl RecordBatchReader for EmptyRecordBatchReader {
-    fn schema(&self) -> Arc<Schema> {
-        self.schema.clone()
+        let result_schema = match &manifest.schema {
+            Some(s) => s,
+            None => return Ok(Schema::empty()),
+        };
+
+        let columns = match &result_schema.columns {
+            Some(c) => c,
+            None => return Ok(Schema::empty()),
+        };
+
+        let fields: Vec<Field> = columns
+            .iter()
+            .map(|col| {
+                // Map Databricks type names to Arrow types
+                // This is a simplified mapping - full type support in Work Item 3.x
+                let data_type = match col.type_name.as_deref() {
+                    Some("INT") | Some("INTEGER") => DataType::Int32,
+                    Some("BIGINT") | Some("LONG") => DataType::Int64,
+                    Some("SMALLINT") | Some("SHORT") => DataType::Int16,
+                    Some("TINYINT") | Some("BYTE") => DataType::Int8,
+                    Some("FLOAT") | Some("REAL") => DataType::Float32,
+                    Some("DOUBLE") => DataType::Float64,
+                    Some("BOOLEAN") => DataType::Boolean,
+                    Some("STRING") | Some("VARCHAR") => DataType::Utf8,
+                    Some("BINARY") => DataType::Binary,
+                    Some("DATE") => DataType::Date32,
+                    Some("TIMESTAMP") | Some("TIMESTAMP_NTZ") => {
+                        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+                    }
+                    Some("DECIMAL") => {
+                        // Default decimal precision/scale - actual values from type_text
+                        DataType::Decimal128(38, 18)
+                    }
+                    _ => DataType::Utf8, // Default to string for unknown types
+                };
+                Field::new(&col.name, data_type, true)
+            })
+            .collect();
+
+        Ok(Schema::new(fields))
     }
 }
 
@@ -207,6 +283,16 @@ impl Optionable for DatabricksStatement {
                             Status::InvalidArguments,
                         )
                     })?);
+                }
+                option_keys::MAX_WAIT => {
+                    let string_value = extract_string(value, "max_wait")?;
+                    let secs: u64 = string_value.parse().map_err(|_| {
+                        Error::with_message_and_status(
+                            "max_wait must be a positive integer (seconds)",
+                            Status::InvalidArguments,
+                        )
+                    })?;
+                    self.max_wait = Some(Duration::from_secs(secs));
                 }
                 _ => {
                     return Err(Error::with_message_and_status(
@@ -283,26 +369,64 @@ impl Statement for DatabricksStatement {
     }
 
     fn cancel(&mut self) -> Result<()> {
-        // TODO: Implement statement cancellation
-        if let Some(_statement_id) = &self.statement_id {
+        if let Some(ref statement_id) = self.statement_id {
             // Cancel the statement via SEA API
+            let statement_id = statement_id.clone();
+            self.runtime
+                .block_on(async { self.client.cancel_statement(&statement_id).await })
+                .map_err(|e| {
+                    let db_err: DatabricksError = e;
+                    Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
+                })?;
         }
+        // Clear the statement ID after cancellation
+        self.statement_id = None;
         Ok(())
     }
 
     fn execute(&mut self) -> Result<impl RecordBatchReader + Send> {
-        let _sql = self.sql_query.as_ref().ok_or_else(|| {
+        let sql = self.sql_query.as_ref().ok_or_else(|| {
             Error::with_message_and_status("SQL query not set", Status::InvalidState)
         })?;
 
-        // TODO: Implement statement execution via SEA API
-        // 1. Get session ID from session manager
-        // 2. Call execute_statement API
-        // 3. Poll until complete if needed
-        // 4. Fetch results (inline or external links)
-        // 5. Return as RecordBatchReader
+        // Get session ID from session manager (creates session if needed)
+        let session_id = self
+            .runtime
+            .block_on(async { self.session_manager.get_session_id().await })
+            .map_err(|e| {
+                let db_err: DatabricksError = e;
+                Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
+            })?;
 
-        Ok(EmptyRecordBatchReader::new(Schema::empty()))
+        // Determine max wait time
+        let max_wait = self
+            .max_wait
+            .unwrap_or(Duration::from_secs(DEFAULT_MAX_WAIT_SECS));
+
+        // Execute statement and wait for completion
+        let response = self
+            .runtime
+            .block_on(async {
+                self.client
+                    .execute_and_wait(
+                        &session_id,
+                        sql,
+                        Some(max_wait),
+                        self.row_limit,
+                        self.byte_limit,
+                    )
+                    .await
+            })
+            .map_err(|e| {
+                let db_err: DatabricksError = e;
+                Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
+            })?;
+
+        // Store statement ID for potential cancellation
+        self.statement_id = Some(response.statement_id.clone());
+
+        // Convert response to record batch reader
+        self.response_to_reader(response)
     }
 
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
@@ -321,14 +445,53 @@ impl Statement for DatabricksStatement {
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
-        let _sql = self.sql_query.as_ref().ok_or_else(|| {
+        let sql = self.sql_query.as_ref().ok_or_else(|| {
             Error::with_message_and_status("SQL query not set", Status::InvalidState)
         })?;
 
-        // TODO: Implement update execution via SEA API
-        // Return affected row count if available
+        // Get session ID from session manager
+        let session_id = self
+            .runtime
+            .block_on(async { self.session_manager.get_session_id().await })
+            .map_err(|e| {
+                let db_err: DatabricksError = e;
+                Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
+            })?;
 
-        Ok(None)
+        // Determine max wait time
+        let max_wait = self
+            .max_wait
+            .unwrap_or(Duration::from_secs(DEFAULT_MAX_WAIT_SECS));
+
+        // Execute statement and wait for completion
+        let response = self
+            .runtime
+            .block_on(async {
+                self.client
+                    .execute_and_wait(
+                        &session_id,
+                        sql,
+                        Some(max_wait),
+                        self.row_limit,
+                        self.byte_limit,
+                    )
+                    .await
+            })
+            .map_err(|e| {
+                let db_err: DatabricksError = e;
+                Error::with_message_and_status(db_err.to_string(), db_err.to_adbc_status())
+            })?;
+
+        // Store statement ID
+        self.statement_id = Some(response.statement_id.clone());
+
+        // Return affected row count from manifest if available
+        // For DDL/DML, the manifest may contain the row count
+        let row_count = response
+            .manifest
+            .and_then(|m| m.total_row_count);
+
+        Ok(row_count)
     }
 
     fn get_parameter_schema(&self) -> Result<Schema> {
@@ -544,5 +707,276 @@ mod tests {
 
         let result = stmt.cancel();
         assert!(result.is_ok(), "cancel() should succeed");
+    }
+
+    #[test]
+    fn test_statement_set_max_wait() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        // Set max wait to 120 seconds
+        stmt.set_option(
+            OptionStatement::Other(option_keys::MAX_WAIT.into()),
+            OptionValue::String("120".into()),
+        )
+        .unwrap();
+
+        assert_eq!(stmt.max_wait, Some(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn test_statement_invalid_max_wait() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        let result = stmt.set_option(
+            OptionStatement::Other(option_keys::MAX_WAIT.into()),
+            OptionValue::String("not_a_number".into()),
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains("max_wait"));
+    }
+
+    #[test]
+    fn test_statement_set_byte_limit() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        stmt.set_option(
+            OptionStatement::Other(option_keys::BYTE_LIMIT.into()),
+            OptionValue::String("10000000".into()),
+        )
+        .unwrap();
+
+        assert_eq!(stmt.byte_limit, Some(10_000_000));
+    }
+
+    #[test]
+    fn test_statement_unknown_option_fails() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        let result = stmt.set_option(
+            OptionStatement::Other("databricks.statement.unknown".into()),
+            OptionValue::String("value".into()),
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(err.message.contains("Unknown option"));
+    }
+
+    #[test]
+    fn test_statement_execute_update_requires_sql() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        let result = stmt.execute_update();
+        assert!(result.is_err());
+        let err = result.err().expect("Expected an error");
+        assert_eq!(err.status, Status::InvalidState);
+        assert!(err.message.contains("SQL query not set"));
+    }
+
+    #[test]
+    fn test_statement_execute_partitions_not_implemented() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        let result = stmt.execute_partitions();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+    }
+
+    #[test]
+    fn test_statement_execute_schema_not_implemented() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        let result = stmt.execute_schema();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+    }
+
+    #[test]
+    fn test_statement_get_parameter_schema_not_implemented() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        let result = stmt.get_parameter_schema();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+    }
+
+    #[test]
+    fn test_statement_bind_stream_not_implemented() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let mut stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        // Create an empty reader for testing
+        let schema = Arc::new(Schema::empty());
+        let reader = Box::new(ArrowResultReader::empty((*schema).clone()));
+
+        let result = stmt.bind_stream(reader);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotImplemented);
+    }
+
+    #[test]
+    fn test_build_schema_from_response_with_columns() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        // Create a response with schema columns
+        let response = crate::client::StatementResponse {
+            statement_id: "test".to_string(),
+            status: crate::client::StatementStatus {
+                state: crate::client::StatementState::Succeeded,
+                error: None,
+            },
+            manifest: Some(crate::client::ResultManifest {
+                format: Some("ARROW_STREAM".to_string()),
+                schema: Some(crate::client::ResultSchema {
+                    column_count: Some(3),
+                    columns: Some(vec![
+                        crate::client::ColumnInfo {
+                            name: "id".to_string(),
+                            type_text: Some("INT".to_string()),
+                            type_name: Some("INT".to_string()),
+                            position: Some(0),
+                        },
+                        crate::client::ColumnInfo {
+                            name: "name".to_string(),
+                            type_text: Some("STRING".to_string()),
+                            type_name: Some("STRING".to_string()),
+                            position: Some(1),
+                        },
+                        crate::client::ColumnInfo {
+                            name: "amount".to_string(),
+                            type_text: Some("DOUBLE".to_string()),
+                            type_name: Some("DOUBLE".to_string()),
+                            position: Some(2),
+                        },
+                    ]),
+                }),
+                total_chunk_count: Some(1),
+                total_row_count: Some(100),
+                total_byte_count: Some(5000),
+                truncated: Some(false),
+                chunks: None,
+            }),
+            result: None,
+        };
+
+        let schema = stmt.build_schema_from_response(&response).unwrap();
+
+        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(*schema.field(0).data_type(), arrow_schema::DataType::Int32);
+        assert_eq!(schema.field(1).name(), "name");
+        assert_eq!(*schema.field(1).data_type(), arrow_schema::DataType::Utf8);
+        assert_eq!(schema.field(2).name(), "amount");
+        assert_eq!(*schema.field(2).data_type(), arrow_schema::DataType::Float64);
+    }
+
+    #[test]
+    fn test_build_schema_from_response_no_manifest() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        let response = crate::client::StatementResponse {
+            statement_id: "test".to_string(),
+            status: crate::client::StatementStatus {
+                state: crate::client::StatementState::Succeeded,
+                error: None,
+            },
+            manifest: None,
+            result: None,
+        };
+
+        let schema = stmt.build_schema_from_response(&response).unwrap();
+        assert_eq!(schema.fields().len(), 0);
+    }
+
+    #[test]
+    fn test_response_to_reader_empty_result() {
+        let runtime = create_mt_runtime();
+        let mock_uri = "http://localhost:1234";
+        let (client, session_manager) = create_test_client_and_session(mock_uri);
+
+        let stmt = DatabricksStatement::new(client, session_manager, runtime).unwrap();
+
+        let response = crate::client::StatementResponse {
+            statement_id: "test".to_string(),
+            status: crate::client::StatementStatus {
+                state: crate::client::StatementState::Succeeded,
+                error: None,
+            },
+            manifest: Some(crate::client::ResultManifest {
+                format: Some("ARROW_STREAM".to_string()),
+                schema: Some(crate::client::ResultSchema {
+                    column_count: Some(1),
+                    columns: Some(vec![crate::client::ColumnInfo {
+                        name: "value".to_string(),
+                        type_text: Some("BIGINT".to_string()),
+                        type_name: Some("BIGINT".to_string()),
+                        position: Some(0),
+                    }]),
+                }),
+                total_chunk_count: Some(0),
+                total_row_count: Some(0),
+                total_byte_count: Some(0),
+                truncated: Some(false),
+                chunks: None,
+            }),
+            result: None,
+        };
+
+        let reader = stmt.response_to_reader(response).unwrap();
+        let schema = reader.schema();
+        assert_eq!(schema.fields().len(), 1);
+        assert_eq!(schema.field(0).name(), "value");
+        assert_eq!(*schema.field(0).data_type(), arrow_schema::DataType::Int64);
     }
 }
