@@ -15,19 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Integration tests for the Databricks ADBC driver.
+//! Integration test entry point.
 //!
-//! This module contains integration tests that verify the full ADBC stack
-//! using wiremock to mock HTTP responses. These tests do not require a
-//! real Databricks connection.
-//!
-//! Test categories:
-//! - Full stack flow tests (Driver -> Database -> Connection -> Statement)
-//! - Error handling scenarios
-//! - Retry behavior
-//! - Session lifecycle
-//! - Statement execution flow
-//! - Cancel statement flow
-//! - External link data fetching
+//! This file serves as the entry point for integration tests that use
+//! wiremock to mock HTTP responses and test the full ADBC stack without
+//! requiring a real Databricks connection.
 
-mod full_stack_tests;
+mod integration;
