@@ -58,11 +58,12 @@ mod driver;
 mod error;
 mod fetch;
 mod options;
-mod session;
+pub mod session;
 mod statement;
 
 pub use connection::DatabricksConnection;
 pub use database::DatabricksDatabase;
 pub use driver::DatabricksDriver;
 pub use error::{Error, Result};
+pub use session::SessionManager;
 pub use statement::DatabricksStatement;

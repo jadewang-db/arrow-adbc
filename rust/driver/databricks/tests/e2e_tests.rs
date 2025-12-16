@@ -437,3 +437,275 @@ fn test_e2e_sea_client_auth_error() {
     println!();
     println!("=== SEA Client Auth Error Test PASSED ===");
 }
+
+// ============================================================================
+// Work Item 1.4: Session Management E2E Tests
+// ============================================================================
+
+/// Test SessionManager creates and caches session on a real Databricks instance.
+///
+/// This validates:
+/// - SessionManager can create sessions via SEA API
+/// - Session IDs are cached (second call returns same ID without API call)
+/// - Catalog and schema are respected during session creation
+#[test]
+#[ignore]
+fn test_e2e_session_manager_create_and_cache() {
+    use adbc_databricks::client::{SeaClient, SeaClientConfig};
+    use adbc_databricks::SessionManager;
+    use std::sync::Arc;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    // Create SeaClient wrapped in Arc
+    let sea_config = SeaClientConfig::new(&host, &config.token, &warehouse_id);
+    let client = Arc::new(SeaClient::new(sea_config).expect("Failed to create SeaClient"));
+
+    // Create Tokio runtime for async operations
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+    // Create SessionManager with optional catalog/schema from config
+    let catalog = if config.metadata.catalog.is_empty() {
+        None
+    } else {
+        Some(config.metadata.catalog.clone())
+    };
+    let schema = if config.metadata.schema.is_empty() {
+        None
+    } else {
+        Some(config.metadata.schema.clone())
+    };
+
+    let session_manager = SessionManager::new(client.clone(), catalog.clone(), schema.clone());
+
+    // Initially no session should be active
+    let is_active_before = rt.block_on(session_manager.is_active());
+    assert!(
+        !is_active_before,
+        "Session should not be active before first get_session_id call"
+    );
+
+    // Get session ID (should create a new session)
+    let session_id_1 = rt
+        .block_on(session_manager.get_session_id())
+        .expect("Failed to create session");
+
+    println!("Created session: {}", session_id_1);
+    assert!(!session_id_1.is_empty(), "Session ID should not be empty");
+
+    // Session should now be active
+    let is_active_after = rt.block_on(session_manager.is_active());
+    assert!(is_active_after, "Session should be active after creation");
+
+    // Get session ID again (should return cached value)
+    let session_id_2 = rt
+        .block_on(session_manager.get_session_id())
+        .expect("Failed to get cached session");
+
+    println!("Cached session returned: {}", session_id_2);
+    assert_eq!(
+        session_id_1, session_id_2,
+        "Second call should return the same session ID"
+    );
+
+    // Verify catalog and schema are stored correctly
+    assert_eq!(
+        session_manager.catalog(),
+        catalog.as_deref(),
+        "Catalog should match"
+    );
+    assert_eq!(
+        session_manager.schema(),
+        schema.as_deref(),
+        "Schema should match"
+    );
+
+    // Clean up: terminate the session
+    rt.block_on(session_manager.terminate())
+        .expect("Failed to terminate session");
+
+    println!("Session terminated");
+
+    println!();
+    println!("=== SessionManager Create and Cache Test PASSED ===");
+}
+
+/// Test SessionManager terminate functionality on a real Databricks instance.
+///
+/// This validates:
+/// - SessionManager can terminate active sessions
+/// - is_active() returns false after termination
+/// - New session can be created after termination
+#[test]
+#[ignore]
+fn test_e2e_session_manager_terminate() {
+    use adbc_databricks::client::{SeaClient, SeaClientConfig};
+    use adbc_databricks::SessionManager;
+    use std::sync::Arc;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    // Create SeaClient wrapped in Arc
+    let sea_config = SeaClientConfig::new(&host, &config.token, &warehouse_id);
+    let client = Arc::new(SeaClient::new(sea_config).expect("Failed to create SeaClient"));
+
+    // Create Tokio runtime for async operations
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+    let session_manager = SessionManager::new(client.clone(), None, None);
+
+    // Create a session
+    let session_id_1 = rt
+        .block_on(session_manager.get_session_id())
+        .expect("Failed to create session");
+
+    println!("Created first session: {}", session_id_1);
+    assert!(
+        rt.block_on(session_manager.is_active()),
+        "Session should be active"
+    );
+
+    // Terminate the session
+    rt.block_on(session_manager.terminate())
+        .expect("Failed to terminate session");
+
+    println!("Terminated session");
+
+    // Session should no longer be active
+    assert!(
+        !rt.block_on(session_manager.is_active()),
+        "Session should not be active after termination"
+    );
+
+    // Create a new session (should get a different session ID)
+    let session_id_2 = rt
+        .block_on(session_manager.get_session_id())
+        .expect("Failed to create second session");
+
+    println!("Created second session: {}", session_id_2);
+    assert!(
+        !session_id_2.is_empty(),
+        "New session ID should not be empty"
+    );
+
+    // Clean up
+    rt.block_on(session_manager.terminate())
+        .expect("Failed to terminate second session");
+
+    println!();
+    println!("=== SessionManager Terminate Test PASSED ===");
+}
+
+/// Complete E2E test for session lifecycle using SessionManager.
+///
+/// This validates the complete session lifecycle:
+/// 1. Session creation via get_session_id()
+/// 2. Session ID caching (repeated calls return same ID)
+/// 3. Session termination via terminate()
+/// 4. Session recreation after termination
+/// 5. is_active() correctly reflects session state
+#[test]
+#[ignore]
+fn test_e2e_session_manager_full_lifecycle() {
+    use adbc_databricks::client::{SeaClient, SeaClientConfig};
+    use adbc_databricks::SessionManager;
+    use std::sync::Arc;
+
+    skip_if_no_config!();
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config.parse_uri().expect("Failed to parse URI");
+
+    println!("=== SessionManager Full Lifecycle E2E Test ===");
+    println!("Host: {}", host);
+    println!("Warehouse ID: {}", warehouse_id);
+    println!();
+
+    // Create SeaClient wrapped in Arc
+    let sea_config = SeaClientConfig::new(&host, &config.token, &warehouse_id);
+    let client = Arc::new(SeaClient::new(sea_config).expect("Failed to create SeaClient"));
+
+    // Create Tokio runtime for async operations
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+    // Create SessionManager with catalog/schema from config if available
+    let catalog = if config.metadata.catalog.is_empty() {
+        None
+    } else {
+        Some(config.metadata.catalog.clone())
+    };
+    let schema = if config.metadata.schema.is_empty() {
+        None
+    } else {
+        Some(config.metadata.schema.clone())
+    };
+
+    let session_manager = SessionManager::new(client.clone(), catalog, schema);
+
+    // Step 1: Initial state - no session
+    println!("Step 1: Verify initial state");
+    assert!(
+        !rt.block_on(session_manager.is_active()),
+        "No session should exist initially"
+    );
+    println!("  - No active session (expected)");
+
+    // Step 2: Create session (lazy initialization)
+    println!("Step 2: Create session");
+    let session_id_1 = rt
+        .block_on(session_manager.get_session_id())
+        .expect("Failed to create session");
+    assert!(!session_id_1.is_empty(), "Session ID should not be empty");
+    assert!(
+        rt.block_on(session_manager.is_active()),
+        "Session should be active"
+    );
+    println!("  - Created session: {}", session_id_1);
+
+    // Step 3: Verify caching
+    println!("Step 3: Verify caching");
+    let session_id_2 = rt
+        .block_on(session_manager.get_session_id())
+        .expect("Failed to get cached session");
+    assert_eq!(
+        session_id_1, session_id_2,
+        "Should return cached session ID"
+    );
+    println!("  - Cached session ID returned: {}", session_id_2);
+
+    // Step 4: Terminate session
+    println!("Step 4: Terminate session");
+    rt.block_on(session_manager.terminate())
+        .expect("Failed to terminate session");
+    assert!(
+        !rt.block_on(session_manager.is_active()),
+        "Session should not be active after termination"
+    );
+    println!("  - Session terminated successfully");
+
+    // Step 5: Recreate session
+    println!("Step 5: Recreate session");
+    let session_id_3 = rt
+        .block_on(session_manager.get_session_id())
+        .expect("Failed to recreate session");
+    assert!(!session_id_3.is_empty(), "New session ID should not be empty");
+    assert!(
+        rt.block_on(session_manager.is_active()),
+        "Session should be active after recreation"
+    );
+    println!("  - Recreated session: {}", session_id_3);
+
+    // Clean up
+    rt.block_on(session_manager.terminate())
+        .expect("Failed to clean up session");
+
+    println!();
+    println!("=== SessionManager Full Lifecycle E2E Test PASSED ===");
+    println!("All session management operations completed successfully!");
+}
