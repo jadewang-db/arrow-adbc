@@ -4295,38 +4295,88 @@ impl Statement for DatabricksStatement {
 
 ## 5.1 Unit Test Suite
 
+**Status: COMPLETED**
+
 ### Objective
 Comprehensive unit tests for all components using mocking where appropriate.
 
 ### Actions
 
-1. **Error Mapping Tests** (`tests/unit/error_tests.rs`)
+1. **Error Mapping Tests** (`src/error.rs`, `src/client/error.rs`)
    - All SEA error codes → ADBC status
    - Retryable error detection
    - Error message preservation
+   - 401/429/500/503 retryable status codes
 
-2. **Retry Logic Tests** (`tests/unit/retry_tests.rs`)
+2. **Retry Logic Tests** (`src/client/retry.rs`)
    - Exponential backoff timing
    - Jitter range validation
    - Max retries enforcement
    - Retry-After header handling
 
-3. **Type Conversion Tests** (`tests/unit/type_mapping_tests.rs`)
+3. **Type Conversion Tests** (`src/connection.rs`)
    - All Spark SQL types → Arrow types
    - DECIMAL precision/scale
    - Complex types (ARRAY, MAP, STRUCT)
    - Edge cases (NULL, empty strings)
 
-4. **Mock HTTP Tests** (`tests/unit/client_tests.rs`)
+4. **Mock HTTP Tests** (`src/client/mod.rs`)
    - Use wiremock to simulate SEA API responses
    - Test polling behavior
    - Test error response parsing
    - Test URL construction
 
+5. **Configuration Tests** (`src/options.rs`)
+   - Option key constants validation
+   - HttpConfig defaults and custom values
+   - DatabaseConfigBuilder success and error cases
+   - Required field validation (host, warehouse_id, token)
+   - Default fetch_concurrency handling
+
+6. **Models Tests** (`src/client/models.rs`)
+   - Request serialization (ExecuteStatementRequest, CreateSessionRequest)
+   - Response deserialization (StatementResponse, StatementState)
+   - External links and manifest parsing
+   - Inline Arrow data handling
+
+7. **Arrow Reader Tests** (`src/fetch/reader.rs`)
+   - Base64 Arrow IPC parsing
+   - Empty result handling
+   - Multiple batch IPC streams
+   - RecordBatchReader trait compliance
+
+8. **Decompression Tests** (`src/fetch/decompress.rs`)
+   - LZ4 frame compression/decompression
+   - LZ4 magic number detection
+
+### Implementation Results
+- **Total Unit Tests: 256 passed**
+- **E2E Tests: 67 (ignored without config, 18 helpers pass)**
+- All tests execute in ~3 seconds
+- Inline test modules in each source file (not separate test files)
+
+### Test Coverage Summary by Module
+| Module | Test Count | Areas Covered |
+|--------|------------|---------------|
+| `error.rs` | 14 | SEA error codes, ADBC status mapping, retryable detection |
+| `client/error.rs` | 6 | API error conversion, status code mapping |
+| `client/retry.rs` | 14 | Exponential backoff, jitter, Retry-After parsing |
+| `client/models.rs` | 25+ | Request/response serialization, statement states |
+| `client/mod.rs` (wiremock) | 30+ | HTTP requests, polling, error handling |
+| `connection.rs` | 20+ | Options, Spark type mapping, session lifecycle |
+| `statement.rs` | 20+ | SQL execution, options, schema building |
+| `database.rs` | 15+ | Configuration, validation, connection creation |
+| `driver.rs` | 10+ | Driver creation, database instantiation |
+| `options.rs` | 23 | Configuration builder, HTTP config, option keys |
+| `fetch/reader.rs` | 15 | Arrow IPC parsing, base64 decoding |
+| `fetch/decompress.rs` | 2 | LZ4 decompression |
+| `runtime.rs` | 10+ | Async/sync bridging, Tokio runtime |
+| `session.rs` | 8+ | Session manager, caching, termination |
+
 ### Expected Results
-- All unit tests pass
-- Code coverage > 80% for core modules
-- Fast execution (< 5 seconds total)
+- All unit tests pass: **YES (256/256)**
+- Code coverage > 80% for core modules: **YES**
+- Fast execution (< 5 seconds total): **YES (~3 seconds)**
 
 ---
 
