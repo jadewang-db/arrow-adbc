@@ -73,9 +73,7 @@ pub struct DatabricksConnection {
     runtime: Arc<Runtime>,
     #[allow(dead_code)]
     config: DatabaseConfig,
-    #[allow(dead_code)]
     current_catalog: Option<String>,
-    #[allow(dead_code)]
     current_schema: Option<String>,
 }
 
@@ -145,36 +143,97 @@ impl DatabricksConnection {
 impl Optionable for DatabricksConnection {
     type Option = OptionConnection;
 
-    fn set_option(&mut self, _key: Self::Option, _value: OptionValue) -> Result<()> {
-        // Stub implementation for now - will be completed in work item 1.7
-        Ok(())
+    fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
+        match key {
+            OptionConnection::AutoCommit => {
+                let val = match value {
+                    OptionValue::String(s) => s,
+                    _ => {
+                        return Err(Error::with_message_and_status(
+                            "AutoCommit option must be a string",
+                            Status::InvalidArguments,
+                        ))
+                    }
+                };
+                if val != "true" {
+                    return Err(Error::with_message_and_status(
+                        "Databricks only supports autocommit mode",
+                        Status::InvalidArguments,
+                    ));
+                }
+                Ok(())
+            }
+            OptionConnection::CurrentCatalog => {
+                let val = match value {
+                    OptionValue::String(s) => s,
+                    _ => {
+                        return Err(Error::with_message_and_status(
+                            "CurrentCatalog option must be a string",
+                            Status::InvalidArguments,
+                        ))
+                    }
+                };
+                self.current_catalog = Some(val);
+                Ok(())
+            }
+            OptionConnection::CurrentSchema => {
+                let val = match value {
+                    OptionValue::String(s) => s,
+                    _ => {
+                        return Err(Error::with_message_and_status(
+                            "CurrentSchema option must be a string",
+                            Status::InvalidArguments,
+                        ))
+                    }
+                };
+                self.current_schema = Some(val);
+                Ok(())
+            }
+            OptionConnection::Other(ref k) => Err(Error::with_message_and_status(
+                format!("Unknown connection option: {}", k),
+                Status::NotImplemented,
+            )),
+            _ => Err(Error::with_message_and_status(
+                format!("Unsupported connection option: {:?}", key),
+                Status::NotImplemented,
+            )),
+        }
     }
 
-    fn get_option_string(&self, _key: Self::Option) -> Result<String> {
+    fn get_option_string(&self, key: Self::Option) -> Result<String> {
+        match key {
+            OptionConnection::AutoCommit => Ok("true".to_string()),
+            OptionConnection::CurrentCatalog => self.current_catalog.clone().ok_or_else(|| {
+                Error::with_message_and_status("Current catalog not set", Status::NotFound)
+            }),
+            OptionConnection::CurrentSchema => self.current_schema.clone().ok_or_else(|| {
+                Error::with_message_and_status("Current schema not set", Status::NotFound)
+            }),
+            _ => Err(Error::with_message_and_status(
+                format!("Unknown option: {:?}", key),
+                Status::NotFound,
+            )),
+        }
+    }
+
+    fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
         Err(Error::with_message_and_status(
-            "Connection options not yet implemented",
-            Status::NotImplemented,
+            format!("Option {:?} is not a byte array", key),
+            Status::NotFound,
         ))
     }
 
-    fn get_option_bytes(&self, _key: Self::Option) -> Result<Vec<u8>> {
+    fn get_option_int(&self, key: Self::Option) -> Result<i64> {
         Err(Error::with_message_and_status(
-            "Connection options not yet implemented",
-            Status::NotImplemented,
+            format!("Option {:?} is not an integer", key),
+            Status::NotFound,
         ))
     }
 
-    fn get_option_int(&self, _key: Self::Option) -> Result<i64> {
+    fn get_option_double(&self, key: Self::Option) -> Result<f64> {
         Err(Error::with_message_and_status(
-            "Connection options not yet implemented",
-            Status::NotImplemented,
-        ))
-    }
-
-    fn get_option_double(&self, _key: Self::Option) -> Result<f64> {
-        Err(Error::with_message_and_status(
-            "Connection options not yet implemented",
-            Status::NotImplemented,
+            format!("Option {:?} is not a double", key),
+            Status::NotFound,
         ))
     }
 }
@@ -304,5 +363,277 @@ impl Drop for DatabricksConnection {
         // Attempt to terminate the session
         // We ignore errors here since drop handlers should not panic
         let _ = self.runtime.block_on(self.session_manager.terminate());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::options::DatabaseConfig;
+
+    /// Helper to create a test connection for unit tests
+    /// Note: This does not actually connect to Databricks, it just creates the struct
+    fn create_mock_connection() -> DatabricksConnection {
+        // Create minimal config for testing
+        let config = DatabaseConfig {
+            host: Some("https://test.databricks.com".to_string()),
+            warehouse_id: Some("test-warehouse".to_string()),
+            token: Some("test-token".to_string()),
+            default_catalog: Some("test_catalog".to_string()),
+            default_schema: Some("test_schema".to_string()),
+            http_config: crate::options::HttpConfig::default(),
+            fetch_config: crate::options::FetchConfig::default(),
+        };
+
+        let runtime = Arc::new(
+            tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"),
+        );
+
+        // Create client config
+        let client_config = SeaClientConfig {
+            host: config.host.clone().unwrap(),
+            token: config.token.clone().unwrap(),
+            warehouse_id: config.warehouse_id.clone().unwrap(),
+            connect_timeout: config.http_config.connect_timeout,
+            read_timeout: config.http_config.read_timeout,
+        };
+
+        let client = Arc::new(
+            SeaClient::new(client_config).expect("Failed to create test client"),
+        );
+
+        let session_manager = Arc::new(SessionManager::new(
+            client.clone(),
+            config.default_catalog.clone(),
+            config.default_schema.clone(),
+        ));
+
+        DatabricksConnection {
+            client,
+            session_manager,
+            runtime,
+            current_catalog: config.default_catalog.clone(),
+            current_schema: config.default_schema.clone(),
+            config,
+        }
+    }
+
+    #[test]
+    fn test_connection_autocommit_always_true() {
+        let conn = create_mock_connection();
+
+        // AutoCommit should always return "true"
+        let result = conn.get_option_string(OptionConnection::AutoCommit);
+        assert!(
+            result.is_ok(),
+            "Should be able to get AutoCommit option: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap(), "true");
+    }
+
+    #[test]
+    fn test_connection_autocommit_cannot_disable() {
+        let mut conn = create_mock_connection();
+
+        // Cannot set autocommit to false
+        let result = conn.set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("false".into()),
+        );
+        assert!(result.is_err(), "Should not be able to disable autocommit");
+
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.status,
+            Status::InvalidArguments,
+            "Should return InvalidArguments status"
+        );
+        assert!(
+            err.message.contains("autocommit"),
+            "Error message should mention autocommit: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_connection_autocommit_set_true_succeeds() {
+        let mut conn = create_mock_connection();
+
+        // Setting autocommit to true should succeed
+        let result = conn.set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String("true".into()),
+        );
+        assert!(
+            result.is_ok(),
+            "Should be able to set autocommit to true: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_connection_current_catalog_get_set() {
+        let mut conn = create_mock_connection();
+
+        // Should be able to get initial catalog
+        let result = conn.get_option_string(OptionConnection::CurrentCatalog);
+        assert!(
+            result.is_ok(),
+            "Should be able to get current catalog: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap(), "test_catalog");
+
+        // Should be able to set new catalog
+        let result = conn.set_option(
+            OptionConnection::CurrentCatalog,
+            OptionValue::String("new_catalog".into()),
+        );
+        assert!(
+            result.is_ok(),
+            "Should be able to set catalog: {:?}",
+            result.err()
+        );
+
+        // Verify new value
+        let result = conn.get_option_string(OptionConnection::CurrentCatalog);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "new_catalog");
+    }
+
+    #[test]
+    fn test_connection_current_schema_get_set() {
+        let mut conn = create_mock_connection();
+
+        // Should be able to get initial schema
+        let result = conn.get_option_string(OptionConnection::CurrentSchema);
+        assert!(
+            result.is_ok(),
+            "Should be able to get current schema: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap(), "test_schema");
+
+        // Should be able to set new schema
+        let result = conn.set_option(
+            OptionConnection::CurrentSchema,
+            OptionValue::String("new_schema".into()),
+        );
+        assert!(
+            result.is_ok(),
+            "Should be able to set schema: {:?}",
+            result.err()
+        );
+
+        // Verify new value
+        let result = conn.get_option_string(OptionConnection::CurrentSchema);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "new_schema");
+    }
+
+    #[test]
+    fn test_connection_catalog_not_set_returns_not_found() {
+        let mut conn = create_mock_connection();
+        conn.current_catalog = None;
+
+        let result = conn.get_option_string(OptionConnection::CurrentCatalog);
+        assert!(result.is_err(), "Should return error when catalog not set");
+
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.status,
+            Status::NotFound,
+            "Should return NotFound status"
+        );
+        assert!(
+            err.message.contains("not set"),
+            "Error message should mention not set: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_connection_schema_not_set_returns_not_found() {
+        let mut conn = create_mock_connection();
+        conn.current_schema = None;
+
+        let result = conn.get_option_string(OptionConnection::CurrentSchema);
+        assert!(result.is_err(), "Should return error when schema not set");
+
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.status,
+            Status::NotFound,
+            "Should return NotFound status"
+        );
+        assert!(
+            err.message.contains("not set"),
+            "Error message should mention not set: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_connection_unknown_option_returns_not_implemented() {
+        let mut conn = create_mock_connection();
+
+        // Try to set an unknown option
+        let result = conn.set_option(
+            OptionConnection::Other("unknown_option".to_string()),
+            OptionValue::String("value".into()),
+        );
+        assert!(result.is_err(), "Should return error for unknown option");
+
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.status,
+            Status::NotImplemented,
+            "Should return NotImplemented status"
+        );
+        assert!(
+            err.message.contains("Unknown"),
+            "Error message should mention unknown option: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_connection_get_option_bytes_not_supported() {
+        let conn = create_mock_connection();
+
+        let result = conn.get_option_bytes(OptionConnection::AutoCommit);
+        assert!(result.is_err(), "get_option_bytes should not be supported");
+
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotFound);
+        assert!(err.message.contains("not a byte array"));
+    }
+
+    #[test]
+    fn test_connection_get_option_int_not_supported() {
+        let conn = create_mock_connection();
+
+        let result = conn.get_option_int(OptionConnection::AutoCommit);
+        assert!(result.is_err(), "get_option_int should not be supported");
+
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotFound);
+        assert!(err.message.contains("not an integer"));
+    }
+
+    #[test]
+    fn test_connection_get_option_double_not_supported() {
+        let conn = create_mock_connection();
+
+        let result = conn.get_option_double(OptionConnection::AutoCommit);
+        assert!(
+            result.is_err(),
+            "get_option_double should not be supported"
+        );
+
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::NotFound);
+        assert!(err.message.contains("not a double"));
     }
 }

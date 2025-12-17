@@ -1828,7 +1828,29 @@ fn test_connection_autocommit() {
 ```
 
 ### Files Modified/Created
-- `driver/databricks/src/connection.rs` (add Optionable impl)
+- `driver/databricks/src/connection.rs` (add Optionable impl + unit tests)
+- `tests/connection_e2e_tests.rs` (add E2E tests)
+- `tests/e2e/helpers.rs` (implement create_test_database)
+
+### Implementation Notes
+
+**Key Changes:**
+1. **OptionValue handling**: Used pattern matching on `OptionValue` enum to extract String values instead of `try_into()`.
+2. **CurrentSchema naming**: The ADBC standard uses `CurrentSchema` (not `CurrentDbSchema`) which maps to `ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA`.
+3. **Error messages**: All error messages are clear and specific to help users diagnose issues.
+4. **Test helper improvements**: Updated `create_test_database()` in helpers.rs to properly configure the database from E2EConfig, enabling E2E tests to run successfully.
+
+**Behavior:**
+- AutoCommit: Always returns "true", setting to "false" returns InvalidArguments error
+- CurrentCatalog: Stored in connection state, can be set/retrieved
+- CurrentSchema: Stored in connection state, can be set/retrieved
+- Unknown options: Return NotImplemented error with clear message
+- Non-string getters (bytes, int, double): All return NotFound error
+
+**Test Coverage:**
+- 11 unit tests covering all option operations
+- 4 E2E tests validating real Databricks integration
+- All tests pass successfully
 
 ---
 

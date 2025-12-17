@@ -153,3 +153,159 @@ fn test_e2e_connection_multiple_statements() {
     // Both statements should be independent and functional
     // (actual functionality will be tested in statement E2E tests)
 }
+
+#[test]
+#[ignore]
+fn test_e2e_connection_option_autocommit() {
+    skip_if_no_config!();
+
+    use adbc_core::options::{OptionConnection, OptionValue};
+    use adbc_core::Optionable;
+
+    let database = create_test_database();
+    let mut conn = create_test_connection(&database);
+
+    // AutoCommit should always return "true"
+    let result = conn.get_option_string(OptionConnection::AutoCommit);
+    assert!(
+        result.is_ok(),
+        "Should be able to get AutoCommit: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        result.unwrap(),
+        "true",
+        "AutoCommit should always be true"
+    );
+
+    // Setting to "true" should succeed
+    let result =
+        conn.set_option(OptionConnection::AutoCommit, OptionValue::String("true".into()));
+    assert!(
+        result.is_ok(),
+        "Should be able to set AutoCommit to true: {:?}",
+        result.err()
+    );
+
+    // Setting to "false" should fail
+    let result = conn.set_option(
+        OptionConnection::AutoCommit,
+        OptionValue::String("false".into()),
+    );
+    assert!(
+        result.is_err(),
+        "Should not be able to set AutoCommit to false"
+    );
+
+    let err = result.unwrap_err();
+    assert_eq!(
+        err.status,
+        adbc_core::error::Status::InvalidArguments,
+        "Should return InvalidArguments status"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_e2e_connection_option_current_catalog() {
+    skip_if_no_config!();
+
+    use adbc_core::options::{OptionConnection, OptionValue};
+    use adbc_core::Optionable;
+
+    let database = create_test_database();
+    let mut conn = create_test_connection(&database);
+
+    // Should be able to get current catalog (if set via config)
+    let initial_catalog = conn.get_option_string(OptionConnection::CurrentCatalog);
+    if initial_catalog.is_ok() {
+        println!("Initial catalog: {}", initial_catalog.unwrap());
+    }
+
+    // Should be able to set new catalog
+    let result = conn.set_option(
+        OptionConnection::CurrentCatalog,
+        OptionValue::String("main".into()),
+    );
+    assert!(
+        result.is_ok(),
+        "Should be able to set catalog: {:?}",
+        result.err()
+    );
+
+    // Verify new value
+    let result = conn.get_option_string(OptionConnection::CurrentCatalog);
+    assert!(
+        result.is_ok(),
+        "Should be able to get catalog: {:?}",
+        result.err()
+    );
+    assert_eq!(result.unwrap(), "main");
+}
+
+#[test]
+#[ignore]
+fn test_e2e_connection_option_current_schema() {
+    skip_if_no_config!();
+
+    use adbc_core::options::{OptionConnection, OptionValue};
+    use adbc_core::Optionable;
+
+    let database = create_test_database();
+    let mut conn = create_test_connection(&database);
+
+    // Should be able to get current schema (if set via config)
+    let initial_schema = conn.get_option_string(OptionConnection::CurrentSchema);
+    if initial_schema.is_ok() {
+        println!("Initial schema: {}", initial_schema.unwrap());
+    }
+
+    // Should be able to set new schema
+    let result = conn.set_option(
+        OptionConnection::CurrentSchema,
+        OptionValue::String("default".into()),
+    );
+    assert!(
+        result.is_ok(),
+        "Should be able to set schema: {:?}",
+        result.err()
+    );
+
+    // Verify new value
+    let result = conn.get_option_string(OptionConnection::CurrentSchema);
+    assert!(
+        result.is_ok(),
+        "Should be able to get schema: {:?}",
+        result.err()
+    );
+    assert_eq!(result.unwrap(), "default");
+}
+
+#[test]
+#[ignore]
+fn test_e2e_connection_option_unknown_fails() {
+    skip_if_no_config!();
+
+    use adbc_core::options::{OptionConnection, OptionValue};
+    use adbc_core::Optionable;
+
+    let database = create_test_database();
+    let mut conn = create_test_connection(&database);
+
+    // Unknown option should fail
+    let result = conn.set_option(
+        OptionConnection::Other("unknown_option".to_string()),
+        OptionValue::String("value".into()),
+    );
+    assert!(
+        result.is_err(),
+        "Should fail for unknown option"
+    );
+
+    let err = result.unwrap_err();
+    assert_eq!(
+        err.status,
+        adbc_core::error::Status::NotImplemented,
+        "Should return NotImplemented status"
+    );
+}

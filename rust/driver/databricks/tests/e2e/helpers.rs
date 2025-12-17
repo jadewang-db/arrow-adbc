@@ -44,13 +44,55 @@ pub fn get_test_config() -> E2EConfig {
 
 /// Create a test database configured from E2E config
 ///
-/// TODO: Complete implementation in Work Item 1.6 after Database trait is fully implemented
-/// This stub will be replaced with proper initialization including:
-/// - Setting host, warehouse_id, and token from E2EConfig
-/// - Initializing the database with the configured options
+/// Reads configuration from DATABRICKS_TEST_CONFIG_FILE and creates a properly
+/// configured DatabricksDatabase instance.
 pub fn create_test_database() -> DatabricksDatabase {
-    // Stub implementation - will be completed when Database trait is fully implemented
-    DatabricksDatabase::new()
+    use adbc_core::options::{OptionDatabase, OptionValue};
+    use adbc_core::Optionable;
+
+    let config = get_test_config();
+    let (host, warehouse_id) = config
+        .parse_uri()
+        .expect("Failed to parse URI from test config");
+
+    let mut database = DatabricksDatabase::new();
+
+    // Set required options
+    database
+        .set_option(OptionDatabase::Uri, OptionValue::String(host))
+        .expect("Failed to set host");
+
+    database
+        .set_option(
+            OptionDatabase::Other("databricks.warehouse_id".to_string()),
+            OptionValue::String(warehouse_id),
+        )
+        .expect("Failed to set warehouse_id");
+
+    database
+        .set_option(OptionDatabase::Password, OptionValue::String(config.token))
+        .expect("Failed to set token");
+
+    // Set optional catalog and schema if present
+    if !config.metadata.catalog.is_empty() {
+        database
+            .set_option(
+                OptionDatabase::Other("databricks.catalog".to_string()),
+                OptionValue::String(config.metadata.catalog),
+            )
+            .expect("Failed to set catalog");
+    }
+
+    if !config.metadata.schema.is_empty() {
+        database
+            .set_option(
+                OptionDatabase::Other("databricks.schema".to_string()),
+                OptionValue::String(config.metadata.schema),
+            )
+            .expect("Failed to set schema");
+    }
+
+    database
 }
 
 /// Create a test connection from a configured database
