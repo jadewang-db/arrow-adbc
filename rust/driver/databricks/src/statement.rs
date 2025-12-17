@@ -142,8 +142,8 @@ impl DatabricksStatement {
         Box::pin(async move {
             match response.status.state {
                 StatementState::Succeeded => {
-                    // For now, return an empty reader (will be implemented in work item 2.7)
-                    Ok(ArrowResultReader::empty(Arc::new(Schema::empty())))
+                    // Create reader from the successful response
+                    self.create_reader_from_result(response)
                 }
                 StatementState::Pending | StatementState::Running => {
                     // Poll until complete
@@ -170,6 +170,81 @@ impl DatabricksStatement {
                 }
             }
         })
+    }
+
+    /// Create an Arrow result reader from a successful statement response
+    ///
+    /// This method handles different result types:
+    /// - Empty result (0 rows): Returns empty reader
+    /// - Inline result: Parses Arrow IPC data inline
+    /// - External links: Will be handled in Sprint 3 (work item 3.x)
+    fn create_reader_from_result(
+        &self,
+        response: crate::client::models::ExecuteStatementResponse,
+    ) -> crate::error::Result<ArrowResultReader> {
+        use crate::fetch::manifest_to_arrow_schema;
+
+        let manifest = response
+            .manifest
+            .ok_or_else(|| DatabricksError::StatementFailed("No manifest in response".into()))?;
+
+        let schema = manifest_to_arrow_schema(&manifest.schema)?;
+
+        let result = response
+            .result
+            .ok_or_else(|| DatabricksError::StatementFailed("No result in response".into()))?;
+
+        // Check if this is an external links result (will be handled in Sprint 3)
+        if let Some(ref external_links) = result.external_links {
+            if !external_links.is_empty() {
+                // External links - will be handled in Sprint 3
+                return Err(DatabricksError::Config(
+                    "External links not yet implemented (Sprint 3)".into(),
+                ));
+            }
+        }
+
+        // Check for empty result
+        if manifest.total_row_count == Some(0) {
+            return Ok(ArrowResultReader::empty(schema));
+        }
+
+        // Inline result - extract and parse Arrow data
+        let data = self.extract_inline_arrow_data(&result)?;
+        ArrowResultReader::from_inline_data(schema, &data)
+    }
+
+    /// Extract inline Arrow IPC data from the statement result
+    ///
+    /// For ARROW_STREAM format, the data is base64-encoded in the arrow_batches field.
+    /// This method extracts and decodes the first batch (inline results are typically single batch).
+    fn extract_inline_arrow_data(
+        &self,
+        result: &crate::client::models::StatementResult,
+    ) -> crate::error::Result<Vec<u8>> {
+        // Check for arrow_batches field (ARROW_STREAM format)
+        if let Some(ref arrow_batches) = result.arrow_batches {
+            if arrow_batches.is_empty() {
+                // No batches means empty result
+                return Ok(Vec::new());
+            }
+
+            // For inline results, we expect a single batch
+            // Multiple batches would typically be in external links
+            let batch = &arrow_batches[0];
+
+            // Decode base64-encoded Arrow IPC data
+            let decoded = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &batch.bytes,
+            )
+            .map_err(|e| DatabricksError::Config(format!("Failed to decode Arrow data: {}", e)))?;
+
+            Ok(decoded)
+        } else {
+            // No arrow_batches field - this might be an empty result or error
+            Ok(Vec::new())
+        }
     }
 }
 

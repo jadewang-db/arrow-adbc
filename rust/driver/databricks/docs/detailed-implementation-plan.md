@@ -3113,9 +3113,36 @@ fn test_e2e_query_data_types() {
 ```
 
 ### Files Modified/Created
-- `driver/databricks/src/statement.rs` (add create_reader_from_result)
-- `driver/databricks/tests/integration/basic_query.rs`
-- `tests/e2e/query_basic_tests.rs`
+- `driver/databricks/src/statement.rs` (add create_reader_from_result, extract_inline_arrow_data)
+- `driver/databricks/src/fetch/reader.rs` (implement from_inline_data with full IPC parsing)
+- `driver/databricks/src/client/models.rs` (add ArrowBatch struct for inline results)
+- `driver/databricks/src/error.rs` (add ArrowIpc error variant)
+- `driver/databricks/tests/statement_e2e_tests.rs` (E2E tests)
+
+### Implementation Notes (Completed)
+
+**Statement Execution Path:**
+1. `execute()` calls SEA API with ARROW_STREAM format
+2. `handle_execute_response()` checks statement state and creates reader
+3. `create_reader_from_result()` handles three cases:
+   - Empty result (0 rows) → empty reader
+   - Inline result → extract and parse Arrow IPC data
+   - External links → return error (to be implemented in Sprint 3)
+
+**Arrow IPC Parsing:**
+- `from_inline_data()` uses arrow-ipc StreamReader for parsing
+- Supports optional LZ4 compression detection and decompression
+- Schema validation ensures response matches expected schema
+- Collects all batches from IPC stream into memory
+
+**Base64 Decoding:**
+- `extract_inline_arrow_data()` decodes base64-encoded Arrow IPC data
+- Handles multiple arrow_batches (though inline typically has one batch)
+
+**E2E Tests:**
+- 5 comprehensive tests covering basic queries, data types, multiple rows, NULL values, and error handling
+- Tests use skip_if_no_config! macro to skip when config not available
+- Tests verify schema, data types, and Arrow array values
 
 ---
 

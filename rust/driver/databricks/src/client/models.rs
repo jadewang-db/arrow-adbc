@@ -144,6 +144,8 @@ pub struct StatementResult {
     #[serde(default)]
     pub data_array: Option<Vec<Vec<serde_json::Value>>>,
     #[serde(default)]
+    pub arrow_batches: Option<Vec<ArrowBatch>>,
+    #[serde(default)]
     pub chunk_index: Option<i32>,
     #[serde(default)]
     pub row_offset: Option<i64>,
@@ -151,6 +153,17 @@ pub struct StatementResult {
     pub row_count: Option<i64>,
     #[serde(default)]
     pub external_links: Option<Vec<ExternalLink>>,
+}
+
+/// Arrow batch data for inline results
+#[derive(Debug, Deserialize)]
+pub struct ArrowBatch {
+    /// Base64-encoded Arrow IPC stream data
+    pub bytes: String,
+    /// Number of rows in this batch
+    pub row_count: i64,
+    /// Start row offset
+    pub start_row_offset: i64,
 }
 
 /// External link to cloud storage for large results

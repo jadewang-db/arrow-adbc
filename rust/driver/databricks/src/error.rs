@@ -36,6 +36,9 @@ pub enum Error {
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
 
+    #[error("Arrow IPC error: {0}")]
+    ArrowIpc(String),
+
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
@@ -73,6 +76,7 @@ impl Error {
             }
             Error::Http(_) => adbc_core::error::Status::IO,
             Error::Arrow(_) => adbc_core::error::Status::InvalidData,
+            Error::ArrowIpc(_) => adbc_core::error::Status::InvalidData,
             Error::Json(_) => adbc_core::error::Status::InvalidData,
             Error::Config(_) => adbc_core::error::Status::InvalidArguments,
             Error::Io(_) => adbc_core::error::Status::IO,

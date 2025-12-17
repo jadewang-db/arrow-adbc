@@ -19,9 +19,11 @@
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, SchemaRef};
+use arrow_ipc::reader::StreamReader;
 use crate::error::Result;
 
 /// Reader for Arrow IPC data from Databricks
+#[derive(Debug)]
 pub struct ArrowResultReader {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
@@ -35,17 +37,76 @@ impl ArrowResultReader {
     /// Parses Arrow IPC stream format data and creates a reader with all batches.
     /// The data should be in Arrow IPC stream format (not file format).
     ///
-    /// # Implementation Note
+    /// # Arguments
+    /// * `schema` - Expected Arrow schema for validation
+    /// * `data` - Arrow IPC stream bytes (may be LZ4-compressed)
+    pub fn from_inline_data(schema: SchemaRef, data: &[u8]) -> Result<Self> {
+        use std::io::Cursor;
+
+        if data.is_empty() {
+            // Empty data means no rows
+            return Ok(Self::empty(schema));
+        }
+
+        // Try to decompress if the data appears to be LZ4-compressed
+        let decompressed_data = if Self::is_lz4_compressed(data) {
+            super::decompress::decompress_lz4(data)?
+        } else {
+            data.to_vec()
+        };
+
+        // Parse Arrow IPC stream
+        let cursor = Cursor::new(decompressed_data);
+        let mut stream_reader = StreamReader::try_new(cursor, None)
+            .map_err(|e| crate::error::Error::ArrowIpc(format!("Failed to parse Arrow IPC stream: {}", e)))?;
+
+        // Validate schema matches expected schema
+        let actual_schema = stream_reader.schema();
+        if !Self::schemas_compatible(&schema, &actual_schema) {
+            return Err(crate::error::Error::ArrowIpc(format!(
+                "Schema mismatch: expected {:?}, got {:?}",
+                schema, actual_schema
+            )));
+        }
+
+        // Collect all batches from the stream
+        let mut batches = Vec::new();
+        while let Some(batch_result) = stream_reader.next() {
+            let batch = batch_result
+                .map_err(|e| crate::error::Error::ArrowIpc(format!("Failed to read batch: {}", e)))?;
+            batches.push(batch);
+        }
+
+        Ok(Self {
+            schema,
+            batches,
+            current_index: 0,
+            affected_rows: None,
+        })
+    }
+
+    /// Check if data appears to be LZ4-compressed
     ///
-    /// The full IPC parsing implementation will be added in Sprint 2.8 (Statement Execute - Inline Path).
-    /// For now, this returns an empty reader as a stub. The schema conversion functionality
-    /// (manifest_to_arrow_schema) is fully implemented and tested.
+    /// LZ4 frame format starts with magic number: 0x184D2204
+    fn is_lz4_compressed(data: &[u8]) -> bool {
+        data.len() >= 4 && data[0..4] == [0x04, 0x22, 0x4D, 0x18]
+    }
+
+    /// Check if two schemas are compatible (same field names and types)
     ///
-    /// TODO(work-item-2.8): Implement full IPC stream parsing when integrating with statement execution.
-    pub fn from_inline_data(schema: SchemaRef, _data: &[u8]) -> Result<Self> {
-        // Stub implementation - will be completed in work item 2.8
-        // when we integrate with actual Databricks API responses
-        Ok(Self::empty(schema))
+    /// This allows for minor differences like metadata that don't affect data compatibility.
+    fn schemas_compatible(expected: &SchemaRef, actual: &SchemaRef) -> bool {
+        if expected.fields().len() != actual.fields().len() {
+            return false;
+        }
+
+        for (exp_field, act_field) in expected.fields().iter().zip(actual.fields().iter()) {
+            if exp_field.name() != act_field.name() || exp_field.data_type() != act_field.data_type() {
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Create an empty reader (typically for DDL statements with no result data)
@@ -215,11 +276,11 @@ mod tests {
     }
 
     #[test]
-    fn test_from_inline_data_stub() {
+    fn test_from_inline_data_empty() {
         let schema = create_test_schema();
-        let data = b"stub data";
+        let data = b"";
 
-        // Currently returns empty reader (stub implementation)
+        // Empty data should return empty reader
         let reader = ArrowResultReader::from_inline_data(schema.clone(), data).unwrap();
         assert_eq!(reader.schema(), schema);
         assert_eq!(reader.affected_rows(), None);
@@ -228,9 +289,44 @@ mod tests {
         assert_eq!(results.len(), 0);
     }
 
-    // Note: Full IPC parsing implementation and tests will be added in work item 2.8
-    // when integrating with actual Databricks API responses. The stub implementation
-    // above ensures the API signature is correct.
+    #[test]
+    fn test_from_inline_data_with_ipc() {
+        use arrow_ipc::writer::StreamWriter;
+        use std::io::Cursor;
+
+        let schema = create_test_schema();
+        let batch = create_test_batch(schema.clone(), 1);
+
+        // Create Arrow IPC stream data
+        let mut buffer = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buffer, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        // Parse it back
+        let reader = ArrowResultReader::from_inline_data(schema.clone(), &buffer).unwrap();
+        assert_eq!(reader.schema(), schema);
+
+        let results: Vec<_> = reader.collect();
+        assert_eq!(results.len(), 1);
+
+        let result_batch = results[0].as_ref().unwrap();
+        assert_eq!(result_batch.num_rows(), 3);
+        assert_eq!(result_batch.num_columns(), 2);
+    }
+
+    #[test]
+    fn test_from_inline_data_invalid_ipc() {
+        let schema = create_test_schema();
+        let data = b"invalid ipc data";
+
+        // Invalid IPC data should return an error
+        let result = ArrowResultReader::from_inline_data(schema.clone(), data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Failed to parse Arrow IPC stream"));
+    }
 
     #[test]
     fn test_record_batch_reader_trait() {
