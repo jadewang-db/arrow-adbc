@@ -303,6 +303,23 @@ impl SeaClient {
 
         Err(last_error.unwrap())
     }
+
+    /// Execute a SQL statement
+    ///
+    /// Sends a request to the SEA API to execute a SQL statement.
+    /// Returns the statement ID, status, and initial results if available.
+    ///
+    /// # Arguments
+    /// * `request` - The statement execution request containing SQL and configuration
+    ///
+    /// # Returns
+    /// * `ExecuteStatementResponse` - Response containing statement ID, status, and results
+    pub async fn execute_statement(
+        &self,
+        request: models::ExecuteStatementRequest,
+    ) -> Result<models::ExecuteStatementResponse> {
+        self.post(&self.statements_url(), &request).await
+    }
 }
 
 #[cfg(test)]
@@ -773,6 +790,362 @@ mod tests {
                 assert_eq!(code, "NOT_FOUND");
                 assert_eq!(message, "Session not found");
                 assert_eq!(http_status, 404);
+            }
+            _ => panic!("Expected SeaApi error"),
+        }
+    }
+
+    #[test]
+    fn test_execute_request_serialization() {
+        use models::ExecuteStatementRequest;
+
+        let request = ExecuteStatementRequest {
+            statement: "SELECT 1".to_string(),
+            warehouse_id: "abc123".to_string(),
+            session_id: Some("session456".to_string()),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("ARROW_STREAM"));
+        assert!(json.contains("INLINE_OR_EXTERNAL_LINKS"));
+        assert!(json.contains("SELECT 1"));
+        assert!(json.contains("abc123"));
+        assert!(json.contains("session456"));
+        assert!(json.contains("10s"));
+    }
+
+    #[test]
+    fn test_execute_request_default_values() {
+        use models::ExecuteStatementRequest;
+
+        let request = ExecuteStatementRequest::default();
+        assert_eq!(request.wait_timeout, "10s");
+        assert_eq!(request.disposition, "INLINE_OR_EXTERNAL_LINKS");
+        assert_eq!(request.format, "ARROW_STREAM");
+        assert!(request.session_id.is_none());
+        assert!(request.catalog.is_none());
+        assert!(request.schema.is_none());
+        assert!(request.row_limit.is_none());
+        assert!(request.byte_limit.is_none());
+    }
+
+    #[test]
+    fn test_execute_request_skip_serializing_none() {
+        use models::ExecuteStatementRequest;
+
+        let request = ExecuteStatementRequest {
+            statement: "SELECT 1".to_string(),
+            warehouse_id: "abc123".to_string(),
+            session_id: None,
+            catalog: None,
+            schema: None,
+            wait_timeout: "10s".to_string(),
+            disposition: "INLINE_OR_EXTERNAL_LINKS".to_string(),
+            format: "ARROW_STREAM".to_string(),
+            row_limit: None,
+            byte_limit: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        // None fields should not be present in JSON
+        assert!(!json.contains("session_id"));
+        assert!(!json.contains("catalog"));
+        assert!(!json.contains("schema"));
+        assert!(!json.contains("row_limit"));
+        assert!(!json.contains("byte_limit"));
+    }
+
+    #[test]
+    fn test_execute_response_deserialization() {
+        use models::ExecuteStatementResponse;
+
+        let json = r#"{
+            "statement_id": "stmt123",
+            "status": { "state": "SUCCEEDED" },
+            "result": { "chunk_index": 0, "row_count": 1 }
+        }"#;
+
+        let response: ExecuteStatementResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.statement_id, "stmt123");
+        assert_eq!(response.status.state, models::StatementState::Succeeded);
+        assert!(response.result.is_some());
+        assert_eq!(response.result.unwrap().chunk_index, Some(0));
+    }
+
+    #[test]
+    fn test_execute_response_with_manifest() {
+        use models::ExecuteStatementResponse;
+
+        let json = r#"{
+            "statement_id": "stmt456",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": {
+                "format": "ARROW_STREAM",
+                "schema": {
+                    "columns": [
+                        {
+                            "name": "col1",
+                            "type_name": "INT",
+                            "type_text": "int",
+                            "position": 0,
+                            "nullable": false
+                        }
+                    ]
+                },
+                "total_chunk_count": 5,
+                "total_row_count": 1000,
+                "total_byte_count": 50000,
+                "truncated": false
+            }
+        }"#;
+
+        let response: ExecuteStatementResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.statement_id, "stmt456");
+        assert_eq!(response.status.state, models::StatementState::Succeeded);
+        assert!(response.manifest.is_some());
+
+        let manifest = response.manifest.unwrap();
+        assert_eq!(manifest.format, "ARROW_STREAM");
+        assert_eq!(manifest.total_chunk_count, 5);
+        assert_eq!(manifest.total_row_count, Some(1000));
+        assert_eq!(manifest.schema.columns.len(), 1);
+        assert_eq!(manifest.schema.columns[0].name, "col1");
+    }
+
+    #[test]
+    fn test_statement_state_deserialization() {
+        use models::StatementState;
+
+        assert_eq!(
+            serde_json::from_str::<StatementState>(r#""PENDING""#).unwrap(),
+            StatementState::Pending
+        );
+        assert_eq!(
+            serde_json::from_str::<StatementState>(r#""RUNNING""#).unwrap(),
+            StatementState::Running
+        );
+        assert_eq!(
+            serde_json::from_str::<StatementState>(r#""SUCCEEDED""#).unwrap(),
+            StatementState::Succeeded
+        );
+        assert_eq!(
+            serde_json::from_str::<StatementState>(r#""FAILED""#).unwrap(),
+            StatementState::Failed
+        );
+        assert_eq!(
+            serde_json::from_str::<StatementState>(r#""CANCELED""#).unwrap(),
+            StatementState::Canceled
+        );
+        assert_eq!(
+            serde_json::from_str::<StatementState>(r#""CLOSED""#).unwrap(),
+            StatementState::Closed
+        );
+    }
+
+    #[test]
+    fn test_execute_response_with_error() {
+        use models::ExecuteStatementResponse;
+
+        let json = r#"{
+            "statement_id": "stmt789",
+            "status": {
+                "state": "FAILED",
+                "error": {
+                    "error_code": "SYNTAX_ERROR",
+                    "message": "Invalid SQL syntax"
+                }
+            }
+        }"#;
+
+        let response: ExecuteStatementResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.statement_id, "stmt789");
+        assert_eq!(response.status.state, models::StatementState::Failed);
+        assert!(response.status.error.is_some());
+
+        let error = response.status.error.unwrap();
+        assert_eq!(error.error_code, Some("SYNTAX_ERROR".to_string()));
+        assert_eq!(error.message, Some("Invalid SQL syntax".to_string()));
+    }
+
+    #[test]
+    fn test_execute_response_with_external_links() {
+        use models::ExecuteStatementResponse;
+
+        let json = r#"{
+            "statement_id": "stmt999",
+            "status": { "state": "SUCCEEDED" },
+            "result": {
+                "external_links": [
+                    {
+                        "external_link": "https://s3.amazonaws.com/bucket/chunk0",
+                        "chunk_index": 0,
+                        "row_offset": 0,
+                        "row_count": 10000,
+                        "byte_count": 1048576,
+                        "expiration": "2024-12-31T23:59:59Z"
+                    }
+                ]
+            }
+        }"#;
+
+        let response: ExecuteStatementResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.statement_id, "stmt999");
+        assert_eq!(response.status.state, models::StatementState::Succeeded);
+        assert!(response.result.is_some());
+
+        let result = response.result.unwrap();
+        assert!(result.external_links.is_some());
+
+        let links = result.external_links.unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].chunk_index, 0);
+        assert_eq!(links[0].row_count, 10000);
+        assert!(links[0].external_link.contains("s3.amazonaws.com"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_statement_success() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path, body_json};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(body_json(serde_json::json!({
+                "statement": "SELECT 1",
+                "warehouse_id": "test-warehouse",
+                "wait_timeout": "10s",
+                "disposition": "INLINE_OR_EXTERNAL_LINKS",
+                "format": "ARROW_STREAM"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "01ef1234-5678-1abc-def0-123456789abc",
+                "status": {
+                    "state": "SUCCEEDED"
+                },
+                "result": {
+                    "chunk_index": 0,
+                    "row_count": 1
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let request = models::ExecuteStatementRequest {
+            statement: "SELECT 1".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let response = client.execute_statement(request).await;
+        assert!(response.is_ok());
+
+        let response = response.unwrap();
+        assert_eq!(response.statement_id, "01ef1234-5678-1abc-def0-123456789abc");
+        assert_eq!(response.status.state, models::StatementState::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn test_execute_statement_with_session() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path, body_json};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(body_json(serde_json::json!({
+                "statement": "SELECT * FROM table1",
+                "warehouse_id": "test-warehouse",
+                "session_id": "session-123",
+                "catalog": "main",
+                "schema": "default",
+                "wait_timeout": "10s",
+                "disposition": "INLINE_OR_EXTERNAL_LINKS",
+                "format": "ARROW_STREAM"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-abc",
+                "status": {
+                    "state": "RUNNING"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let request = models::ExecuteStatementRequest {
+            statement: "SELECT * FROM table1".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            session_id: Some("session-123".to_string()),
+            catalog: Some("main".to_string()),
+            schema: Some("default".to_string()),
+            ..Default::default()
+        };
+
+        let response = client.execute_statement(request).await;
+        assert!(response.is_ok());
+
+        let response = response.unwrap();
+        assert_eq!(response.statement_id, "stmt-abc");
+        assert_eq!(response.status.state, models::StatementState::Running);
+    }
+
+    #[tokio::test]
+    async fn test_execute_statement_error() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error_code": "INVALID_PARAMETER_VALUE",
+                "message": "Invalid SQL statement"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let request = models::ExecuteStatementRequest {
+            statement: "INVALID SQL".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let response = client.execute_statement(request).await;
+        assert!(response.is_err());
+
+        match response.unwrap_err() {
+            crate::error::Error::SeaApi { code, message, http_status, .. } => {
+                assert_eq!(code, "INVALID_PARAMETER_VALUE");
+                assert_eq!(message, "Invalid SQL statement");
+                assert_eq!(http_status, 400);
             }
             _ => panic!("Expected SeaApi error"),
         }

@@ -2038,8 +2038,29 @@ fn test_execute_response_deserialization() {
 ```
 
 ### Files Modified/Created
-- `driver/databricks/src/client/models.rs`
-- `driver/databricks/src/client/mod.rs` (add execute_statement)
+- `driver/databricks/src/client/models.rs` (models already defined)
+- `driver/databricks/src/client/mod.rs` (added execute_statement method)
+
+### Implementation Notes
+
+**Key Changes:**
+1. **execute_statement method**: Added to SeaClient with comprehensive documentation. The method delegates to the generic `post` method for HTTP request handling.
+2. **Request models**: All models (ExecuteStatementRequest, ExecuteStatementResponse, StatementStatus, StatementState, etc.) were already defined in models.rs and match the specification.
+3. **Default values**: Confirmed correct defaults - wait_timeout="10s", disposition="INLINE_OR_EXTERNAL_LINKS", format="ARROW_STREAM".
+4. **Serialization**: Verified #[serde(skip_serializing_if = "Option::is_none")] works correctly for optional fields.
+5. **StatementState enum**: Uses #[serde(rename_all = "SCREAMING_SNAKE_CASE")] for correct JSON mapping.
+
+**Test Coverage:**
+- 3 unit tests for request serialization (basic, defaults, skip_serializing_none)
+- 6 unit tests for response deserialization (basic, with_manifest, state_deserialization, with_error, with_external_links)
+- 3 integration tests using wiremock (success, with_session, error)
+- All 12 tests pass successfully
+
+**Behavior:**
+- execute_statement sends POST request to /api/2.0/sql/statements
+- Returns ExecuteStatementResponse with statement_id, status, and optional manifest/result
+- Error responses properly mapped to SeaApi errors
+- Optional fields correctly omitted from JSON when None
 
 ---
 
