@@ -2366,6 +2366,14 @@ Implement the Statement struct with SQL query setting and connection reference m
                        )
                    })
                }
+               OptionStatement::Other(ref k) if k == "databricks.statement.byte_limit" => {
+                   self.config.byte_limit.ok_or_else(|| {
+                       adbc_core::error::Error::with_message_and_status(
+                           "byte_limit not set",
+                           adbc_core::error::Status::NotFound,
+                       )
+                   })
+               }
                _ => Err(adbc_core::error::Error::with_message_and_status(
                    format!("Unknown option: {:?}", key),
                    adbc_core::error::Status::NotFound,
@@ -2422,6 +2430,7 @@ Implement the Statement struct with SQL query setting and connection reference m
    - `get_option_int`: Returns row_limit or byte_limit if set, NotFound if not set
    - `get_option_bytes`: Always returns NotFound (no byte options supported)
    - `get_option_double`: Always returns NotFound (no double options supported)
+   - **Rationale**: Both row_limit and byte_limit are retrievable via get_option_int() for consistency, since both can be set via set_option(). This provides symmetric read/write access to configuration values and allows applications to query the current limits applied to statements
 
 4. **SQL Query Storage:**
    - Added sql_query field to DatabricksStatement
