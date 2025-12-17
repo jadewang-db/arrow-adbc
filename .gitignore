@@ -128,3 +128,6 @@ target/
 # Meson subproject support
 /c/subprojects/*
 !/c/subprojects/*.wrap
+
+# E2E test configuration files (contain sensitive tokens)
+*.local.json

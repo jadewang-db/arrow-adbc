@@ -41,5 +41,6 @@ arrow-array = { version = ">=53.1.0, <58", default-features = false, features = 
     "ffi",
 ] }
 arrow-buffer = { version = ">=53.1.0, <58", default-features = false }
+arrow-ipc = { version = ">=53.1.0, <58", default-features = false }
 arrow-schema = { version = ">=53.1.0, <58", default-features = false }
 arrow-select = { version = ">=53.1.0, <58", default-features = false }
