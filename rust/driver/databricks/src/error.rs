@@ -54,5 +54,54 @@ pub enum Error {
     Timeout,
 }
 
+impl Error {
+    /// Convert this error to an ADBC status code
+    pub fn to_adbc_status(&self) -> adbc_core::error::Status {
+        match self {
+            Error::SeaApi { code: _, http_status, .. } => {
+                match *http_status {
+                    400 => adbc_core::error::Status::InvalidArguments,
+                    401 => adbc_core::error::Status::Unauthenticated,
+                    403 => adbc_core::error::Status::Unauthorized,
+                    404 => adbc_core::error::Status::NotFound,
+                    429 => adbc_core::error::Status::IO, // Rate limited, retryable
+                    500 => adbc_core::error::Status::Internal,
+                    503 => adbc_core::error::Status::IO, // Unavailable, retryable
+                    _ => adbc_core::error::Status::Unknown,
+                }
+            }
+            Error::Http(_) => adbc_core::error::Status::IO,
+            Error::Arrow(_) => adbc_core::error::Status::InvalidData,
+            Error::Json(_) => adbc_core::error::Status::InvalidData,
+            Error::Config(_) => adbc_core::error::Status::InvalidArguments,
+            Error::Io(_) => adbc_core::error::Status::IO,
+            Error::StatementFailed(_) => adbc_core::error::Status::Internal,
+            Error::Session(_) => adbc_core::error::Status::InvalidState,
+            Error::Timeout => adbc_core::error::Status::Timeout,
+        }
+    }
+
+    /// Check if this error is retryable
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Error::SeaApi { http_status, .. } => {
+                matches!(*http_status, 429 | 500 | 503)
+            }
+            Error::Http(e) => e.is_timeout() || e.is_connect(),
+            Error::Io(_) => true,
+            _ => false,
+        }
+    }
+}
+
+impl From<Error> for adbc_core::error::Error {
+    fn from(err: Error) -> Self {
+        adbc_core::error::Error::with_message_and_status(
+            err.to_string(),
+            err.to_adbc_status(),
+        )
+    }
+}
+
 /// Result type alias for Databricks driver operations
 pub type Result<T> = std::result::Result<T, Error>;

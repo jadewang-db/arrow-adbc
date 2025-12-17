@@ -23,7 +23,7 @@ mod client;
 mod connection;
 mod database;
 mod driver;
-mod error;
+pub mod error;
 mod fetch;
 mod options;
 mod session;
