@@ -17,6 +17,9 @@
 
 //! Database implementation for Databricks
 
+use std::sync::{Arc, Mutex};
+use tokio::runtime::Runtime;
+
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
 use adbc_core::{Database, Optionable};
@@ -30,6 +33,7 @@ use crate::options::{keys, DatabaseConfig};
 /// Creating a Database does NOT establish a network connection.
 pub struct DatabricksDatabase {
     config: DatabaseConfig,
+    runtime: Arc<Mutex<Option<Arc<Runtime>>>>,
 }
 
 impl DatabricksDatabase {
@@ -37,7 +41,47 @@ impl DatabricksDatabase {
     pub fn new() -> Self {
         Self {
             config: DatabaseConfig::default(),
+            runtime: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Get or create the Tokio runtime
+    ///
+    /// The runtime is created lazily on first connection creation and shared
+    /// across all connections from this database.
+    fn get_runtime(&self) -> Arc<Runtime> {
+        let mut guard = self.runtime.lock().expect("Failed to lock runtime mutex");
+        if guard.is_none() {
+            let rt = Runtime::new().expect("Failed to create Tokio runtime");
+            *guard = Some(Arc::new(rt));
+        }
+        guard.as_ref().unwrap().clone()
+    }
+
+    /// Validate configuration before creating connection
+    ///
+    /// Ensures that all required options are set before attempting to
+    /// create a connection.
+    fn validate_config(&self) -> Result<()> {
+        if self.config.host.is_none() {
+            return Err(Error::with_message_and_status(
+                "Missing required option: uri",
+                Status::InvalidArguments,
+            ));
+        }
+        if self.config.warehouse_id.is_none() {
+            return Err(Error::with_message_and_status(
+                "Missing required option: databricks.warehouse_id",
+                Status::InvalidArguments,
+            ));
+        }
+        if self.config.token.is_none() {
+            return Err(Error::with_message_and_status(
+                "Missing required option: databricks.token",
+                Status::InvalidArguments,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -252,16 +296,20 @@ impl Database for DatabricksDatabase {
     type ConnectionType = DatabricksConnection;
 
     fn new_connection(&self) -> Result<Self::ConnectionType> {
-        // For now, create a basic connection stub
-        // Full implementation will be in work item 1.7
-        Ok(DatabricksConnection::new())
+        self.validate_config()?;
+
+        let runtime = self.get_runtime();
+        DatabricksConnection::new(self.config.clone(), runtime)
     }
 
     fn new_connection_with_opts(
         &self,
         opts: impl IntoIterator<Item = (OptionConnection, OptionValue)>,
     ) -> Result<Self::ConnectionType> {
-        let mut conn = DatabricksConnection::new();
+        self.validate_config()?;
+
+        let runtime = self.get_runtime();
+        let mut conn = DatabricksConnection::new(self.config.clone(), runtime)?;
 
         for (key, value) in opts {
             conn.set_option(key, value)?;

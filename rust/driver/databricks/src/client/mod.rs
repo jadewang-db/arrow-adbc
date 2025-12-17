@@ -24,6 +24,7 @@ use crate::error::Result;
 use std::time::Duration;
 
 /// HTTP client for communicating with the Databricks Statement Execution API
+#[derive(Debug)]
 pub struct SeaClient {
     http_client: reqwest::Client,
     host: String,

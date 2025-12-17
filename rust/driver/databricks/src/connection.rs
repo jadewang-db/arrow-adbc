@@ -18,13 +18,18 @@
 //! Connection implementation for Databricks
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
 use adbc_core::{Connection, Optionable};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
+use tokio::runtime::Runtime;
 
+use crate::client::{SeaClient, SeaClientConfig};
+use crate::options::DatabaseConfig;
+use crate::session::SessionManager;
 use crate::statement::DatabricksStatement;
 
 /// Empty reader for stub implementations
@@ -53,17 +58,71 @@ impl RecordBatchReader for EmptyBatchReader {
 }
 
 /// Connection to a Databricks SQL Warehouse
-pub struct DatabricksConnection;
-
-impl DatabricksConnection {
-    pub fn new() -> Self {
-        Self
-    }
+///
+/// Holds the client, session manager, and runtime needed for executing
+/// SQL statements against a Databricks SQL Warehouse.
+#[derive(Debug)]
+pub struct DatabricksConnection {
+    #[allow(dead_code)]
+    client: Arc<SeaClient>,
+    session_manager: Arc<SessionManager>,
+    runtime: Arc<Runtime>,
+    #[allow(dead_code)]
+    config: DatabaseConfig,
+    #[allow(dead_code)]
+    current_catalog: Option<String>,
+    #[allow(dead_code)]
+    current_schema: Option<String>,
 }
 
-impl Default for DatabricksConnection {
-    fn default() -> Self {
-        Self::new()
+impl DatabricksConnection {
+    /// Create a new connection with the given configuration and runtime
+    ///
+    /// This will create a SEA client and session manager, and immediately
+    /// establish a session with the SQL Warehouse.
+    ///
+    /// # Arguments
+    /// * `config` - Database configuration containing connection details
+    /// * `runtime` - Tokio runtime to use for async operations
+    ///
+    /// # Errors
+    /// Returns an error if the client cannot be created or the initial
+    /// session cannot be established.
+    pub fn new(config: DatabaseConfig, runtime: Arc<Runtime>) -> Result<Self> {
+        // Create SEA client
+        let client_config = SeaClientConfig {
+            host: config.host.clone().unwrap(),
+            token: config.token.clone().unwrap(),
+            warehouse_id: config.warehouse_id.clone().unwrap(),
+            connect_timeout: config.http_config.connect_timeout,
+            read_timeout: config.http_config.read_timeout,
+        };
+
+        let client = Arc::new(
+            SeaClient::new(client_config)
+                .map_err(|e| Error::with_message_and_status(e.to_string(), Status::Internal))?,
+        );
+
+        // Create session manager
+        let session_manager = Arc::new(SessionManager::new(
+            client.clone(),
+            config.default_catalog.clone(),
+            config.default_schema.clone(),
+        ));
+
+        // Create session immediately to validate connectivity
+        let _session_id = runtime
+            .block_on(session_manager.get_session_id())
+            .map_err(|e| Error::with_message_and_status(e.to_string(), Status::Internal))?;
+
+        Ok(Self {
+            client,
+            session_manager,
+            runtime,
+            current_catalog: config.default_catalog.clone(),
+            current_schema: config.default_schema.clone(),
+            config,
+        })
     }
 }
 
@@ -185,5 +244,17 @@ impl Connection for DatabricksConnection {
     fn get_statistic_names(&self) -> Result<impl RecordBatchReader> {
         // Stub implementation - will be completed in work item 1.7
         Ok(EmptyBatchReader::new(std::sync::Arc::new(Schema::empty())))
+    }
+}
+
+impl Drop for DatabricksConnection {
+    /// Clean up the connection by terminating the session
+    ///
+    /// This ensures that server-side resources are released when the
+    /// connection is dropped.
+    fn drop(&mut self) {
+        // Attempt to terminate the session
+        // We ignore errors here since drop handlers should not panic
+        let _ = self.runtime.block_on(self.session_manager.terminate());
     }
 }

@@ -27,6 +27,7 @@ use tokio::sync::Mutex;
 /// This manager handles creating and caching session IDs for use with
 /// SQL Warehouse statements. It ensures that only one session is created
 /// per connection and handles proper cleanup when the connection is closed.
+#[derive(Debug)]
 pub struct SessionManager {
     client: Arc<SeaClient>,
     session_id: Mutex<Option<String>>,

@@ -55,13 +55,13 @@ pub fn create_test_database() -> DatabricksDatabase {
 
 /// Create a test connection from a configured database
 ///
-/// TODO: Complete implementation in Work Item 1.7 after Connection trait is fully implemented
-/// This stub will be replaced with proper initialization including:
-/// - Creating connection from database using new_connection()
-/// - Setting connection-level options if needed
-pub fn create_test_connection(_database: &DatabricksDatabase) -> DatabricksConnection {
-    // Stub implementation - will be completed when Connection trait is fully implemented
-    DatabricksConnection::new()
+/// Creates a connection using the database's new_connection() method.
+/// Panics if the connection cannot be created.
+pub fn create_test_connection(database: &DatabricksDatabase) -> DatabricksConnection {
+    use adbc_core::Database;
+    database
+        .new_connection()
+        .expect("Failed to create test connection")
 }
 
 /// Macro for conditional test execution
