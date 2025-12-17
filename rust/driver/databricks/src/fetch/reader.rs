@@ -17,8 +17,8 @@
 
 //! Arrow result reader implementation
 
-use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_schema::{ArrowError, SchemaRef};
 
 /// Reader for Arrow IPC data from Databricks
 pub struct ArrowResultReader {
@@ -30,12 +30,40 @@ pub struct ArrowResultReader {
 
 impl ArrowResultReader {
     /// Create an empty reader
-    pub fn empty(_schema: SchemaRef) -> Self {
-        todo!("ArrowResultReader::empty implementation in work item 2.7")
+    ///
+    /// This is a stub implementation that will be completed in work item 2.7.
+    /// For now, it returns an empty reader with no batches.
+    pub fn empty(schema: SchemaRef) -> Self {
+        Self {
+            schema,
+            batches: Vec::new(),
+            current_index: 0,
+            affected_rows: None,
+        }
     }
 
     /// Get the number of affected rows for DML operations
     pub fn affected_rows(&self) -> Option<i64> {
         self.affected_rows
+    }
+}
+
+impl Iterator for ArrowResultReader {
+    type Item = std::result::Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_index < self.batches.len() {
+            let batch = self.batches[self.current_index].clone();
+            self.current_index += 1;
+            Some(Ok(batch))
+        } else {
+            None
+        }
+    }
+}
+
+impl RecordBatchReader for ArrowResultReader {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 }

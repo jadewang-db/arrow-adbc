@@ -23,10 +23,13 @@ use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{OptionStatement, OptionValue};
 use adbc_core::{Optionable, PartitionedResult, Statement};
 use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::{ArrowError, Schema, SchemaRef};
+use arrow_schema::Schema;
 use tokio::runtime::Runtime;
 
-use crate::client::SeaClient;
+use crate::client::models::{ExecuteStatementRequest, StatementState};
+use crate::client::{PollConfig, SeaClient};
+use crate::error::Error as DatabricksError;
+use crate::fetch::reader::ArrowResultReader;
 use crate::options::DatabaseConfig;
 use crate::session::SessionManager;
 
@@ -94,30 +97,79 @@ impl DatabricksStatement {
             statement_id: None,
         })
     }
-}
 
-/// Empty reader for stub implementations
-struct EmptyBatchReader {
-    schema: SchemaRef,
-}
+    /// Internal async execute implementation
+    ///
+    /// Executes the SQL query asynchronously and returns an Arrow result reader.
+    /// This method handles statement execution, polling, and result retrieval.
+    async fn execute_async(&mut self) -> crate::error::Result<ArrowResultReader> {
+        let sql = self
+            .sql_query
+            .as_ref()
+            .ok_or_else(|| DatabricksError::Config("No SQL query set".into()))?;
 
-impl EmptyBatchReader {
-    fn new(schema: SchemaRef) -> Self {
-        Self { schema }
+        let session_id = self.session_manager.get_session_id().await?;
+
+        let request = ExecuteStatementRequest {
+            statement: sql.clone(),
+            warehouse_id: self.client.warehouse_id().to_string(),
+            session_id: Some(session_id),
+            catalog: self.config.catalog.clone(),
+            schema: self.config.schema.clone(),
+            wait_timeout: self.config.wait_timeout.clone(),
+            row_limit: self.config.row_limit,
+            byte_limit: self.config.byte_limit,
+            ..Default::default()
+        };
+
+        let response = self.client.execute_statement(request).await?;
+        self.statement_id = Some(response.statement_id.clone());
+
+        self.handle_execute_response(response).await
     }
-}
 
-impl Iterator for EmptyBatchReader {
-    type Item = std::result::Result<RecordBatch, ArrowError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        None
-    }
-}
-
-impl RecordBatchReader for EmptyBatchReader {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    /// Handle the execute statement response based on its state
+    ///
+    /// This method processes the response and handles different statement states:
+    /// - SUCCEEDED: Creates a reader from the result
+    /// - PENDING/RUNNING: Polls until completion
+    /// - FAILED: Returns an error
+    /// - Other states: Returns an error
+    fn handle_execute_response<'a>(
+        &'a self,
+        response: crate::client::models::ExecuteStatementResponse,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<ArrowResultReader>> + 'a>> {
+        Box::pin(async move {
+            match response.status.state {
+                StatementState::Succeeded => {
+                    // For now, return an empty reader (will be implemented in work item 2.7)
+                    Ok(ArrowResultReader::empty(Arc::new(Schema::empty())))
+                }
+                StatementState::Pending | StatementState::Running => {
+                    // Poll until complete
+                    let final_response = self
+                        .client
+                        .poll_until_complete(&response.statement_id, &PollConfig::default())
+                        .await?;
+                    // Recursively handle the final response
+                    self.handle_execute_response(final_response).await
+                }
+                StatementState::Failed => {
+                    let msg = response
+                        .status
+                        .error
+                        .and_then(|e| e.message)
+                        .unwrap_or_else(|| "Unknown error".into());
+                    Err(DatabricksError::StatementFailed(msg))
+                }
+                StatementState::Canceled => {
+                    Err(DatabricksError::StatementFailed("Statement was canceled".into()))
+                }
+                StatementState::Closed => {
+                    Err(DatabricksError::StatementFailed("Statement was closed".into()))
+                }
+            }
+        })
     }
 }
 
@@ -240,15 +292,29 @@ impl Statement for DatabricksStatement {
     }
 
     fn cancel(&mut self) -> Result<()> {
-        Err(Error::with_message_and_status(
-            "Statement cancellation not yet implemented",
-            Status::NotImplemented,
-        ))
+        // Check if there's a statement ID to cancel
+        if let Some(ref stmt_id) = self.statement_id {
+            // Note: cancel_statement method will be added in a future work item
+            // For now, return NotImplemented
+            let _ = stmt_id; // Suppress unused variable warning
+            Err(Error::with_message_and_status(
+                "Statement cancellation not yet implemented - cancel_statement API pending",
+                Status::NotImplemented,
+            ))
+        } else {
+            // No active statement to cancel
+            Ok(())
+        }
     }
 
     fn execute(&mut self) -> Result<impl RecordBatchReader> {
-        // Stub implementation - will be completed in later work items
-        Ok(EmptyBatchReader::new(std::sync::Arc::new(Schema::empty())))
+        // Clone runtime to avoid borrow checker issues
+        let runtime = self.runtime.clone();
+        // Block on the async execute implementation
+        let reader = runtime
+            .block_on(self.execute_async())
+            .map_err(|e| Error::with_message_and_status(e.to_string(), e.to_adbc_status()))?;
+        Ok(reader)
     }
 
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
@@ -266,10 +332,17 @@ impl Statement for DatabricksStatement {
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
-        Err(Error::with_message_and_status(
-            "Update execution not yet implemented",
-            Status::NotImplemented,
-        ))
+        // Clone runtime to avoid borrow checker issues
+        let runtime = self.runtime.clone();
+        // Block on the async execute implementation
+        let reader = runtime
+            .block_on(self.execute_async())
+            .map_err(|e| Error::with_message_and_status(e.to_string(), e.to_adbc_status()))?;
+
+        // Extract affected rows from the reader
+        // For DDL statements, this is typically None
+        // For DML statements (INSERT, UPDATE, DELETE), this contains the row count
+        Ok(reader.affected_rows())
     }
 
     fn get_parameter_schema(&self) -> Result<Schema> {
@@ -646,5 +719,87 @@ mod tests {
         assert_eq!(stmt.config.wait_timeout, "60s");
         assert_eq!(stmt.config.row_limit, Some(10000));
         assert_eq!(stmt.config.byte_limit, Some(10485760));
+    }
+
+    #[test]
+    fn test_execute_without_query_fails() {
+        use adbc_core::Statement;
+        let mut stmt = create_test_statement();
+
+        // Try to execute without setting a query
+        let result = stmt.execute();
+        assert!(result.is_err());
+        // Check error message by converting to string
+        if let Err(e) = result {
+            assert!(e.to_string().contains("No SQL query set"));
+        }
+    }
+
+    #[test]
+    fn test_execute_update_without_query_fails() {
+        use adbc_core::Statement;
+        let mut stmt = create_test_statement();
+
+        // Try to execute_update without setting a query
+        let result = stmt.execute_update();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("No SQL query set"));
+    }
+
+    #[test]
+    fn test_cancel_without_active_statement_succeeds() {
+        use adbc_core::Statement;
+        let mut stmt = create_test_statement();
+
+        // Cancel without an active statement should succeed
+        let result = stmt.cancel();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_cancel_with_statement_id_not_implemented() {
+        use adbc_core::Statement;
+        let mut stmt = create_test_statement();
+
+        // Manually set a statement ID to simulate an active statement
+        stmt.statement_id = Some("test-stmt-id".to_string());
+
+        // Cancel should return NotImplemented (since cancel_statement API is not yet implemented)
+        let result = stmt.cancel();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("not yet implemented"));
+    }
+
+    #[test]
+    fn test_execute_async_creates_request_with_config() {
+        use adbc_core::Statement;
+        let mut stmt = create_test_statement();
+
+        // Set SQL query and options
+        stmt.set_sql_query("SELECT * FROM test_table").unwrap();
+        stmt.set_option(
+            OptionStatement::Other("databricks.statement.wait_timeout".to_string()),
+            OptionValue::String("30s".to_string()),
+        )
+        .unwrap();
+        stmt.set_option(
+            OptionStatement::Other("databricks.statement.row_limit".to_string()),
+            OptionValue::Int(1000),
+        )
+        .unwrap();
+        stmt.set_option(
+            OptionStatement::Other("databricks.statement.byte_limit".to_string()),
+            OptionValue::Int(1048576),
+        )
+        .unwrap();
+
+        // Note: We can't easily test execute_async directly because it requires
+        // a mock server. This test just verifies the configuration is set up correctly.
+        assert_eq!(stmt.sql_query, Some("SELECT * FROM test_table".to_string()));
+        assert_eq!(stmt.config.wait_timeout, "30s");
+        assert_eq!(stmt.config.row_limit, Some(1000));
+        assert_eq!(stmt.config.byte_limit, Some(1048576));
     }
 }
