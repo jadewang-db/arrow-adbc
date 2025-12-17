@@ -242,11 +242,12 @@ impl Connection for DatabricksConnection {
     type StatementType = DatabricksStatement;
 
     fn new_statement(&mut self) -> Result<Self::StatementType> {
-        Ok(DatabricksStatement::new(
+        DatabricksStatement::new(
             self.client.clone(),
             self.session_manager.clone(),
             self.runtime.clone(),
-        ))
+            &self.config,
+        )
     }
 
     fn cancel(&mut self) -> Result<()> {
