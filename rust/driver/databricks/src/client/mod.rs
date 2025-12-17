@@ -334,6 +334,41 @@ impl SeaClient {
     pub async fn get_statement(&self, statement_id: &str) -> Result<models::ExecuteStatementResponse> {
         self.get(&self.statement_url(statement_id)).await
     }
+
+    /// Get chunk with refreshed external links
+    ///
+    /// Retrieves refreshed external links for a specific chunk when the original presigned URLs expire.
+    /// This is used by the ChunkFetcher to refresh expired URLs (403 Forbidden responses).
+    ///
+    /// # Arguments
+    /// * `statement_id` - The statement ID
+    /// * `chunk_index` - The index of the chunk to refresh (0-based)
+    ///
+    /// # Returns
+    /// * `GetChunkResponse` - Response containing refreshed external links with new expiration times
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use adbc_driver_databricks::client::{SeaClient, SeaClientConfig};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let client = SeaClient::new(SeaClientConfig::default())?;
+    /// let chunk = client.get_chunk("stmt-id", 0).await?;
+    /// assert!(!chunk.external_links.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_chunk(
+        &self,
+        statement_id: &str,
+        chunk_index: i32,
+    ) -> Result<models::GetChunkResponse> {
+        let url = format!(
+            "{}/result/chunks/{}",
+            self.statement_url(statement_id),
+            chunk_index
+        );
+        self.get(&url).await
+    }
 }
 
 /// Configuration for statement polling
@@ -1101,6 +1136,238 @@ mod tests {
         assert_eq!(links[0].chunk_index, 0);
         assert_eq!(links[0].row_count, 10000);
         assert!(links[0].external_link.contains("s3.amazonaws.com"));
+    }
+
+    // === get_chunk Tests ===
+
+    #[tokio::test]
+    async fn test_get_chunk_success() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-123/result/chunks/0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "external_links": [
+                    {
+                        "external_link": "https://s3.amazonaws.com/bucket/chunk0?refreshed=true",
+                        "chunk_index": 0,
+                        "row_offset": 0,
+                        "row_count": 10000,
+                        "byte_count": 1048576,
+                        "expiration": "2025-12-31T23:59:59Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let response = client.get_chunk("stmt-123", 0).await;
+
+        assert!(response.is_ok());
+        let response = response.unwrap();
+        assert_eq!(response.external_links.len(), 1);
+        assert_eq!(response.external_links[0].chunk_index, 0);
+        assert_eq!(response.external_links[0].row_count, 10000);
+        assert!(response.external_links[0].external_link.contains("refreshed=true"));
+        assert_eq!(response.external_links[0].expiration, "2025-12-31T23:59:59Z");
+    }
+
+    #[tokio::test]
+    async fn test_get_chunk_multiple_links() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-456/result/chunks/5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "external_links": [
+                    {
+                        "external_link": "https://s3.amazonaws.com/bucket/chunk5_part0",
+                        "chunk_index": 5,
+                        "row_offset": 50000,
+                        "row_count": 5000,
+                        "byte_count": 524288,
+                        "expiration": "2025-12-31T23:59:59Z"
+                    },
+                    {
+                        "external_link": "https://s3.amazonaws.com/bucket/chunk5_part1",
+                        "chunk_index": 5,
+                        "row_offset": 55000,
+                        "row_count": 5000,
+                        "byte_count": 524288,
+                        "expiration": "2025-12-31T23:59:59Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let response = client.get_chunk("stmt-456", 5).await;
+
+        assert!(response.is_ok());
+        let response = response.unwrap();
+        assert_eq!(response.external_links.len(), 2);
+        assert_eq!(response.external_links[0].chunk_index, 5);
+        assert_eq!(response.external_links[1].chunk_index, 5);
+        assert_eq!(response.external_links[0].row_offset, 50000);
+        assert_eq!(response.external_links[1].row_offset, 55000);
+    }
+
+    #[tokio::test]
+    async fn test_get_chunk_not_found() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-invalid/result/chunks/999"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error_code": "NOT_FOUND",
+                "message": "Chunk not found or statement does not exist"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let response = client.get_chunk("stmt-invalid", 999).await;
+
+        assert!(response.is_err());
+        match response.unwrap_err() {
+            crate::error::Error::SeaApi { code, message, http_status, .. } => {
+                assert_eq!(code, "NOT_FOUND");
+                assert_eq!(message, "Chunk not found or statement does not exist");
+                assert_eq!(http_status, 404);
+            }
+            _ => panic!("Expected SeaApi error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_chunk_invalid_chunk_index() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-789/result/chunks/100"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error_code": "INVALID_PARAMETER_VALUE",
+                "message": "Chunk index 100 exceeds total_chunk_count 10"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let response = client.get_chunk("stmt-789", 100).await;
+
+        assert!(response.is_err());
+        match response.unwrap_err() {
+            crate::error::Error::SeaApi { code, message, http_status, .. } => {
+                assert_eq!(code, "INVALID_PARAMETER_VALUE");
+                assert!(message.contains("exceeds total_chunk_count"));
+                assert_eq!(http_status, 400);
+            }
+            _ => panic!("Expected SeaApi error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_chunk_url_construction() {
+        let config = SeaClientConfig {
+            host: "https://workspace.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+
+        // Test URL construction with different chunk indices
+        let statement_id = "01ef1234-5678-1abc-def0-123456789abc";
+
+        // This test verifies the URL is constructed correctly
+        // The URL should be: {base_url}/statements/{statement_id}/result/chunks/{chunk_index}
+        let base_url = client.statement_url(statement_id);
+        assert_eq!(
+            base_url,
+            "https://workspace.cloud.databricks.com/api/2.0/sql/statements/01ef1234-5678-1abc-def0-123456789abc"
+        );
+
+        // For chunk 0
+        let expected_chunk_0_url = format!("{}/result/chunks/0", base_url);
+        assert_eq!(
+            expected_chunk_0_url,
+            "https://workspace.cloud.databricks.com/api/2.0/sql/statements/01ef1234-5678-1abc-def0-123456789abc/result/chunks/0"
+        );
+
+        // For chunk 42
+        let expected_chunk_42_url = format!("{}/result/chunks/42", base_url);
+        assert_eq!(
+            expected_chunk_42_url,
+            "https://workspace.cloud.databricks.com/api/2.0/sql/statements/01ef1234-5678-1abc-def0-123456789abc/result/chunks/42"
+        );
+    }
+
+    #[test]
+    fn test_get_chunk_response_deserialization() {
+        use models::GetChunkResponse;
+
+        let json = r#"{
+            "external_links": [
+                {
+                    "external_link": "https://s3.amazonaws.com/bucket/chunk0",
+                    "chunk_index": 0,
+                    "row_offset": 0,
+                    "row_count": 10000,
+                    "byte_count": 1048576,
+                    "expiration": "2025-12-31T23:59:59Z"
+                }
+            ]
+        }"#;
+
+        let response: GetChunkResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.external_links.len(), 1);
+        assert_eq!(response.external_links[0].chunk_index, 0);
+        assert_eq!(response.external_links[0].row_count, 10000);
+        assert_eq!(response.external_links[0].byte_count, 1048576);
+        assert_eq!(response.external_links[0].expiration, "2025-12-31T23:59:59Z");
     }
 
     #[tokio::test]

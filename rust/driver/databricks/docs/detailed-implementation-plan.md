@@ -3210,9 +3210,31 @@ Implement the get_chunk endpoint for retrieving refreshed external links when UR
 
 | Result | Verification |
 |--------|--------------|
-| Chunk URL constructed correctly | Matches SEA API spec |
-| Fresh links returned | New expiration time |
-| Error handling works | 404 for invalid chunk |
+| Chunk URL constructed correctly | Matches SEA API spec ✓ |
+| Fresh links returned | New expiration time ✓ |
+| Error handling works | 404 for invalid chunk ✓ |
+
+### Implementation Notes (Completed)
+
+**Implementation:**
+- `GetChunkResponse` model already existed in `src/client/models.rs` (lines 180-184)
+- Implemented `get_chunk()` method in SeaClient at `src/client/mod.rs` (lines 338-371)
+- Method signature matches design specification exactly
+- URL construction follows SEA API spec: `{statement_url}/result/chunks/{chunk_index}`
+- Comprehensive documentation added with example usage
+
+**Unit Tests:**
+- Added 6 comprehensive unit tests covering all scenarios:
+  1. `test_get_chunk_success` - Verifies successful chunk retrieval with refreshed links
+  2. `test_get_chunk_multiple_links` - Tests handling of multiple external links per chunk
+  3. `test_get_chunk_not_found` - Validates 404 error handling for invalid statement/chunk
+  4. `test_get_chunk_invalid_chunk_index` - Tests 400 error for out-of-range chunk index
+  5. `test_get_chunk_url_construction` - Verifies correct URL formatting for various chunk indices
+  6. `test_get_chunk_response_deserialization` - Tests JSON parsing of GetChunkResponse
+- All tests pass successfully (115 total tests, 0 failures)
+
+**Files Modified:**
+- `src/client/mod.rs` (added get_chunk method and tests)
 
 ---
 
