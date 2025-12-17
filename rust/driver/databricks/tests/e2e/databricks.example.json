@@ -1,0 +1,15 @@
+{
+  "environment": "Databricks",
+  "uri": "https://your-workspace.cloud.databricks.com/sql/1.0/warehouses/YOUR_WAREHOUSE_ID",
+  "token": "dapi...",
+  "query": "select count(*) from `main`.`your_schema`.`your_table`",
+  "type": "databricks",
+  "trace": "true",
+  "expectedResults": 1,
+  "metadata": {
+    "catalog": "main",
+    "schema": "your_schema",
+    "table": "your_table",
+    "expectedColumnCount": 3
+  }
+}
