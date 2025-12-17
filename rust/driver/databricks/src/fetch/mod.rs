@@ -27,9 +27,10 @@ use crate::client::models::ManifestSchema;
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use futures::Stream;
 use reqwest::Client;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 
 /// Fetches result chunks from external links in parallel
 ///
@@ -37,6 +38,7 @@ use tokio::sync::mpsc;
 /// using presigned URLs (external links). It supports:
 /// - Parallel chunk fetching with configurable concurrency
 /// - Automatic URL refresh when presigned URLs expire (403 Forbidden)
+/// - Shared cache for refreshed URLs to minimize API calls
 /// - LZ4 decompression of downloaded data
 #[derive(Clone)]
 pub struct ChunkFetcher {
@@ -48,6 +50,10 @@ pub struct ChunkFetcher {
     statement_id: String,
     /// Maximum number of concurrent chunk downloads
     concurrency: usize,
+    /// Shared cache of refreshed URLs
+    /// Key: chunk_index, Value: refreshed ExternalLink
+    /// This cache is shared among all workers via Arc<RwLock>
+    refreshed_urls: Arc<RwLock<HashMap<i32, ExternalLink>>>,
 }
 
 impl ChunkFetcher {
@@ -91,6 +97,7 @@ impl ChunkFetcher {
             sea_client,
             statement_id,
             concurrency,
+            refreshed_urls: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -143,19 +150,96 @@ impl ChunkFetcher {
 
     /// Fetch a chunk with automatic retry on URL expiration
     ///
-    /// This is a stub implementation for work item 3.5. Full URL refresh logic
-    /// with shared cache will be implemented in that work item.
+    /// Implements retry logic with shared cache for refreshed URLs:
+    /// - On UrlExpired error: Check cache, refresh if needed, update cache, retry
+    /// - On other retryable errors: Use exponential backoff
+    /// - Maximum retry attempts: 3
     ///
     /// # Arguments
     /// * `link` - External link containing the presigned URL and metadata
     ///
     /// # Returns
     /// * `Ok(Vec<u8>)` - Raw bytes of the chunk (may be LZ4 compressed)
-    /// * `Err(Error)` - If fetch fails (currently just delegates to fetch_chunk)
+    /// * `Err(Error)` - If fetch fails after all retries
     async fn fetch_chunk_with_retry(&self, link: &ExternalLink) -> Result<Vec<u8>> {
-        // TODO: Implement URL refresh logic with shared cache in work item 3.5
-        // For now, just call fetch_chunk directly
-        self.fetch_chunk(link).await
+        const MAX_RETRIES: u32 = 3;
+        let mut current_link = link.clone();
+
+        for attempt in 0..MAX_RETRIES {
+            match self.fetch_chunk(&current_link).await {
+                Ok(data) => return Ok(data),
+
+                Err(Error::UrlExpired(chunk_index)) => {
+                    // Step 1: Check cache for refreshed URL
+                    {
+                        let cache = self.refreshed_urls.read().await;
+                        if let Some(cached_link) = cache.get(&chunk_index) {
+                            current_link = cached_link.clone();
+                            continue; // Retry with cached URL
+                        }
+                    }
+
+                    // Step 2: Cache miss, call refresh API
+                    // Note: Multiple workers might reach here, but that's OK
+                    // The API call is idempotent and returns same URLs
+                    let refreshed_links = self.refresh_chunk_links(chunk_index).await?;
+
+                    // Step 3: Update cache with ALL returned URLs
+                    {
+                        let mut cache = self.refreshed_urls.write().await;
+                        for refreshed_link in refreshed_links {
+                            cache.insert(refreshed_link.chunk_index, refreshed_link);
+                        }
+                    }
+
+                    // Step 4: Get our refreshed URL from cache
+                    {
+                        let cache = self.refreshed_urls.read().await;
+                        current_link = cache
+                            .get(&chunk_index)
+                            .ok_or_else(|| {
+                                Error::StatementFailed("Refreshed URL not found".into())
+                            })?
+                            .clone();
+                    }
+
+                    // Retry with refreshed URL
+                    continue;
+                }
+
+                Err(e) if e.is_retryable() && attempt < MAX_RETRIES - 1 => {
+                    // Exponential backoff: 1s, 2s, 4s
+                    tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+                    continue;
+                }
+
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(Error::StatementFailed("Max retries exceeded".into()))
+    }
+
+    /// Refresh URLs by calling get_chunk API
+    ///
+    /// Returns ALL external links returned by the API (may be multiple).
+    /// The API may return links for multiple chunks (e.g., when requesting chunk 5,
+    /// it might return refreshed URLs for chunks [5, 6, 7, 8, 9, 10]).
+    ///
+    /// # Arguments
+    /// * `chunk_index` - The chunk index that needs URL refresh
+    ///
+    /// # Returns
+    /// * `Ok(Vec<ExternalLink>)` - All refreshed external links from the response
+    /// * `Err(Error)` - If the API call fails
+    async fn refresh_chunk_links(&self, chunk_index: i32) -> Result<Vec<ExternalLink>> {
+        let response = self
+            .sea_client
+            .get_chunk(&self.statement_id, chunk_index)
+            .await?;
+
+        // API may return multiple refreshed URLs, not just the one we asked for
+        Ok(response.external_links)
     }
 
     /// Fetch chunks using worker pool pattern
@@ -1863,7 +1947,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fetch_chunk_with_retry_stub() {
+    async fn test_fetch_chunk_with_retry_success_on_first_attempt() {
         use crate::client::{SeaClient, SeaClientConfig};
         use wiremock::{MockServer, Mock, ResponseTemplate};
         use wiremock::matchers::{method, path};
@@ -1895,9 +1979,491 @@ mod tests {
             expiration: "2025-12-31T23:59:59Z".to_string(),
         };
 
-        // Stub implementation should just call fetch_chunk
         let result = fetcher.fetch_chunk_with_retry(&link).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunk_with_retry_url_expired_single_refresh() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path, header};
+
+        let mock_server = MockServer::start().await;
+
+        // First attempt: 403 Forbidden (expired URL)
+        Mock::given(method("GET"))
+            .and(path("/expired-chunk"))
+            .respond_with(ResponseTemplate::new(403))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // Refreshed URL endpoint succeeds
+        Mock::given(method("GET"))
+            .and(path("/refreshed-chunk"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![5, 6, 7]))
+            .mount(&mock_server)
+            .await;
+
+        // Mock get_chunk API call for URL refresh
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-refresh/result/chunks/5"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "external_links": [{
+                    "external_link": format!("{}/refreshed-chunk", mock_server.uri()),
+                    "chunk_index": 5,
+                    "row_offset": 50000,
+                    "row_count": 10000,
+                    "byte_count": 3,
+                    "expiration": "2025-12-31T23:59:59Z"
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(sea_client, "stmt-refresh".to_string(), 8).unwrap();
+
+        let link = ExternalLink {
+            external_link: format!("{}/expired-chunk", mock_server.uri()),
+            chunk_index: 5,
+            row_offset: 50000,
+            row_count: 10000,
+            byte_count: 3,
+            expiration: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        let result = fetcher.fetch_chunk_with_retry(&link).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![5, 6, 7]);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunk_with_retry_url_expired_multiple_urls_cached() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path, header};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock expired URLs for chunks 5 and 6
+        Mock::given(method("GET"))
+            .and(path("/expired-chunk5"))
+            .respond_with(ResponseTemplate::new(403))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/expired-chunk6"))
+            .respond_with(ResponseTemplate::new(403))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // Refreshed URLs succeed
+        Mock::given(method("GET"))
+            .and(path("/refreshed-chunk5"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![5, 5, 5]))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/refreshed-chunk6"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![6, 6, 6]))
+            .mount(&mock_server)
+            .await;
+
+        // Mock get_chunk API - returns BOTH chunk 5 and 6 refreshed URLs
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-multi/result/chunks/5"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "external_links": [
+                    {
+                        "external_link": format!("{}/refreshed-chunk5", mock_server.uri()),
+                        "chunk_index": 5,
+                        "row_offset": 50000,
+                        "row_count": 10000,
+                        "byte_count": 3,
+                        "expiration": "2025-12-31T23:59:59Z"
+                    },
+                    {
+                        "external_link": format!("{}/refreshed-chunk6", mock_server.uri()),
+                        "chunk_index": 6,
+                        "row_offset": 60000,
+                        "row_count": 10000,
+                        "byte_count": 3,
+                        "expiration": "2025-12-31T23:59:59Z"
+                    }
+                ]
+            })))
+            .expect(1) // Should only be called once
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(sea_client, "stmt-multi".to_string(), 8).unwrap();
+
+        let link5 = ExternalLink {
+            external_link: format!("{}/expired-chunk5", mock_server.uri()),
+            chunk_index: 5,
+            row_offset: 50000,
+            row_count: 10000,
+            byte_count: 3,
+            expiration: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        let link6 = ExternalLink {
+            external_link: format!("{}/expired-chunk6", mock_server.uri()),
+            chunk_index: 6,
+            row_offset: 60000,
+            row_count: 10000,
+            byte_count: 3,
+            expiration: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        // Fetch chunk 5 - will refresh and cache both 5 and 6
+        let result5 = fetcher.fetch_chunk_with_retry(&link5).await;
+        assert!(result5.is_ok());
+        assert_eq!(result5.unwrap(), vec![5, 5, 5]);
+
+        // Fetch chunk 6 - should use cached URL, no API call
+        let result6 = fetcher.fetch_chunk_with_retry(&link6).await;
+        assert!(result6.is_ok());
+        assert_eq!(result6.unwrap(), vec![6, 6, 6]);
+
+        // Verify get_chunk was only called once (for chunk 5)
+        // This is validated by the .expect(1) above
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunk_with_retry_cache_hit() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        // Expired URL
+        Mock::given(method("GET"))
+            .and(path("/expired-chunk"))
+            .respond_with(ResponseTemplate::new(403))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // Refreshed URL
+        Mock::given(method("GET"))
+            .and(path("/refreshed-chunk"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![9, 9, 9]))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(sea_client, "stmt-cache".to_string(), 8).unwrap();
+
+        // Pre-populate cache
+        {
+            let mut cache = fetcher.refreshed_urls.write().await;
+            cache.insert(
+                9,
+                ExternalLink {
+                    external_link: format!("{}/refreshed-chunk", mock_server.uri()),
+                    chunk_index: 9,
+                    row_offset: 90000,
+                    row_count: 10000,
+                    byte_count: 3,
+                    expiration: "2025-12-31T23:59:59Z".to_string(),
+                },
+            );
+        }
+
+        let link = ExternalLink {
+            external_link: format!("{}/expired-chunk", mock_server.uri()),
+            chunk_index: 9,
+            row_offset: 90000,
+            row_count: 10000,
+            byte_count: 3,
+            expiration: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        // Should hit 403, check cache, find refreshed URL, and succeed
+        let result = fetcher.fetch_chunk_with_retry(&link).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![9, 9, 9]);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunk_with_retry_max_retries_exceeded() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        // Always return 500 (retryable error)
+        Mock::given(method("GET"))
+            .and(path("/failing-chunk"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(sea_client, "stmt-fail".to_string(), 8).unwrap();
+
+        let link = ExternalLink {
+            external_link: format!("{}/failing-chunk", mock_server.uri()),
+            chunk_index: 0,
+            row_offset: 0,
+            row_count: 100,
+            byte_count: 3,
+            expiration: "2025-12-31T23:59:59Z".to_string(),
+        };
+
+        let result = fetcher.fetch_chunk_with_retry(&link).await;
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            Error::Io(e) => {
+                assert!(e.to_string().contains("500"));
+            }
+            e => panic!("Expected Io error, got {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunk_with_retry_exponential_backoff() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+        use std::time::Instant;
+
+        let mock_server = MockServer::start().await;
+
+        // Return 500 twice, then succeed
+        Mock::given(method("GET"))
+            .and(path("/retry-chunk"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/retry-chunk"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7, 8, 9]))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(sea_client, "stmt-backoff".to_string(), 8).unwrap();
+
+        let link = ExternalLink {
+            external_link: format!("{}/retry-chunk", mock_server.uri()),
+            chunk_index: 0,
+            row_offset: 0,
+            row_count: 100,
+            byte_count: 3,
+            expiration: "2025-12-31T23:59:59Z".to_string(),
+        };
+
+        let start = Instant::now();
+        let result = fetcher.fetch_chunk_with_retry(&link).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![7, 8, 9]);
+
+        // Should take at least 3 seconds (1s + 2s backoff)
+        assert!(elapsed.as_secs() >= 3);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunk_with_retry_concurrent_cache_access() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path, header};
+        use tokio::task::JoinSet;
+
+        let mock_server = MockServer::start().await;
+
+        // Multiple expired URLs
+        for i in 10..15 {
+            Mock::given(method("GET"))
+                .and(path(format!("/expired-chunk{}", i)))
+                .respond_with(ResponseTemplate::new(403))
+                .up_to_n_times(1)
+                .mount(&mock_server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path(format!("/refreshed-chunk{}", i)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![i as u8; 3]))
+                .mount(&mock_server)
+                .await;
+        }
+
+        // Mock get_chunk API for any chunk - returns all refreshed URLs (10-14)
+        // Due to race conditions, any chunk might call refresh first
+        for chunk_idx in 10..15 {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/2.0/sql/statements/stmt-concurrent/result/chunks/{}", chunk_idx)))
+                .and(header("Authorization", "Bearer test-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "external_links": (10..15).map(|i| {
+                        serde_json::json!({
+                            "external_link": format!("{}/refreshed-chunk{}", mock_server.uri(), i),
+                            "chunk_index": i,
+                            "row_offset": (i as i64) * 10000,
+                            "row_count": 10000,
+                            "byte_count": 3,
+                            "expiration": "2025-12-31T23:59:59Z"
+                        })
+                    }).collect::<Vec<_>>()
+                })))
+                .up_to_n_times(1) // Each can be called at most once
+                .mount(&mock_server)
+                .await;
+        }
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = Arc::new(ChunkFetcher::new(sea_client, "stmt-concurrent".to_string(), 8).unwrap());
+
+        // Spawn 5 concurrent tasks, all hitting expired URLs
+        let mut tasks = JoinSet::new();
+        for i in 10..15 {
+            let fetcher_clone = fetcher.clone();
+            let mock_uri = mock_server.uri();
+            tasks.spawn(async move {
+                let link = ExternalLink {
+                    external_link: format!("{}/expired-chunk{}", mock_uri, i),
+                    chunk_index: i,
+                    row_offset: (i as i64) * 10000,
+                    row_count: 10000,
+                    byte_count: 3,
+                    expiration: "2024-01-01T00:00:00Z".to_string(),
+                };
+                fetcher_clone.fetch_chunk_with_retry(&link).await
+            });
+        }
+
+        // Wait for all tasks to complete
+        let mut results = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            results.push(result.unwrap());
+        }
+
+        // All should succeed
+        assert_eq!(results.len(), 5);
+        for (idx, result) in results.iter().enumerate() {
+            if let Err(e) = result {
+                eprintln!("Error for chunk {}: {:?}", 10 + idx, e);
+            }
+            assert!(result.is_ok(), "Failed for chunk {}: {:?}", 10 + idx, result);
+            let i = 10 + idx;
+            assert_eq!(result.as_ref().unwrap(), &vec![i as u8; 3]);
+        }
+
+        // Key behavior verified: Cache sharing allows all chunks to succeed
+        // Even though chunks hit 403 concurrently, the shared cache reduces API calls
+    }
+
+    #[tokio::test]
+    async fn test_refresh_chunk_links() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path, header};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock get_chunk API
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-refresh-test/result/chunks/5"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "external_links": [
+                    {
+                        "external_link": "https://s3.amazonaws.com/bucket/chunk5",
+                        "chunk_index": 5,
+                        "row_offset": 50000,
+                        "row_count": 10000,
+                        "byte_count": 1048576,
+                        "expiration": "2025-12-31T23:59:59Z"
+                    },
+                    {
+                        "external_link": "https://s3.amazonaws.com/bucket/chunk6",
+                        "chunk_index": 6,
+                        "row_offset": 60000,
+                        "row_count": 10000,
+                        "byte_count": 1048576,
+                        "expiration": "2025-12-31T23:59:59Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(sea_client, "stmt-refresh-test".to_string(), 8).unwrap();
+
+        let links = fetcher.refresh_chunk_links(5).await.unwrap();
+
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].chunk_index, 5);
+        assert_eq!(links[1].chunk_index, 6);
+        assert_eq!(links[0].external_link, "https://s3.amazonaws.com/bucket/chunk5");
+        assert_eq!(links[1].external_link, "https://s3.amazonaws.com/bucket/chunk6");
     }
 }

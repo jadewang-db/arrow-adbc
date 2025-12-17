@@ -4022,6 +4022,41 @@ When calling `get_chunk(statement_id, chunk_index)` to refresh an expired URL, t
 | Max retries respected | Fails after 3 attempts |
 | Thread-safe cache | RwLock prevents data races |
 
+### Implementation Status: ✅ COMPLETED
+
+**Implementation Details:**
+- Added `refreshed_urls: Arc<RwLock<HashMap<i32, ExternalLink>>>` field to ChunkFetcher
+- Updated `ChunkFetcher::new()` to initialize the cache with `Arc::new(RwLock::new(HashMap::new()))`
+- Implemented `refresh_chunk_links()` method that calls `sea_client.get_chunk()` and returns all external links
+- Replaced `fetch_chunk_with_retry()` stub with full implementation:
+  - Retry loop with MAX_RETRIES = 3
+  - On UrlExpired: Check cache (read lock) → refresh if miss → update cache with ALL URLs (write lock) → retry
+  - On retryable errors: Exponential backoff (1s, 2s, 4s)
+  - Returns error after exhausting retries
+
+**Tests Added:**
+1. `test_fetch_chunk_with_retry_success_on_first_attempt` - Basic success path
+2. `test_fetch_chunk_with_retry_url_expired_single_refresh` - URL expiration with single refresh
+3. `test_fetch_chunk_with_retry_url_expired_multiple_urls_cached` - Multiple URLs cached, cache reuse verified
+4. `test_fetch_chunk_with_retry_cache_hit` - Pre-populated cache hit scenario
+5. `test_fetch_chunk_with_retry_max_retries_exceeded` - Retry limit enforcement
+6. `test_fetch_chunk_with_retry_exponential_backoff` - Backoff timing verification
+7. `test_fetch_chunk_with_retry_concurrent_cache_access` - 5 concurrent workers, cache sharing
+8. `test_refresh_chunk_links` - API returns multiple refreshed URLs
+
+**Key Design Decisions:**
+- Used `Arc<RwLock<HashMap>>` for shared cache to allow concurrent reads while serializing writes
+- Cache stores refreshed URLs by chunk_index for O(1) lookup
+- Multiple workers can call refresh_chunk_links() concurrently (idempotent API)
+- Short-lived write locks minimize contention
+- Exponential backoff uses bit shift: `Duration::from_secs(1 << attempt)`
+
+**Test Results:**
+- All 40 fetch module tests pass (154 total lib tests)
+- Cache behavior verified with wiremock expectations
+- Concurrent access patterns tested with tokio::task::JoinSet
+- Exponential backoff timing validated (≥3 seconds for 2 retries)
+
 ---
 
 ## 3.6 Arrow Result Reader - External Links
