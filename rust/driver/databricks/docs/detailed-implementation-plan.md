@@ -2393,6 +2393,73 @@ Implement the Statement struct with SQL query setting and connection reference m
 
 ### Files Modified/Created
 - `driver/databricks/src/statement.rs`
+- `driver/databricks/src/connection.rs`
+
+### Implementation Notes (Work Item 2.5 - Completed)
+
+**Status:** ✅ Completed
+
+**Commit:** `f1b9540179933bfce01c5151e853114189b6add3`
+
+**Key Implementation Details:**
+
+1. **StatementConfig Structure:**
+   - Added all required fields: wait_timeout, row_limit, byte_limit, catalog, schema, fetch_concurrency
+   - Default wait_timeout is "10s"
+   - Inherits catalog, schema, and fetch_concurrency from DatabaseConfig
+
+2. **Optionable Trait Implementation:**
+   - Implemented set_option for three custom options:
+     * `databricks.statement.wait_timeout` (String)
+     * `databricks.statement.row_limit` (Int)
+     * `databricks.statement.byte_limit` (Int)
+   - Manual pattern matching for OptionValue conversion (no TryFrom implementation exists)
+   - Type validation ensures correct types for each option
+   - Unknown options return NotImplemented error
+
+3. **get_option Methods:**
+   - `get_option_string`: Returns wait_timeout
+   - `get_option_int`: Returns row_limit or byte_limit if set, NotFound if not set
+   - `get_option_bytes`: Always returns NotFound (no byte options supported)
+   - `get_option_double`: Always returns NotFound (no double options supported)
+
+4. **SQL Query Storage:**
+   - Added sql_query field to DatabricksStatement
+   - Implemented set_sql_query to store query string
+   - Can be updated multiple times
+
+5. **Connection Integration:**
+   - Updated DatabricksConnection::new_statement to pass DatabaseConfig
+   - Statement now receives database-level defaults for catalog, schema, and fetch_concurrency
+
+6. **Testing:**
+   - Added 17 comprehensive unit tests
+   - Test coverage includes:
+     * Config inheritance from DatabaseConfig
+     * Setting and getting all three options
+     * Type validation for each option
+     * Unknown option handling
+     * SQL query storage and updates
+     * Multiple options set together
+   - All 80 unit tests pass
+   - All integration tests pass
+
+**Key Decisions:**
+
+1. **OptionValue Conversion:** Used manual pattern matching (similar to database.rs) since adbc_core doesn't provide TryFrom implementations for OptionValue.
+
+2. **Error Status Codes:**
+   - Unknown/unsupported options: `Status::NotImplemented`
+   - Option not set (for int options): `Status::NotFound`
+   - No byte/double options: `Status::NotFound`
+
+3. **byte_limit Retrieval:** Added support for retrieving byte_limit via get_option_int (same as row_limit), which wasn't explicitly mentioned in the planning doc but is consistent and useful.
+
+4. **Test Helper:** Created comprehensive test helper function that properly initializes all components (SeaClient, SessionManager, Runtime) with correct signatures.
+
+**Files Changed:**
+- `src/statement.rs`: +479 lines (implementation + tests)
+- `src/connection.rs`: +4 lines (pass DatabaseConfig to statement)
 
 ---
 
