@@ -3309,6 +3309,49 @@ fn test_is_lz4_compressed() {
 }
 ```
 
+### Implementation Notes (Completed)
+
+**Implementation:**
+- Implemented `decompress_lz4()` function in `src/fetch/decompress.rs` using `lz4_flex::frame::FrameDecoder`
+- Function signature matches design specification exactly
+- Uses `FrameDecoder::new()` with `read_to_end()` for streaming decompression
+- Proper error handling for corrupt data and invalid formats
+- Added comprehensive documentation with examples
+
+**Functions Implemented:**
+1. `decompress_lz4(compressed: &[u8]) -> Result<Vec<u8>>` - Decompresses LZ4_FRAME compressed data
+2. `is_lz4_compressed(data: &[u8]) -> bool` - Detects LZ4 frame magic number (0x184D2204)
+3. `decompress_if_needed(data: Vec<u8>) -> Result<Vec<u8>>` - Wrapper that handles both compressed and uncompressed data
+
+**Unit Tests:**
+Added 14 comprehensive unit tests covering all scenarios:
+1. `test_lz4_compression_decompression` - Basic roundtrip test
+2. `test_is_lz4_compressed_valid_frame` - Magic number detection with valid LZ4 frame
+3. `test_is_lz4_compressed_non_lz4` - Non-LZ4 data detection
+4. `test_is_lz4_compressed_empty` - Empty data handling
+5. `test_is_lz4_compressed_too_short` - Short data (< 4 bytes) handling
+6. `test_decompress_if_needed_compressed` - Wrapper with compressed data
+7. `test_decompress_if_needed_uncompressed` - Wrapper with uncompressed data
+8. `test_lz4_large_data` - Large data (1MB) decompression
+9. `test_lz4_highly_compressible` - High compression ratio data (100KB repeated pattern)
+10. `test_lz4_decompress_corrupt_data` - Error handling for corrupt data
+11. `test_lz4_decompress_empty` - Empty data edge case
+12. `test_decompress_if_needed_various_patterns` - Arrow IPC and JSON data passthrough
+13. `test_lz4_magic_number_endianness` - Verifies little-endian magic number format
+14. `test_lz4_arrow_ipc_roundtrip` - Real-world Arrow IPC data roundtrip
+
+All tests pass successfully (129 total tests, 0 failures)
+
+**Files Modified:**
+- `src/fetch/decompress.rs` (implemented decompress_lz4 and added tests)
+
+**Key Design Decisions:**
+- Used `lz4_flex::frame::FrameDecoder` which handles LZ4 frame format correctly
+- Magic number detection uses little-endian byte order: `[0x04, 0x22, 0x4D, 0x18]`
+- Graceful handling of empty data (returns empty vector rather than error)
+- Comprehensive test coverage including edge cases, large data, and error scenarios
+- Tests verify both compression ratio and data integrity
+
 ---
 
 ## 3.3 ChunkFetcher - Core Implementation
