@@ -3426,6 +3426,53 @@ Implement parallel chunk fetching infrastructure for downloading Arrow data from
 | Single chunk fetchable | Presigned URL works |
 | 403 detected | Returns UrlExpired error |
 
+### Implementation Notes (Completed)
+
+**Implementation:**
+- Implemented `ChunkFetcher` struct in `src/fetch/mod.rs` with all required fields:
+  - `http_client: Client` - HTTP client with 300s timeout
+  - `sea_client: Arc<SeaClient>` - SEA client for URL refresh (used in work item 3.4)
+  - `statement_id: String` - Statement ID for this result set
+  - `concurrency: usize` - Maximum concurrent downloads
+- Implemented `new()` constructor that creates HTTP client with 300 second timeout
+- Implemented `fetch_chunk()` async method that:
+  - Downloads chunk from presigned URL
+  - Detects 403 Forbidden and returns `Error::UrlExpired(chunk_index)`
+  - Returns `Error::Io` for other HTTP errors with descriptive message
+  - Returns raw bytes (may be LZ4 compressed)
+- Added comprehensive documentation with examples
+
+**Error Handling:**
+- Added `Error::UrlExpired(i32)` variant to `src/error.rs`
+- Maps to `adbc_core::error::Status::IO` for retryability
+- Error message includes chunk index for debugging
+
+**Unit Tests:**
+Added 9 comprehensive unit tests covering all scenarios:
+1. `test_chunk_fetcher_new` - Constructor instantiation
+2. `test_chunk_fetcher_new_custom_concurrency` - Custom concurrency values
+3. `test_fetch_chunk_success` - Successful chunk download
+4. `test_fetch_chunk_403_forbidden` - URL expiration detection (returns UrlExpired with chunk_index)
+5. `test_fetch_chunk_404_not_found` - 404 error handling
+6. `test_fetch_chunk_500_internal_error` - 500 error handling
+7. `test_fetch_chunk_large_data` - Large 1MB chunk download
+8. `test_fetch_chunk_empty_response` - Empty chunk (0 bytes)
+9. `test_chunk_fetcher_concurrency_boundary_values` - Boundary testing (0, 1, 100)
+
+All tests pass successfully (138 total tests, 0 failures)
+
+**Files Modified:**
+- `src/error.rs` - Added `UrlExpired(i32)` error variant
+- `src/fetch/mod.rs` - Implemented ChunkFetcher struct, new(), fetch_chunk(), and tests
+
+**Key Design Decisions:**
+- HTTP client timeout set to 300 seconds (5 minutes) for large chunk downloads
+- 403 Forbidden specifically returns `UrlExpired` error with chunk index
+- Other HTTP errors return `Error::Io` with formatted error message including chunk index and status code
+- `sea_client` field stored for URL refresh (to be used in work item 3.4)
+- Comprehensive test coverage including wiremock for HTTP mocking
+- Tests verify both success cases and all error scenarios
+
 ---
 
 ## 3.4 ChunkFetcher - Worker Pool Pattern

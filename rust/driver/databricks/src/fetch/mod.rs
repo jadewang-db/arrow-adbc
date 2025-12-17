@@ -20,23 +20,122 @@
 pub mod decompress;
 pub mod reader;
 
-use crate::client::models::ManifestSchema;
+use crate::client::models::ExternalLink;
+use crate::client::SeaClient;
 use crate::error::{Error, Result};
+use crate::client::models::ManifestSchema;
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use reqwest::Client;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Fetches result chunks from external links in parallel
-pub struct ChunkFetcher;
-
-impl ChunkFetcher {
-    pub fn new() -> Result<Self> {
-        todo!("ChunkFetcher::new implementation in work item 3.3")
-    }
+///
+/// The ChunkFetcher is responsible for downloading Arrow data from cloud storage
+/// using presigned URLs (external links). It supports:
+/// - Parallel chunk fetching with configurable concurrency
+/// - Automatic URL refresh when presigned URLs expire (403 Forbidden)
+/// - LZ4 decompression of downloaded data
+pub struct ChunkFetcher {
+    /// HTTP client for downloading chunks from cloud storage
+    http_client: Client,
+    /// SEA client for refreshing expired URLs
+    sea_client: Arc<SeaClient>,
+    /// Statement ID for this result set
+    statement_id: String,
+    /// Maximum number of concurrent chunk downloads
+    concurrency: usize,
 }
 
-impl Default for ChunkFetcher {
-    fn default() -> Self {
-        Self
+impl ChunkFetcher {
+    /// Create a new ChunkFetcher
+    ///
+    /// # Arguments
+    /// * `sea_client` - SEA client for refreshing expired URLs
+    /// * `statement_id` - Statement ID for this result set
+    /// * `concurrency` - Maximum number of concurrent chunk downloads (default: 8)
+    ///
+    /// # Returns
+    /// A new ChunkFetcher instance configured for parallel downloads
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use adbc_driver_databricks::fetch::ChunkFetcher;
+    /// # use adbc_driver_databricks::client::{SeaClient, SeaClientConfig};
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let sea_client = Arc::new(SeaClient::new(SeaClientConfig::default())?);
+    /// let fetcher = ChunkFetcher::new(
+    ///     sea_client,
+    ///     "stmt-id-123".to_string(),
+    ///     8
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new(
+        sea_client: Arc<SeaClient>,
+        statement_id: String,
+        concurrency: usize,
+    ) -> Result<Self> {
+        // Create HTTP client with 300 second (5 minute) timeout for chunk downloads
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()?;
+
+        Ok(Self {
+            http_client,
+            sea_client,
+            statement_id,
+            concurrency,
+        })
+    }
+
+    /// Fetch a single chunk from its external link
+    ///
+    /// Downloads the Arrow IPC data from cloud storage using the presigned URL.
+    /// If the URL has expired (403 Forbidden), returns UrlExpired error to trigger refresh.
+    ///
+    /// # Arguments
+    /// * `link` - External link containing the presigned URL and metadata
+    ///
+    /// # Returns
+    /// * `Ok(Vec<u8>)` - Raw bytes of the chunk (may be LZ4 compressed)
+    /// * `Err(Error::UrlExpired)` - If the presigned URL has expired (403 response)
+    /// * `Err(Error::Http)` - For other HTTP errors
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use adbc_driver_databricks::fetch::ChunkFetcher;
+    /// # use adbc_driver_databricks::client::models::ExternalLink;
+    /// # async fn example(fetcher: ChunkFetcher, link: ExternalLink) -> Result<(), Box<dyn std::error::Error>> {
+    /// let data = fetcher.fetch_chunk(&link).await?;
+    /// println!("Downloaded {} bytes", data.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn fetch_chunk(&self, link: &ExternalLink) -> Result<Vec<u8>> {
+        let response = self.http_client
+            .get(&link.external_link)
+            .send()
+            .await?;
+
+        // Check for 403 Forbidden - indicates expired URL
+        if response.status() == reqwest::StatusCode::FORBIDDEN {
+            return Err(Error::UrlExpired(link.chunk_index));
+        }
+
+        // Check for other errors
+        if !response.status().is_success() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to fetch chunk {}: HTTP {}", link.chunk_index, response.status())
+            )));
+        }
+
+        // Read response body
+        let bytes = response.bytes().await?;
+        Ok(bytes.to_vec())
     }
 }
 
@@ -651,5 +750,365 @@ mod tests {
             }
             _ => panic!("Expected Struct type"),
         }
+    }
+
+    // === ChunkFetcher Tests ===
+
+    #[test]
+    fn test_chunk_fetcher_new() {
+        use crate::client::{SeaClient, SeaClientConfig};
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(
+            sea_client,
+            "stmt-123".to_string(),
+            8,
+        );
+
+        assert!(fetcher.is_ok());
+        let fetcher = fetcher.unwrap();
+        assert_eq!(fetcher.statement_id, "stmt-123");
+        assert_eq!(fetcher.concurrency, 8);
+    }
+
+    #[test]
+    fn test_chunk_fetcher_new_custom_concurrency() {
+        use crate::client::{SeaClient, SeaClientConfig};
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+
+        // Test with different concurrency values
+        let fetcher = ChunkFetcher::new(sea_client.clone(), "stmt-1".to_string(), 4).unwrap();
+        assert_eq!(fetcher.concurrency, 4);
+
+        let fetcher = ChunkFetcher::new(sea_client.clone(), "stmt-2".to_string(), 16).unwrap();
+        assert_eq!(fetcher.concurrency, 16);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunk_success() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock successful chunk download
+        Mock::given(method("GET"))
+            .and(path("/chunk0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1, 2, 3, 4, 5]))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(
+            sea_client,
+            "stmt-123".to_string(),
+            8,
+        ).unwrap();
+
+        let link = ExternalLink {
+            external_link: format!("{}/chunk0", mock_server.uri()),
+            chunk_index: 0,
+            row_offset: 0,
+            row_count: 100,
+            byte_count: 5,
+            expiration: "2025-12-31T23:59:59Z".to_string(),
+        };
+
+        let result = fetcher.fetch_chunk(&link).await;
+        assert!(result.is_ok());
+        let data = result.unwrap();
+        assert_eq!(data, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunk_403_forbidden() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock 403 Forbidden response (expired URL)
+        Mock::given(method("GET"))
+            .and(path("/expired-chunk"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(
+            sea_client,
+            "stmt-456".to_string(),
+            8,
+        ).unwrap();
+
+        let link = ExternalLink {
+            external_link: format!("{}/expired-chunk", mock_server.uri()),
+            chunk_index: 5,
+            row_offset: 50000,
+            row_count: 10000,
+            byte_count: 1048576,
+            expiration: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        let result = fetcher.fetch_chunk(&link).await;
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            Error::UrlExpired(chunk_index) => {
+                assert_eq!(chunk_index, 5);
+            }
+            e => panic!("Expected UrlExpired error, got {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunk_404_not_found() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock 404 Not Found response
+        Mock::given(method("GET"))
+            .and(path("/missing-chunk"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(
+            sea_client,
+            "stmt-789".to_string(),
+            8,
+        ).unwrap();
+
+        let link = ExternalLink {
+            external_link: format!("{}/missing-chunk", mock_server.uri()),
+            chunk_index: 0,
+            row_offset: 0,
+            row_count: 100,
+            byte_count: 1000,
+            expiration: "2025-12-31T23:59:59Z".to_string(),
+        };
+
+        let result = fetcher.fetch_chunk(&link).await;
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            Error::Io(e) => {
+                assert!(e.to_string().contains("404"));
+                assert!(e.to_string().contains("chunk 0"));
+            }
+            e => panic!("Expected Io error, got {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunk_500_internal_error() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock 500 Internal Server Error
+        Mock::given(method("GET"))
+            .and(path("/error-chunk"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(
+            sea_client,
+            "stmt-error".to_string(),
+            8,
+        ).unwrap();
+
+        let link = ExternalLink {
+            external_link: format!("{}/error-chunk", mock_server.uri()),
+            chunk_index: 3,
+            row_offset: 30000,
+            row_count: 10000,
+            byte_count: 1048576,
+            expiration: "2025-12-31T23:59:59Z".to_string(),
+        };
+
+        let result = fetcher.fetch_chunk(&link).await;
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            Error::Io(e) => {
+                assert!(e.to_string().contains("500"));
+                assert!(e.to_string().contains("chunk 3"));
+            }
+            e => panic!("Expected Io error, got {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunk_large_data() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        // Create 1MB of test data
+        let large_data = vec![42u8; 1_048_576];
+
+        Mock::given(method("GET"))
+            .and(path("/large-chunk"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(large_data.clone()))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(
+            sea_client,
+            "stmt-large".to_string(),
+            8,
+        ).unwrap();
+
+        let link = ExternalLink {
+            external_link: format!("{}/large-chunk", mock_server.uri()),
+            chunk_index: 0,
+            row_offset: 0,
+            row_count: 100000,
+            byte_count: 1048576,
+            expiration: "2025-12-31T23:59:59Z".to_string(),
+        };
+
+        let result = fetcher.fetch_chunk(&link).await;
+        assert!(result.is_ok());
+        let data = result.unwrap();
+        assert_eq!(data.len(), 1_048_576);
+        assert_eq!(data, large_data);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunk_empty_response() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock empty response (0 bytes)
+        Mock::given(method("GET"))
+            .and(path("/empty-chunk"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![]))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(
+            sea_client,
+            "stmt-empty".to_string(),
+            8,
+        ).unwrap();
+
+        let link = ExternalLink {
+            external_link: format!("{}/empty-chunk", mock_server.uri()),
+            chunk_index: 0,
+            row_offset: 0,
+            row_count: 0,
+            byte_count: 0,
+            expiration: "2025-12-31T23:59:59Z".to_string(),
+        };
+
+        let result = fetcher.fetch_chunk(&link).await;
+        assert!(result.is_ok());
+        let data = result.unwrap();
+        assert_eq!(data.len(), 0);
+    }
+
+    #[test]
+    fn test_chunk_fetcher_concurrency_boundary_values() {
+        use crate::client::{SeaClient, SeaClientConfig};
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+
+        // Test with concurrency = 1 (minimum)
+        let fetcher = ChunkFetcher::new(sea_client.clone(), "stmt-1".to_string(), 1);
+        assert!(fetcher.is_ok());
+        assert_eq!(fetcher.unwrap().concurrency, 1);
+
+        // Test with concurrency = 100 (very high)
+        let fetcher = ChunkFetcher::new(sea_client.clone(), "stmt-2".to_string(), 100);
+        assert!(fetcher.is_ok());
+        assert_eq!(fetcher.unwrap().concurrency, 100);
+
+        // Test with concurrency = 0 (edge case - should still work)
+        let fetcher = ChunkFetcher::new(sea_client.clone(), "stmt-3".to_string(), 0);
+        assert!(fetcher.is_ok());
+        assert_eq!(fetcher.unwrap().concurrency, 0);
     }
 }

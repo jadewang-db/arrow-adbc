@@ -56,6 +56,9 @@ pub enum Error {
 
     #[error("Timeout waiting for statement")]
     Timeout,
+
+    #[error("URL expired for chunk {0}")]
+    UrlExpired(i32),
 }
 
 impl Error {
@@ -83,6 +86,7 @@ impl Error {
             Error::StatementFailed(_) => adbc_core::error::Status::Internal,
             Error::Session(_) => adbc_core::error::Status::InvalidState,
             Error::Timeout => adbc_core::error::Status::Timeout,
+            Error::UrlExpired(_) => adbc_core::error::Status::IO,
         }
     }
 
