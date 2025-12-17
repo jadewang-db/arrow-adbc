@@ -34,3 +34,7 @@ pub use database::DatabricksDatabase;
 pub use driver::DatabricksDriver;
 pub use error::Error;
 pub use statement::DatabricksStatement;
+
+// Export for FFI (C API compatibility)
+#[cfg(feature = "ffi")]
+adbc_ffi::export_driver!(DatabricksDriverInit, DatabricksDriver);

@@ -7,6 +7,7 @@ name = "adbc-driver-databricks"
 version = "0.22.0"
 dependencies = [
  "adbc_core",
+ "adbc_ffi",
  "arrow-array 57.1.0",
  "arrow-buffer 53.4.1",
  "arrow-ipc 53.4.0",

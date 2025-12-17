@@ -37,9 +37,11 @@ crate-type = ["lib", "cdylib"]
 default = ["rustls-tls"]
 rustls-tls = ["reqwest/rustls-tls"]
 native-tls = ["reqwest/native-tls"]
+ffi = ["adbc_ffi"]
 
 [dependencies]
 adbc_core = { workspace = true }
+adbc_ffi = { workspace = true, optional = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
