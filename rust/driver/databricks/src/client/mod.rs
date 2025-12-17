@@ -182,6 +182,30 @@ impl SeaClient {
             http_status,
         })
     }
+
+    /// Create a new session with the SQL Warehouse
+    pub async fn create_session(
+        &self,
+        catalog: Option<String>,
+        schema: Option<String>,
+    ) -> Result<String> {
+        let request = models::CreateSessionRequest {
+            warehouse_id: self.warehouse_id.clone(),
+            catalog,
+            schema,
+        };
+
+        let response: models::CreateSessionResponse = self
+            .post(&self.sessions_url(), &request)
+            .await?;
+
+        Ok(response.session_id)
+    }
+
+    /// Delete/terminate a session
+    pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+        self.delete(&self.session_url(session_id)).await
+    }
 }
 
 #[cfg(test)]
@@ -482,6 +506,175 @@ mod tests {
             crate::error::Error::SeaApi { code, message, http_status } => {
                 assert_eq!(code, "NOT_FOUND");
                 assert_eq!(message, "Resource not found");
+                assert_eq!(http_status, 404);
+            }
+            _ => panic!("Expected SeaApi error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_session_success() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path, body_json};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .and(body_json(serde_json::json!({
+                "warehouse_id": "test-warehouse",
+                "catalog": "main",
+                "schema": "default"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "01ef1234-5678-1abc-def0-123456789abc"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let session_id = client.create_session(
+            Some("main".to_string()),
+            Some("default".to_string())
+        ).await;
+
+        assert!(session_id.is_ok());
+        assert_eq!(session_id.unwrap(), "01ef1234-5678-1abc-def0-123456789abc");
+    }
+
+    #[tokio::test]
+    async fn test_create_session_without_catalog_schema() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path, body_json};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .and(body_json(serde_json::json!({
+                "warehouse_id": "test-warehouse"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "01ef1234-5678-1abc-def0-123456789abc"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let session_id = client.create_session(None, None).await;
+
+        assert!(session_id.is_ok());
+        assert_eq!(session_id.unwrap(), "01ef1234-5678-1abc-def0-123456789abc");
+    }
+
+    #[tokio::test]
+    async fn test_create_session_error() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error_code": "INVALID_PARAMETER_VALUE",
+                "message": "Invalid warehouse ID"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "invalid-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let result = client.create_session(None, None).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            crate::error::Error::SeaApi { code, message, http_status } => {
+                assert_eq!(code, "INVALID_PARAMETER_VALUE");
+                assert_eq!(message, "Invalid warehouse ID");
+                assert_eq!(http_status, 400);
+            }
+            _ => panic!("Expected SeaApi error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_session_success() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/01ef1234-5678-1abc-def0-123456789abc"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let result = client.delete_session("01ef1234-5678-1abc-def0-123456789abc").await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_delete_session_error() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/invalid-session"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error_code": "NOT_FOUND",
+                "message": "Session not found"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let result = client.delete_session("invalid-session").await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            crate::error::Error::SeaApi { code, message, http_status } => {
+                assert_eq!(code, "NOT_FOUND");
+                assert_eq!(message, "Session not found");
                 assert_eq!(http_status, 404);
             }
             _ => panic!("Expected SeaApi error"),

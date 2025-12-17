@@ -19,14 +19,14 @@
 //!
 //! This driver provides Arrow-native access to Databricks using the Statement Execution API (SEA).
 
-mod client;
+pub mod client;
 mod connection;
 mod database;
 mod driver;
 pub mod error;
 mod fetch;
 mod options;
-mod session;
+pub mod session;
 mod statement;
 
 pub use connection::DatabricksConnection;
