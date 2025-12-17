@@ -199,7 +199,7 @@ impl DatabricksStatement {
             if !external_links.is_empty() {
                 // External links - will be handled in Sprint 3
                 return Err(DatabricksError::Config(
-                    "External links not yet implemented (Sprint 3)".into(),
+                    "Query result set is too large for inline transfer. Please reduce the result size using LIMIT clause, or contact your administrator about enabling external links support for large result sets.".into(),
                 ));
             }
         }
