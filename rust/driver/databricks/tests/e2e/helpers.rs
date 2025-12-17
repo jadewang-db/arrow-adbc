@@ -16,6 +16,7 @@
 // under the License.
 
 use super::config::E2EConfig;
+use adbc_driver_databricks::{DatabricksConnection, DatabricksDatabase};
 use std::sync::Mutex;
 
 /// Lazy-loaded test configuration from JSON file
@@ -39,6 +40,28 @@ pub fn get_test_config() -> E2EConfig {
             "Cannot load test configuration from DATABRICKS_TEST_CONFIG_FILE. \
              Set this environment variable to point to a valid JSON configuration file.",
         )
+}
+
+/// Create a test database configured from E2E config
+///
+/// TODO: Complete implementation in Work Item 1.6 after Database trait is fully implemented
+/// This stub will be replaced with proper initialization including:
+/// - Setting host, warehouse_id, and token from E2EConfig
+/// - Initializing the database with the configured options
+pub fn create_test_database() -> DatabricksDatabase {
+    // Stub implementation - will be completed when Database trait is fully implemented
+    DatabricksDatabase::new()
+}
+
+/// Create a test connection from a configured database
+///
+/// TODO: Complete implementation in Work Item 1.7 after Connection trait is fully implemented
+/// This stub will be replaced with proper initialization including:
+/// - Creating connection from database using new_connection()
+/// - Setting connection-level options if needed
+pub fn create_test_connection(_database: &DatabricksDatabase) -> DatabricksConnection {
+    // Stub implementation - will be completed when Connection trait is fully implemented
+    DatabricksConnection::new()
 }
 
 /// Macro for conditional test execution
