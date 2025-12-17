@@ -25,9 +25,11 @@ use crate::client::SeaClient;
 use crate::error::{Error, Result};
 use crate::client::models::ManifestSchema;
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use futures::Stream;
 use reqwest::Client;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 /// Fetches result chunks from external links in parallel
 ///
@@ -36,6 +38,7 @@ use std::time::Duration;
 /// - Parallel chunk fetching with configurable concurrency
 /// - Automatic URL refresh when presigned URLs expire (403 Forbidden)
 /// - LZ4 decompression of downloaded data
+#[derive(Clone)]
 pub struct ChunkFetcher {
     /// HTTP client for downloading chunks from cloud storage
     http_client: Client,
@@ -136,6 +139,228 @@ impl ChunkFetcher {
         // Read response body
         let bytes = response.bytes().await?;
         Ok(bytes.to_vec())
+    }
+
+    /// Fetch a chunk with automatic retry on URL expiration
+    ///
+    /// This is a stub implementation for work item 3.5. Full URL refresh logic
+    /// with shared cache will be implemented in that work item.
+    ///
+    /// # Arguments
+    /// * `link` - External link containing the presigned URL and metadata
+    ///
+    /// # Returns
+    /// * `Ok(Vec<u8>)` - Raw bytes of the chunk (may be LZ4 compressed)
+    /// * `Err(Error)` - If fetch fails (currently just delegates to fetch_chunk)
+    async fn fetch_chunk_with_retry(&self, link: &ExternalLink) -> Result<Vec<u8>> {
+        // TODO: Implement URL refresh logic with shared cache in work item 3.5
+        // For now, just call fetch_chunk directly
+        self.fetch_chunk(link).await
+    }
+
+    /// Fetch chunks using worker pool pattern
+    ///
+    /// Workers continuously pull from queue in order (0, 1, 2, ...) and download them.
+    /// Chunks are yielded in sequential order regardless of completion order.
+    ///
+    /// # Architecture
+    /// - Fixed number of worker tasks (num_workers = concurrency.min(total_chunks))
+    /// - Workers pull chunks from ordered queue (MPSC channel with buffer)
+    /// - Workers are NEVER blocked by:
+    ///   1. Ordering logic (runs in separate task via channels)
+    ///   2. Slow downloads (each worker is independent)
+    ///   3. URL refresh (handled per-worker, doesn't affect others)
+    /// - Ordering runs in separate async task, buffering out-of-order chunks
+    ///
+    /// # Arguments
+    /// * `links` - Vector of external links to fetch (will be sorted by chunk_index)
+    ///
+    /// # Returns
+    /// * `Ok(impl Stream<Item = Result<Vec<u8>>>)` - Stream that yields chunks in order (0, 1, 2, ...)
+    /// * `Err(Error)` - If setup fails
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use adbc_driver_databricks::fetch::ChunkFetcher;
+    /// # use adbc_driver_databricks::client::models::ExternalLink;
+    /// # use futures::{StreamExt, pin_mut};
+    /// # async fn example(fetcher: ChunkFetcher, links: Vec<ExternalLink>) -> Result<(), Box<dyn std::error::Error>> {
+    /// let stream = fetcher.fetch_chunks_ordered(links).await?;
+    /// pin_mut!(stream);
+    /// while let Some(result) = stream.next().await {
+    ///     let chunk_data = result?;
+    ///     println!("Got chunk with {} bytes", chunk_data.len());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn fetch_chunks_ordered(
+        &self,
+        links: Vec<ExternalLink>,
+    ) -> Result<impl Stream<Item = Result<Vec<u8>>>> {
+        let total_chunks = links.len();
+        let num_workers = self.concurrency.min(total_chunks);
+
+        // Create channels with buffering to prevent blocking
+        // Buffer size = max(1, num_workers * 2) to handle empty case
+        let buffer_size = std::cmp::max(1, num_workers * 2);
+        let (work_tx, work_rx) = mpsc::channel::<ExternalLink>(buffer_size);
+        let (result_tx, result_rx) = mpsc::channel::<(usize, Result<Vec<u8>>)>(buffer_size);
+
+        // Sort links by chunk_index to ensure ordered queue feeding
+        let mut sorted_links = links;
+        sorted_links.sort_by_key(|link| link.chunk_index);
+
+        // Spawn work producer (feeds chunks in order to queue)
+        let work_producer = tokio::spawn(async move {
+            for link in sorted_links {
+                if work_tx.send(link).await.is_err() {
+                    break; // Receiver dropped
+                }
+            }
+        });
+
+        // Spawn independent worker pool
+        // Key: Each worker is INDEPENDENT and NEVER waits for other workers
+        // Use Arc<Mutex<Receiver>> to share the receiver among workers
+        let work_rx = Arc::new(tokio::sync::Mutex::new(work_rx));
+        let fetcher = Arc::new(self.clone());
+        let mut worker_handles = Vec::new();
+
+        for _worker_id in 0..num_workers {
+            let work_rx_clone = work_rx.clone();
+            let result_tx_clone = result_tx.clone();
+            let fetcher_clone = fetcher.clone();
+
+            let handle = tokio::spawn(async move {
+                // Worker loop: pull → download → send result → repeat
+                // NEVER blocked by other workers or ordering logic
+                loop {
+                    // Lock receiver, pull one item, then immediately unlock
+                    let link = {
+                        let mut rx = work_rx_clone.lock().await;
+                        rx.recv().await
+                    };
+
+                    match link {
+                        Some(link) => {
+                            let chunk_index = link.chunk_index as usize;
+
+                            // fetch_chunk_with_retry handles URL refresh internally
+                            // If URL expires, THIS worker refreshes and retries
+                            // Other workers continue unaffected
+                            let result = fetcher_clone.fetch_chunk_with_retry(&link).await;
+
+                            // Send to buffered channel (non-blocking with capacity)
+                            if result_tx_clone.send((chunk_index, result)).await.is_err() {
+                                break; // Receiver dropped
+                            }
+
+                            // Immediately pull next chunk from queue!
+                            // No waiting for ordering or other workers
+                        }
+                        None => break, // Channel closed
+                    }
+                }
+            });
+
+            worker_handles.push(handle);
+        }
+
+        // Drop original sender so workers can complete
+        drop(result_tx);
+
+        // Create ordered output stream
+        // This runs in SEPARATE task, doesn't block workers
+        let ordered_stream = Self::create_ordered_stream(
+            result_rx,
+            total_chunks,
+            work_producer,
+            worker_handles,
+        );
+
+        Ok(ordered_stream)
+    }
+
+    /// Create a stream that yields chunks in order
+    ///
+    /// Key insight: Workers download at different speeds, so chunks complete out of order.
+    /// This function ensures output is always sequential (0, 1, 2, ...) by:
+    /// 1. Buffering out-of-order chunks
+    /// 2. Only yielding when the next expected chunk is ready
+    /// 3. Cascading yields when a blocking chunk arrives
+    ///
+    /// # Example Flow
+    /// If chunks complete in order [2, 0, 3, 1, 4]:
+    ///   - Chunk 2 arrives → buffer[2] = data, wait (need chunk 0 first)
+    ///   - Chunk 0 arrives → buffer[0] = data, yield 0 immediately
+    ///   - Chunk 3 arrives → buffer[3] = data, wait (need chunk 1)
+    ///   - Chunk 1 arrives → buffer[1] = data, yield 1, then yield 2, then yield 3 (cascade!)
+    ///   - Chunk 4 arrives → buffer[4] = data, yield 4
+    ///   Result: Output order is always 0, 1, 2, 3, 4
+    ///
+    /// # Arguments
+    /// * `result_rx` - Channel receiver for chunk results from workers
+    /// * `total_chunks` - Total number of chunks expected
+    /// * `work_producer` - Handle to the work producer task
+    /// * `worker_handles` - Handles to all worker tasks
+    ///
+    /// # Returns
+    /// Stream that yields chunks in sequential order
+    fn create_ordered_stream(
+        mut result_rx: mpsc::Receiver<(usize, Result<Vec<u8>>)>,
+        total_chunks: usize,
+        work_producer: tokio::task::JoinHandle<()>,
+        worker_handles: Vec<tokio::task::JoinHandle<()>>,
+    ) -> impl Stream<Item = Result<Vec<u8>>> {
+        async_stream::stream! {
+            // Buffer to hold chunks until we can yield them in order
+            // Initialize with None for each position
+            let mut buffer: Vec<Option<Result<Vec<u8>>>> = (0..total_chunks).map(|_| None).collect();
+            let mut next_to_yield = 0;  // Next chunk index we need to output
+            let mut received_count = 0;
+
+            // Receive results from workers (may arrive out of order)
+            while let Some((index, result)) = result_rx.recv().await {
+                // Store this chunk in the buffer
+                buffer[index] = Some(result);
+                received_count += 1;
+
+                // Try to yield all consecutive chunks that are now ready
+                // This handles cascading yields when a missing chunk arrives
+                while next_to_yield < total_chunks {
+                    if let Some(result) = buffer[next_to_yield].take() {
+                        yield result;  // Yield in order!
+                        next_to_yield += 1;
+                    } else {
+                        break; // This chunk not ready yet, wait for it
+                    }
+                }
+
+                if received_count == total_chunks {
+                    break;  // All chunks received
+                }
+            }
+
+            // Yield any remaining buffered chunks
+            while next_to_yield < total_chunks {
+                if let Some(result) = buffer[next_to_yield].take() {
+                    yield result;
+                    next_to_yield += 1;
+                } else {
+                    yield Err(Error::StatementFailed(
+                        format!("Missing chunk {}", next_to_yield).into()
+                    ));
+                    break;
+                }
+            }
+
+            // Wait for all tasks to complete
+            let _ = work_producer.await;
+            for handle in worker_handles {
+                let _ = handle.await;
+            }
+        }
     }
 }
 
@@ -1110,5 +1335,569 @@ mod tests {
         let fetcher = ChunkFetcher::new(sea_client.clone(), "stmt-3".to_string(), 0);
         assert!(fetcher.is_ok());
         assert_eq!(fetcher.unwrap().concurrency, 0);
+    }
+
+    // === Worker Pool Pattern Tests ===
+
+    #[tokio::test]
+    async fn test_fetch_chunks_ordered_basic() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+        use futures::{StreamExt, pin_mut};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock 3 chunks
+        Mock::given(method("GET"))
+            .and(path("/chunk0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0, 0, 0]))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/chunk1"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1, 1, 1]))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/chunk2"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![2, 2, 2]))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(sea_client, "stmt-ordered".to_string(), 2).unwrap();
+
+        let links = vec![
+            ExternalLink {
+                external_link: format!("{}/chunk0", mock_server.uri()),
+                chunk_index: 0,
+                row_offset: 0,
+                row_count: 100,
+                byte_count: 3,
+                expiration: "2025-12-31T23:59:59Z".to_string(),
+            },
+            ExternalLink {
+                external_link: format!("{}/chunk1", mock_server.uri()),
+                chunk_index: 1,
+                row_offset: 100,
+                row_count: 100,
+                byte_count: 3,
+                expiration: "2025-12-31T23:59:59Z".to_string(),
+            },
+            ExternalLink {
+                external_link: format!("{}/chunk2", mock_server.uri()),
+                chunk_index: 2,
+                row_offset: 200,
+                row_count: 100,
+                byte_count: 3,
+                expiration: "2025-12-31T23:59:59Z".to_string(),
+            },
+        ];
+
+        let stream = fetcher.fetch_chunks_ordered(links).await.unwrap();
+        pin_mut!(stream);
+        pin_mut!(stream);
+        let mut chunks = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            chunks.push(result.unwrap());
+        }
+
+        // Verify we got all chunks in order
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], vec![0, 0, 0]);
+        assert_eq!(chunks[1], vec![1, 1, 1]);
+        assert_eq!(chunks[2], vec![2, 2, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunks_ordered_unsorted_input() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+        use futures::{StreamExt, pin_mut};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock 3 chunks
+        for i in 0..3 {
+            Mock::given(method("GET"))
+                .and(path(format!("/chunk{}", i)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![i as u8; 3]))
+                .mount(&mock_server)
+                .await;
+        }
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(sea_client, "stmt-unsorted".to_string(), 2).unwrap();
+
+        // Provide links in REVERSE order (2, 1, 0)
+        let links = vec![
+            ExternalLink {
+                external_link: format!("{}/chunk2", mock_server.uri()),
+                chunk_index: 2,
+                row_offset: 200,
+                row_count: 100,
+                byte_count: 3,
+                expiration: "2025-12-31T23:59:59Z".to_string(),
+            },
+            ExternalLink {
+                external_link: format!("{}/chunk1", mock_server.uri()),
+                chunk_index: 1,
+                row_offset: 100,
+                row_count: 100,
+                byte_count: 3,
+                expiration: "2025-12-31T23:59:59Z".to_string(),
+            },
+            ExternalLink {
+                external_link: format!("{}/chunk0", mock_server.uri()),
+                chunk_index: 0,
+                row_offset: 0,
+                row_count: 100,
+                byte_count: 3,
+                expiration: "2025-12-31T23:59:59Z".to_string(),
+            },
+        ];
+
+        let stream = fetcher.fetch_chunks_ordered(links).await.unwrap();
+        pin_mut!(stream);
+        let mut chunks = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            chunks.push(result.unwrap());
+        }
+
+        // Should still get chunks in correct order (0, 1, 2)
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], vec![0, 0, 0]);
+        assert_eq!(chunks[1], vec![1, 1, 1]);
+        assert_eq!(chunks[2], vec![2, 2, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunks_ordered_variable_delays() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+        use futures::{StreamExt, pin_mut};
+        use std::time::Duration;
+
+        let mock_server = MockServer::start().await;
+
+        // Mock chunk 0 with 100ms delay (slow)
+        Mock::given(method("GET"))
+            .and(path("/chunk0"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![0, 0, 0])
+                    .set_delay(Duration::from_millis(100))
+            )
+            .mount(&mock_server)
+            .await;
+
+        // Mock chunk 1 with no delay (fast)
+        Mock::given(method("GET"))
+            .and(path("/chunk1"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1, 1, 1]))
+            .mount(&mock_server)
+            .await;
+
+        // Mock chunk 2 with 50ms delay (medium)
+        Mock::given(method("GET"))
+            .and(path("/chunk2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![2, 2, 2])
+                    .set_delay(Duration::from_millis(50))
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(sea_client, "stmt-delays".to_string(), 3).unwrap();
+
+        let links = vec![
+            ExternalLink {
+                external_link: format!("{}/chunk0", mock_server.uri()),
+                chunk_index: 0,
+                row_offset: 0,
+                row_count: 100,
+                byte_count: 3,
+                expiration: "2025-12-31T23:59:59Z".to_string(),
+            },
+            ExternalLink {
+                external_link: format!("{}/chunk1", mock_server.uri()),
+                chunk_index: 1,
+                row_offset: 100,
+                row_count: 100,
+                byte_count: 3,
+                expiration: "2025-12-31T23:59:59Z".to_string(),
+            },
+            ExternalLink {
+                external_link: format!("{}/chunk2", mock_server.uri()),
+                chunk_index: 2,
+                row_offset: 200,
+                row_count: 100,
+                byte_count: 3,
+                expiration: "2025-12-31T23:59:59Z".to_string(),
+            },
+        ];
+
+        let stream = fetcher.fetch_chunks_ordered(links).await.unwrap();
+        pin_mut!(stream);
+        let mut chunks = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            chunks.push(result.unwrap());
+        }
+
+        // Even though completion order is likely [1, 2, 0], output should be [0, 1, 2]
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], vec![0, 0, 0]);
+        assert_eq!(chunks[1], vec![1, 1, 1]);
+        assert_eq!(chunks[2], vec![2, 2, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunks_ordered_single_chunk() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+        use futures::{StreamExt, pin_mut};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/chunk0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![42, 42, 42]))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(sea_client, "stmt-single".to_string(), 8).unwrap();
+
+        let links = vec![
+            ExternalLink {
+                external_link: format!("{}/chunk0", mock_server.uri()),
+                chunk_index: 0,
+                row_offset: 0,
+                row_count: 100,
+                byte_count: 3,
+                expiration: "2025-12-31T23:59:59Z".to_string(),
+            },
+        ];
+
+        let stream = fetcher.fetch_chunks_ordered(links).await.unwrap();
+        pin_mut!(stream);
+        let mut chunks = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            chunks.push(result.unwrap());
+        }
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], vec![42, 42, 42]);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunks_ordered_many_chunks() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+        use futures::{StreamExt, pin_mut};
+
+        let mock_server = MockServer::start().await;
+        let num_chunks = 20;
+
+        // Mock many chunks
+        for i in 0..num_chunks {
+            Mock::given(method("GET"))
+                .and(path(format!("/chunk{}", i)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![i as u8; 10]))
+                .mount(&mock_server)
+                .await;
+        }
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(sea_client, "stmt-many".to_string(), 4).unwrap();
+
+        let links: Vec<ExternalLink> = (0..num_chunks)
+            .map(|i| ExternalLink {
+                external_link: format!("{}/chunk{}", mock_server.uri(), i),
+                chunk_index: i as i32,
+                row_offset: i as i64 * 100,
+                row_count: 100,
+                byte_count: 10,
+                expiration: "2025-12-31T23:59:59Z".to_string(),
+            })
+            .collect();
+
+        let stream = fetcher.fetch_chunks_ordered(links).await.unwrap();
+        pin_mut!(stream);
+        let mut chunks = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            chunks.push(result.unwrap());
+        }
+
+        // Verify we got all chunks in order
+        assert_eq!(chunks.len(), num_chunks);
+        for i in 0..num_chunks {
+            assert_eq!(chunks[i], vec![i as u8; 10]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunks_ordered_concurrency_limit() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+        use futures::{StreamExt, pin_mut};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock 10 chunks
+        for i in 0..10 {
+            Mock::given(method("GET"))
+                .and(path(format!("/chunk{}", i)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![i as u8; 5]))
+                .mount(&mock_server)
+                .await;
+        }
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+
+        // Set concurrency to 3, but have 10 chunks
+        let fetcher = ChunkFetcher::new(sea_client, "stmt-limit".to_string(), 3).unwrap();
+
+        let links: Vec<ExternalLink> = (0..10)
+            .map(|i| ExternalLink {
+                external_link: format!("{}/chunk{}", mock_server.uri(), i),
+                chunk_index: i as i32,
+                row_offset: i as i64 * 100,
+                row_count: 100,
+                byte_count: 5,
+                expiration: "2025-12-31T23:59:59Z".to_string(),
+            })
+            .collect();
+
+        let stream = fetcher.fetch_chunks_ordered(links).await.unwrap();
+        pin_mut!(stream);
+        let mut chunks = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            chunks.push(result.unwrap());
+        }
+
+        // Should still get all chunks in order
+        assert_eq!(chunks.len(), 10);
+        for i in 0..10 {
+            assert_eq!(chunks[i], vec![i as u8; 5]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunks_ordered_error_propagation() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+        use futures::{StreamExt, pin_mut};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock chunk 0 - success
+        Mock::given(method("GET"))
+            .and(path("/chunk0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0, 0, 0]))
+            .mount(&mock_server)
+            .await;
+
+        // Mock chunk 1 - 404 error
+        Mock::given(method("GET"))
+            .and(path("/chunk1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        // Mock chunk 2 - success
+        Mock::given(method("GET"))
+            .and(path("/chunk2"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![2, 2, 2]))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(sea_client, "stmt-error".to_string(), 2).unwrap();
+
+        let links = vec![
+            ExternalLink {
+                external_link: format!("{}/chunk0", mock_server.uri()),
+                chunk_index: 0,
+                row_offset: 0,
+                row_count: 100,
+                byte_count: 3,
+                expiration: "2025-12-31T23:59:59Z".to_string(),
+            },
+            ExternalLink {
+                external_link: format!("{}/chunk1", mock_server.uri()),
+                chunk_index: 1,
+                row_offset: 100,
+                row_count: 100,
+                byte_count: 3,
+                expiration: "2025-12-31T23:59:59Z".to_string(),
+            },
+            ExternalLink {
+                external_link: format!("{}/chunk2", mock_server.uri()),
+                chunk_index: 2,
+                row_offset: 200,
+                row_count: 100,
+                byte_count: 3,
+                expiration: "2025-12-31T23:59:59Z".to_string(),
+            },
+        ];
+
+        let stream = fetcher.fetch_chunks_ordered(links).await.unwrap();
+        pin_mut!(stream);
+        let mut results = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            results.push(result);
+        }
+
+        // First chunk should succeed
+        assert!(results[0].is_ok());
+        assert_eq!(results[0].as_ref().unwrap(), &vec![0, 0, 0]);
+
+        // Second chunk should fail with IO error
+        assert!(results[1].is_err());
+        match &results[1] {
+            Err(Error::Io(e)) => {
+                assert!(e.to_string().contains("404"));
+            }
+            _ => panic!("Expected IO error for chunk 1"),
+        }
+
+        // Third chunk should still be returned (though might fail or succeed)
+        assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunks_ordered_empty_list() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use futures::{StreamExt, pin_mut};
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(sea_client, "stmt-empty".to_string(), 8).unwrap();
+
+        let links: Vec<ExternalLink> = vec![];
+
+        let stream = fetcher.fetch_chunks_ordered(links).await.unwrap();
+        pin_mut!(stream);
+        let mut chunks = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            chunks.push(result.unwrap());
+        }
+
+        // Should get no chunks
+        assert_eq!(chunks.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chunk_with_retry_stub() {
+        use crate::client::{SeaClient, SeaClientConfig};
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/chunk0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1, 2, 3]))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: "https://test.cloud.databricks.com".to_string(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let sea_client = Arc::new(SeaClient::new(config).unwrap());
+        let fetcher = ChunkFetcher::new(sea_client, "stmt-retry".to_string(), 8).unwrap();
+
+        let link = ExternalLink {
+            external_link: format!("{}/chunk0", mock_server.uri()),
+            chunk_index: 0,
+            row_offset: 0,
+            row_count: 100,
+            byte_count: 3,
+            expiration: "2025-12-31T23:59:59Z".to_string(),
+        };
+
+        // Stub implementation should just call fetch_chunk
+        let result = fetcher.fetch_chunk_with_retry(&link).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![1, 2, 3]);
     }
 }
