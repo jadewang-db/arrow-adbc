@@ -30,6 +30,7 @@ pub enum Error {
         code: String,
         message: String,
         http_status: u16,
+        retry_after: Option<std::time::Duration>,
     },
 
     #[error("Arrow error: {0}")]

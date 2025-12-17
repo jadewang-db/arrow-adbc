@@ -21,6 +21,7 @@ pub mod error;
 pub mod models;
 
 use crate::error::Result;
+use std::time::Duration;
 
 /// HTTP client for communicating with the Databricks Statement Execution API
 pub struct SeaClient {
@@ -45,9 +46,53 @@ impl Default for SeaClientConfig {
             host: String::new(),
             token: String::new(),
             warehouse_id: String::new(),
-            connect_timeout: std::time::Duration::from_secs(10),
-            read_timeout: std::time::Duration::from_secs(300),
+            connect_timeout: Duration::from_secs(10),
+            read_timeout: Duration::from_secs(300),
         }
+    }
+}
+
+/// Configuration for retry behavior with exponential backoff
+#[derive(Clone, Debug)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts
+    pub max_retries: u32,
+    /// Base delay for exponential backoff
+    pub base_delay: Duration,
+    /// Maximum delay between retries
+    pub max_delay: Duration,
+    /// Jitter factor (0.0 - 1.0) to prevent thundering herd
+    pub jitter: f64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(30),
+            jitter: 0.5,
+        }
+    }
+}
+
+impl RetryConfig {
+    /// Calculate the delay for a given retry attempt (0-indexed)
+    ///
+    /// Uses exponential backoff: base_delay * 2^attempt
+    /// Capped at max_delay
+    /// Jitter applied: delay * (1 + random(0, jitter))
+    pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
+        let base_ms = self.base_delay.as_millis() as f64;
+        let exponential = base_ms * 2_f64.powi(attempt as i32);
+        let capped = exponential.min(self.max_delay.as_millis() as f64);
+
+        // Add jitter: delay * (1 + random(0, jitter))
+        let mut rng = rand::thread_rng();
+        let jitter_factor = 1.0 + rand::Rng::gen::<f64>(&mut rng) * self.jitter;
+        let final_ms = capped * jitter_factor;
+
+        Duration::from_millis(final_ms as u64)
     }
 }
 
@@ -132,7 +177,8 @@ impl SeaClient {
     }
 
     /// Send a GET request
-    async fn get<Resp>(&self, url: &str) -> Result<Resp>
+    #[cfg_attr(test, allow(dead_code))]
+    pub async fn get<Resp>(&self, url: &str) -> Result<Resp>
     where
         Resp: serde::de::DeserializeOwned,
     {
@@ -174,12 +220,22 @@ impl SeaClient {
     /// Handle an error response by parsing the error details
     async fn handle_error_response<T>(&self, response: reqwest::Response) -> Result<T> {
         let http_status = response.status().as_u16();
+
+        // Extract Retry-After header if present (in seconds)
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs);
+
         let body: serde_json::Value = response.json().await.unwrap_or_default();
 
         Err(crate::error::Error::SeaApi {
             code: body["error_code"].as_str().unwrap_or("UNKNOWN").to_string(),
             message: body["message"].as_str().unwrap_or("Unknown error").to_string(),
             http_status,
+            retry_after,
         })
     }
 
@@ -205,6 +261,46 @@ impl SeaClient {
     /// Delete/terminate a session
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
         self.delete(&self.session_url(session_id)).await
+    }
+
+    /// Execute an operation with retry logic
+    ///
+    /// Retries operations that fail with retryable errors using exponential backoff.
+    /// For 429 errors, respects the Retry-After header if present.
+    pub async fn with_retry<F, Fut, T>(&self, retry_config: &RetryConfig, mut f: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let mut last_error = None;
+
+        for attempt in 0..=retry_config.max_retries {
+            match f().await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    // Check if we should retry this error
+                    if !e.is_retryable() || attempt == retry_config.max_retries {
+                        return Err(e);
+                    }
+
+                    // For 429 errors, use Retry-After header if present
+                    let delay = if let crate::error::Error::SeaApi { http_status, retry_after, .. } = &e {
+                        if *http_status == 429 {
+                            retry_after.unwrap_or_else(|| retry_config.delay_for_attempt(attempt))
+                        } else {
+                            retry_config.delay_for_attempt(attempt)
+                        }
+                    } else {
+                        retry_config.delay_for_attempt(attempt)
+                    };
+
+                    tokio::time::sleep(delay).await;
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap())
     }
 }
 
@@ -371,7 +467,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            crate::error::Error::SeaApi { code, message, http_status } => {
+            crate::error::Error::SeaApi { code, message, http_status, .. } => {
                 assert_eq!(code, "INVALID_PARAMETER_VALUE");
                 assert_eq!(message, "Invalid warehouse ID");
                 assert_eq!(http_status, 400);
@@ -503,7 +599,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            crate::error::Error::SeaApi { code, message, http_status } => {
+            crate::error::Error::SeaApi { code, message, http_status, .. } => {
                 assert_eq!(code, "NOT_FOUND");
                 assert_eq!(message, "Resource not found");
                 assert_eq!(http_status, 404);
@@ -609,7 +705,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            crate::error::Error::SeaApi { code, message, http_status } => {
+            crate::error::Error::SeaApi { code, message, http_status, .. } => {
                 assert_eq!(code, "INVALID_PARAMETER_VALUE");
                 assert_eq!(message, "Invalid warehouse ID");
                 assert_eq!(http_status, 400);
@@ -672,7 +768,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            crate::error::Error::SeaApi { code, message, http_status } => {
+            crate::error::Error::SeaApi { code, message, http_status, .. } => {
                 assert_eq!(code, "NOT_FOUND");
                 assert_eq!(message, "Session not found");
                 assert_eq!(http_status, 404);

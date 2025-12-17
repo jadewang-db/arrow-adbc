@@ -26,6 +26,7 @@ fn test_sea_error_to_adbc_status_400() {
         code: "BAD_REQUEST".into(),
         message: "Invalid SQL".into(),
         http_status: 400,
+        retry_after: None,
     };
     assert_eq!(err.to_adbc_status(), Status::InvalidArguments);
 }
@@ -36,6 +37,7 @@ fn test_sea_error_to_adbc_status_401() {
         code: "UNAUTHENTICATED".into(),
         message: "Invalid token".into(),
         http_status: 401,
+        retry_after: None,
     };
     assert_eq!(err.to_adbc_status(), Status::Unauthenticated);
 }
@@ -46,6 +48,7 @@ fn test_sea_error_to_adbc_status_403() {
         code: "PERMISSION_DENIED".into(),
         message: "No access".into(),
         http_status: 403,
+        retry_after: None,
     };
     assert_eq!(err.to_adbc_status(), Status::Unauthorized);
 }
@@ -56,6 +59,7 @@ fn test_sea_error_to_adbc_status_404() {
         code: "NOT_FOUND".into(),
         message: "Resource not found".into(),
         http_status: 404,
+        retry_after: None,
     };
     assert_eq!(err.to_adbc_status(), Status::NotFound);
 }
@@ -66,6 +70,7 @@ fn test_sea_error_to_adbc_status_429() {
         code: "REQUEST_LIMIT_EXCEEDED".into(),
         message: "Rate limited".into(),
         http_status: 429,
+        retry_after: None,
     };
     assert_eq!(err.to_adbc_status(), Status::IO);
 }
@@ -76,6 +81,7 @@ fn test_sea_error_to_adbc_status_500() {
         code: "INTERNAL_ERROR".into(),
         message: "Server error".into(),
         http_status: 500,
+        retry_after: None,
     };
     assert_eq!(err.to_adbc_status(), Status::Internal);
 }
@@ -86,6 +92,7 @@ fn test_sea_error_to_adbc_status_503() {
         code: "TEMPORARILY_UNAVAILABLE".into(),
         message: "Service unavailable".into(),
         http_status: 503,
+        retry_after: None,
     };
     assert_eq!(err.to_adbc_status(), Status::IO);
 }
@@ -96,6 +103,7 @@ fn test_retryable_errors_429() {
         code: "REQUEST_LIMIT_EXCEEDED".into(),
         message: "Rate limited".into(),
         http_status: 429,
+        retry_after: None,
     };
     assert!(err_429.is_retryable());
 }
@@ -106,6 +114,7 @@ fn test_retryable_errors_500() {
         code: "INTERNAL_ERROR".into(),
         message: "Server error".into(),
         http_status: 500,
+        retry_after: None,
     };
     assert!(err_500.is_retryable());
 }
@@ -116,6 +125,7 @@ fn test_retryable_errors_503() {
         code: "TEMPORARILY_UNAVAILABLE".into(),
         message: "Service unavailable".into(),
         http_status: 503,
+        retry_after: None,
     };
     assert!(err_503.is_retryable());
 }
@@ -126,6 +136,7 @@ fn test_non_retryable_errors_400() {
         code: "BAD_REQUEST".into(),
         message: "Invalid".into(),
         http_status: 400,
+        retry_after: None,
     };
     assert!(!err_400.is_retryable());
 }
@@ -136,6 +147,7 @@ fn test_non_retryable_errors_401() {
         code: "UNAUTHENTICATED".into(),
         message: "Invalid token".into(),
         http_status: 401,
+        retry_after: None,
     };
     assert!(!err_401.is_retryable());
 }
@@ -146,6 +158,7 @@ fn test_non_retryable_errors_404() {
         code: "NOT_FOUND".into(),
         message: "Not found".into(),
         http_status: 404,
+        retry_after: None,
     };
     assert!(!err_404.is_retryable());
 }
@@ -169,6 +182,7 @@ fn test_all_sea_error_codes() {
             code: code.into(),
             message: "test".into(),
             http_status: status,
+            retry_after: None,
         };
         assert_eq!(
             err.to_adbc_status(),
@@ -229,6 +243,7 @@ fn test_error_conversion_to_adbc_core() {
         code: "BAD_REQUEST".into(),
         message: "Invalid SQL".into(),
         http_status: 400,
+        retry_after: None,
     };
 
     let adbc_err: adbc_core::error::Error = err.into();
@@ -242,6 +257,7 @@ fn test_error_message_preserved() {
         code: "INTERNAL_ERROR".into(),
         message: "Database connection failed".into(),
         http_status: 500,
+        retry_after: None,
     };
 
     let err_str = err.to_string();
