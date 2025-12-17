@@ -2152,6 +2152,48 @@ Implement statement status polling with exponential backoff for async statement 
 | Timeout works | Returns Timeout error after 300s |
 | Failed state handled | Returns error with message |
 
+### Files Modified/Created
+- `driver/databricks/src/client/mod.rs` - Added get_statement, PollConfig, and poll_until_complete
+
+### Implementation Notes
+
+**Key Changes:**
+1. **get_statement method**: Added to SeaClient to retrieve statement status. Uses the generic `get` method to query `/api/2.0/sql/statements/{statement_id}`.
+2. **PollConfig struct**: Configuration for polling with default values (initial_delay=1s, max_delay=10s, timeout=300s).
+3. **poll_until_complete method**: Implements polling loop with exponential backoff. Handles all statement states (SUCCEEDED, FAILED, CANCELED, CLOSED, PENDING, RUNNING).
+4. **Exponential backoff**: Delay doubles each iteration (1s, 2s, 4s, 8s, 10s, 10s...) with max_delay cap.
+5. **Timeout handling**: Checks elapsed time before each request, returns Error::Timeout when exceeded.
+6. **State handling**:
+   - SUCCEEDED: Returns response
+   - FAILED: Returns Error::StatementFailed with error message (or "Unknown error" if missing)
+   - CANCELED: Returns Error::StatementFailed("Statement was canceled")
+   - CLOSED: Returns Error::StatementFailed("Statement was closed")
+   - PENDING/RUNNING: Continue polling with backoff
+
+**Test Coverage:**
+- 2 unit tests for PollConfig (default, custom)
+- 3 unit tests for get_statement (success, running, not_found)
+- 8 unit tests for poll_until_complete:
+  - Immediate success (no polling)
+  - PENDING → RUNNING → SUCCEEDED transition
+  - FAILED state with error message
+  - CANCELED state
+  - CLOSED state
+  - Timeout after max duration
+  - Exponential backoff timing verification
+  - Missing error message handling
+- All 13 tests pass successfully
+
+**Behavior:**
+- get_statement sends GET request to /api/2.0/sql/statements/{statement_id}
+- Returns ExecuteStatementResponse with current status
+- poll_until_complete loops until terminal state or timeout
+- Exponential backoff starts at 1s, doubles each iteration, capped at 10s
+- Timeout checked before each request to avoid unnecessary API calls
+- Error messages extracted from response.status.error.message when available
+
+---
+
 ### Unit Tests
 ```rust
 #[tokio::test]

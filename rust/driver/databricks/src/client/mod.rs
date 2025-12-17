@@ -320,6 +320,105 @@ impl SeaClient {
     ) -> Result<models::ExecuteStatementResponse> {
         self.post(&self.statements_url(), &request).await
     }
+
+    /// Get statement status and results
+    ///
+    /// Retrieves the current status and results for a previously executed statement.
+    /// This is used to poll for completion when execute_statement returns PENDING or RUNNING.
+    ///
+    /// # Arguments
+    /// * `statement_id` - The statement ID returned from execute_statement
+    ///
+    /// # Returns
+    /// * `ExecuteStatementResponse` - Current status and results (if complete)
+    pub async fn get_statement(&self, statement_id: &str) -> Result<models::ExecuteStatementResponse> {
+        self.get(&self.statement_url(statement_id)).await
+    }
+}
+
+/// Configuration for statement polling
+#[derive(Clone, Debug)]
+pub struct PollConfig {
+    /// Initial delay before first poll (default: 1 second)
+    pub initial_delay: Duration,
+    /// Maximum delay between polls (default: 10 seconds)
+    pub max_delay: Duration,
+    /// Total timeout for polling (default: 300 seconds / 5 minutes)
+    pub timeout: Duration,
+}
+
+impl Default for PollConfig {
+    fn default() -> Self {
+        Self {
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(10),
+            timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+impl SeaClient {
+    /// Poll until statement completes or fails
+    ///
+    /// Continuously polls the statement status until it reaches a terminal state
+    /// (SUCCEEDED, FAILED, CANCELED, CLOSED) or the timeout is reached.
+    /// Uses exponential backoff with a maximum delay cap.
+    ///
+    /// # Arguments
+    /// * `statement_id` - The statement ID to poll
+    /// * `config` - Polling configuration (delays and timeout)
+    ///
+    /// # Returns
+    /// * `ExecuteStatementResponse` - Final response when SUCCEEDED
+    /// * `Error::StatementFailed` - When statement fails, is canceled, or closed
+    /// * `Error::Timeout` - When polling exceeds the configured timeout
+    ///
+    /// # Backoff Strategy
+    /// - Initial delay: config.initial_delay (default 1s)
+    /// - Each iteration: delay = min(delay * 2, max_delay)
+    /// - Max delay: config.max_delay (default 10s)
+    /// - Sequence: 1s, 2s, 4s, 8s, 10s, 10s, ...
+    pub async fn poll_until_complete(
+        &self,
+        statement_id: &str,
+        config: &PollConfig,
+    ) -> Result<models::ExecuteStatementResponse> {
+        let start = std::time::Instant::now();
+        let mut delay = config.initial_delay;
+
+        loop {
+            // Check timeout before making request
+            if start.elapsed() > config.timeout {
+                return Err(crate::error::Error::Timeout);
+            }
+
+            let response = self.get_statement(statement_id).await?;
+
+            match response.status.state {
+                models::StatementState::Succeeded => {
+                    return Ok(response);
+                }
+                models::StatementState::Failed => {
+                    let error_msg = response.status.error
+                        .and_then(|e| e.message)
+                        .unwrap_or_else(|| "Unknown error".to_string());
+                    return Err(crate::error::Error::StatementFailed(error_msg));
+                }
+                models::StatementState::Canceled => {
+                    return Err(crate::error::Error::StatementFailed("Statement was canceled".into()));
+                }
+                models::StatementState::Closed => {
+                    return Err(crate::error::Error::StatementFailed("Statement was closed".into()));
+                }
+                models::StatementState::Pending | models::StatementState::Running => {
+                    // Sleep before next poll
+                    tokio::time::sleep(delay).await;
+                    // Exponential backoff with cap
+                    delay = std::cmp::min(delay * 2, config.max_delay);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1148,6 +1247,527 @@ mod tests {
                 assert_eq!(http_status, 400);
             }
             _ => panic!("Expected SeaApi error"),
+        }
+    }
+
+    // === PollConfig Tests ===
+
+    #[test]
+    fn test_poll_config_default() {
+        let config = PollConfig::default();
+        assert_eq!(config.initial_delay, Duration::from_secs(1));
+        assert_eq!(config.max_delay, Duration::from_secs(10));
+        assert_eq!(config.timeout, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_poll_config_custom() {
+        let config = PollConfig {
+            initial_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(5),
+            timeout: Duration::from_secs(60),
+        };
+        assert_eq!(config.initial_delay, Duration::from_millis(500));
+        assert_eq!(config.max_delay, Duration::from_secs(5));
+        assert_eq!(config.timeout, Duration::from_secs(60));
+    }
+
+    // === get_statement Tests ===
+
+    #[tokio::test]
+    async fn test_get_statement_success() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-123",
+                "status": {
+                    "state": "SUCCEEDED"
+                },
+                "result": {
+                    "chunk_index": 0,
+                    "row_count": 100
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let response = client.get_statement("stmt-123").await;
+
+        assert!(response.is_ok());
+        let response = response.unwrap();
+        assert_eq!(response.statement_id, "stmt-123");
+        assert_eq!(response.status.state, models::StatementState::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn test_get_statement_running() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-456"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-456",
+                "status": {
+                    "state": "RUNNING"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let response = client.get_statement("stmt-456").await;
+
+        assert!(response.is_ok());
+        let response = response.unwrap();
+        assert_eq!(response.statement_id, "stmt-456");
+        assert_eq!(response.status.state, models::StatementState::Running);
+    }
+
+    #[tokio::test]
+    async fn test_get_statement_not_found() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/invalid-id"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error_code": "NOT_FOUND",
+                "message": "Statement not found"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let response = client.get_statement("invalid-id").await;
+
+        assert!(response.is_err());
+        match response.unwrap_err() {
+            crate::error::Error::SeaApi { code, message, http_status, .. } => {
+                assert_eq!(code, "NOT_FOUND");
+                assert_eq!(message, "Statement not found");
+                assert_eq!(http_status, 404);
+            }
+            _ => panic!("Expected SeaApi error"),
+        }
+    }
+
+    // === poll_until_complete Tests ===
+
+    #[tokio::test]
+    async fn test_poll_until_complete_immediate_success() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        // Statement is already succeeded
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-success"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-success",
+                "status": {
+                    "state": "SUCCEEDED"
+                },
+                "result": {
+                    "chunk_index": 0,
+                    "row_count": 100
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let poll_config = PollConfig::default();
+
+        let start = std::time::Instant::now();
+        let response = client.poll_until_complete("stmt-success", &poll_config).await;
+        let elapsed = start.elapsed();
+
+        assert!(response.is_ok());
+        let response = response.unwrap();
+        assert_eq!(response.statement_id, "stmt-success");
+        assert_eq!(response.status.state, models::StatementState::Succeeded);
+        // Should return immediately without polling delay
+        assert!(elapsed < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn test_poll_until_complete_pending_then_success() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        // First call returns PENDING
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-pending"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-pending",
+                "status": {
+                    "state": "PENDING"
+                }
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // Second call returns RUNNING
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-pending"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-pending",
+                "status": {
+                    "state": "RUNNING"
+                }
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // Third call returns SUCCEEDED
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-pending"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-pending",
+                "status": {
+                    "state": "SUCCEEDED"
+                },
+                "result": {
+                    "chunk_index": 0,
+                    "row_count": 100
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let poll_config = PollConfig {
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(10),
+            timeout: Duration::from_secs(30),
+        };
+
+        let response = client.poll_until_complete("stmt-pending", &poll_config).await;
+
+        assert!(response.is_ok());
+        let response = response.unwrap();
+        assert_eq!(response.statement_id, "stmt-pending");
+        assert_eq!(response.status.state, models::StatementState::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn test_poll_until_complete_failed() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-failed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-failed",
+                "status": {
+                    "state": "FAILED",
+                    "error": {
+                        "error_code": "SYNTAX_ERROR",
+                        "message": "Invalid SQL syntax"
+                    }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let poll_config = PollConfig::default();
+
+        let response = client.poll_until_complete("stmt-failed", &poll_config).await;
+
+        assert!(response.is_err());
+        match response.unwrap_err() {
+            crate::error::Error::StatementFailed(msg) => {
+                assert_eq!(msg, "Invalid SQL syntax");
+            }
+            e => panic!("Expected StatementFailed error, got {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_poll_until_complete_canceled() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-canceled"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-canceled",
+                "status": {
+                    "state": "CANCELED"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let poll_config = PollConfig::default();
+
+        let response = client.poll_until_complete("stmt-canceled", &poll_config).await;
+
+        assert!(response.is_err());
+        match response.unwrap_err() {
+            crate::error::Error::StatementFailed(msg) => {
+                assert_eq!(msg, "Statement was canceled");
+            }
+            e => panic!("Expected StatementFailed error, got {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_poll_until_complete_closed() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-closed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-closed",
+                "status": {
+                    "state": "CLOSED"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let poll_config = PollConfig::default();
+
+        let response = client.poll_until_complete("stmt-closed", &poll_config).await;
+
+        assert!(response.is_err());
+        match response.unwrap_err() {
+            crate::error::Error::StatementFailed(msg) => {
+                assert_eq!(msg, "Statement was closed");
+            }
+            e => panic!("Expected StatementFailed error, got {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_poll_until_complete_timeout() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        // Always return RUNNING to force timeout
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-timeout"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-timeout",
+                "status": {
+                    "state": "RUNNING"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let poll_config = PollConfig {
+            initial_delay: Duration::from_millis(50),
+            max_delay: Duration::from_millis(100),
+            timeout: Duration::from_millis(500), // Short timeout for test
+        };
+
+        let start = std::time::Instant::now();
+        let response = client.poll_until_complete("stmt-timeout", &poll_config).await;
+        let elapsed = start.elapsed();
+
+        assert!(response.is_err());
+        match response.unwrap_err() {
+            crate::error::Error::Timeout => {
+                // Expected
+            }
+            e => panic!("Expected Timeout error, got {:?}", e),
+        }
+        // Verify we actually waited close to the timeout duration
+        assert!(elapsed >= Duration::from_millis(500));
+        assert!(elapsed < Duration::from_millis(1000)); // Some buffer for test execution
+    }
+
+    #[tokio::test]
+    async fn test_poll_exponential_backoff() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        // Return RUNNING for several iterations
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-backoff"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-backoff",
+                "status": {
+                    "state": "RUNNING"
+                }
+            })))
+            .up_to_n_times(4)
+            .mount(&mock_server)
+            .await;
+
+        // Finally return SUCCEEDED
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-backoff"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-backoff",
+                "status": {
+                    "state": "SUCCEEDED"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let poll_config = PollConfig {
+            initial_delay: Duration::from_millis(100), // 100ms
+            max_delay: Duration::from_millis(500),     // Cap at 500ms
+            timeout: Duration::from_secs(10),
+        };
+
+        let start = std::time::Instant::now();
+        let response = client.poll_until_complete("stmt-backoff", &poll_config).await;
+        let elapsed = start.elapsed();
+
+        assert!(response.is_ok());
+
+        // Verify exponential backoff timing
+        // Expected delays: 100ms, 200ms, 400ms, 500ms (capped)
+        // Total: ~1200ms minimum
+        // With some buffer for request time: should be at least 1000ms
+        assert!(elapsed >= Duration::from_millis(1000),
+            "Expected at least 1000ms with exponential backoff, got {}ms",
+            elapsed.as_millis());
+    }
+
+    #[tokio::test]
+    async fn test_poll_failed_with_missing_error_message() {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-no-msg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "statement_id": "stmt-no-msg",
+                "status": {
+                    "state": "FAILED"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = SeaClientConfig {
+            host: mock_server.uri(),
+            token: "test-token".to_string(),
+            warehouse_id: "test-warehouse".to_string(),
+            ..Default::default()
+        };
+
+        let client = SeaClient::new(config).unwrap();
+        let poll_config = PollConfig::default();
+
+        let response = client.poll_until_complete("stmt-no-msg", &poll_config).await;
+
+        assert!(response.is_err());
+        match response.unwrap_err() {
+            crate::error::Error::StatementFailed(msg) => {
+                assert_eq!(msg, "Unknown error");
+            }
+            e => panic!("Expected StatementFailed error, got {:?}", e),
         }
     }
 }
