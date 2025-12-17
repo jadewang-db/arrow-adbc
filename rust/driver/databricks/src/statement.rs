@@ -17,24 +17,45 @@
 
 //! Statement implementation for Databricks
 
+use std::sync::Arc;
+
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{OptionStatement, OptionValue};
 use adbc_core::{Optionable, PartitionedResult, Statement};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
+use tokio::runtime::Runtime;
+
+use crate::client::SeaClient;
+use crate::session::SessionManager;
 
 /// SQL statement handle for executing queries
-pub struct DatabricksStatement;
-
-impl DatabricksStatement {
-    pub fn new() -> Self {
-        Self
-    }
+pub struct DatabricksStatement {
+    #[allow(dead_code)]
+    client: Arc<SeaClient>,
+    #[allow(dead_code)]
+    session_manager: Arc<SessionManager>,
+    #[allow(dead_code)]
+    runtime: Arc<Runtime>,
 }
 
-impl Default for DatabricksStatement {
-    fn default() -> Self {
-        Self::new()
+impl DatabricksStatement {
+    /// Create a new statement with the given client, session manager, and runtime
+    ///
+    /// # Arguments
+    /// * `client` - SEA client for making API calls
+    /// * `session_manager` - Session manager for maintaining session state
+    /// * `runtime` - Tokio runtime for async operations
+    pub fn new(
+        client: Arc<SeaClient>,
+        session_manager: Arc<SessionManager>,
+        runtime: Arc<Runtime>,
+    ) -> Self {
+        Self {
+            client,
+            session_manager,
+            runtime,
+        }
     }
 }
 

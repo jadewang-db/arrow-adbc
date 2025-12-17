@@ -23,8 +23,8 @@ use std::sync::Arc;
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
 use adbc_core::{Connection, Optionable};
-use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::{ArrowError, Schema, SchemaRef};
+use arrow_array::RecordBatchReader;
+use arrow_schema::Schema;
 use tokio::runtime::Runtime;
 
 use crate::client::{SeaClient, SeaClientConfig};
@@ -32,27 +32,31 @@ use crate::options::DatabaseConfig;
 use crate::session::SessionManager;
 use crate::statement::DatabricksStatement;
 
-/// Empty reader for stub implementations
-struct EmptyBatchReader {
-    schema: SchemaRef,
+/// Empty reader for unimplemented methods that return RecordBatchReader
+/// This is used as a placeholder until the methods are fully implemented
+struct UnimplementedBatchReader {
+    schema: std::sync::Arc<Schema>,
 }
 
-impl EmptyBatchReader {
-    fn new(schema: SchemaRef) -> Self {
-        Self { schema }
+impl UnimplementedBatchReader {
+    fn new() -> Self {
+        Self {
+            schema: std::sync::Arc::new(Schema::empty()),
+        }
     }
 }
 
-impl Iterator for EmptyBatchReader {
-    type Item = std::result::Result<RecordBatch, ArrowError>;
+impl Iterator for UnimplementedBatchReader {
+    type Item = std::result::Result<arrow_array::RecordBatch, arrow_schema::ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        None
+        // This should never be called since methods that return this type use todo!()
+        unreachable!("UnimplementedBatchReader should not be used")
     }
 }
 
-impl RecordBatchReader for EmptyBatchReader {
-    fn schema(&self) -> SchemaRef {
+impl RecordBatchReader for UnimplementedBatchReader {
+    fn schema(&self) -> std::sync::Arc<Schema> {
         self.schema.clone()
     }
 }
@@ -124,6 +128,18 @@ impl DatabricksConnection {
             config,
         })
     }
+
+    /// Get the session ID for this connection
+    ///
+    /// This is primarily used for testing and debugging purposes.
+    ///
+    /// # Errors
+    /// Returns an error if the session ID cannot be retrieved.
+    pub fn session_id(&self) -> Result<String> {
+        self.runtime
+            .block_on(self.session_manager.get_session_id())
+            .map_err(|e| Error::with_message_and_status(e.to_string(), Status::Internal))
+    }
 }
 
 impl Optionable for DatabricksConnection {
@@ -167,20 +183,26 @@ impl Connection for DatabricksConnection {
     type StatementType = DatabricksStatement;
 
     fn new_statement(&mut self) -> Result<Self::StatementType> {
-        // Stub implementation - will be completed in work item 1.7
-        Ok(DatabricksStatement::new())
-    }
-
-    fn cancel(&mut self) -> Result<()> {
-        Err(Error::with_message_and_status(
-            "Connection methods not yet implemented",
-            Status::NotImplemented,
+        Ok(DatabricksStatement::new(
+            self.client.clone(),
+            self.session_manager.clone(),
+            self.runtime.clone(),
         ))
     }
 
+    fn cancel(&mut self) -> Result<()> {
+        // Cancel any active operations on this connection
+        // Since statements are independent, there's nothing to cancel at the connection level
+        Ok(())
+    }
+
     fn get_info(&self, _codes: Option<HashSet<InfoCode>>) -> Result<impl RecordBatchReader> {
-        // Stub implementation - will be completed in work item 1.7
-        Ok(EmptyBatchReader::new(std::sync::Arc::new(Schema::empty())))
+        // Metadata methods will be implemented in Sprint 4
+        #[allow(unreachable_code)]
+        {
+            todo!("Implemented in Sprint 4");
+            Ok(UnimplementedBatchReader::new())
+        }
     }
 
     fn get_objects(
@@ -192,8 +214,12 @@ impl Connection for DatabricksConnection {
         _table_type: Option<Vec<&str>>,
         _column_name: Option<&str>,
     ) -> Result<impl RecordBatchReader> {
-        // Stub implementation - will be completed in work item 1.7
-        Ok(EmptyBatchReader::new(std::sync::Arc::new(Schema::empty())))
+        // Metadata methods will be implemented in Sprint 4
+        #[allow(unreachable_code)]
+        {
+            todo!("Implemented in Sprint 4");
+            Ok(UnimplementedBatchReader::new())
+        }
     }
 
     fn get_table_schema(
@@ -202,13 +228,17 @@ impl Connection for DatabricksConnection {
         _db_schema: Option<&str>,
         _table_name: &str,
     ) -> Result<Schema> {
-        // Stub implementation - will be completed in work item 1.7
-        Ok(Schema::empty())
+        // Metadata methods will be implemented in Sprint 4
+        todo!("Implemented in Sprint 4")
     }
 
     fn get_table_types(&self) -> Result<impl RecordBatchReader> {
-        // Stub implementation - will be completed in work item 1.7
-        Ok(EmptyBatchReader::new(std::sync::Arc::new(Schema::empty())))
+        // Metadata methods will be implemented in Sprint 4
+        #[allow(unreachable_code)]
+        {
+            todo!("Implemented in Sprint 4");
+            Ok(UnimplementedBatchReader::new())
+        }
     }
 
     fn commit(&mut self) -> Result<()> {
@@ -226,8 +256,14 @@ impl Connection for DatabricksConnection {
     }
 
     fn read_partition(&self, _partition: impl AsRef<[u8]>) -> Result<impl RecordBatchReader> {
-        // Stub implementation - will be completed in work item 1.7
-        Ok(EmptyBatchReader::new(std::sync::Arc::new(Schema::empty())))
+        #[allow(unreachable_code)]
+        {
+            return Err(Error::with_message_and_status(
+                "Partitioned reads not supported",
+                Status::NotImplemented,
+            ));
+            Ok(UnimplementedBatchReader::new())
+        }
     }
 
     fn get_statistics(
@@ -237,13 +273,25 @@ impl Connection for DatabricksConnection {
         _table_name: Option<&str>,
         _approximate: bool,
     ) -> Result<impl RecordBatchReader> {
-        // Stub implementation - will be completed in work item 1.7
-        Ok(EmptyBatchReader::new(std::sync::Arc::new(Schema::empty())))
+        #[allow(unreachable_code)]
+        {
+            return Err(Error::with_message_and_status(
+                "Statistics not supported",
+                Status::NotImplemented,
+            ));
+            Ok(UnimplementedBatchReader::new())
+        }
     }
 
     fn get_statistic_names(&self) -> Result<impl RecordBatchReader> {
-        // Stub implementation - will be completed in work item 1.7
-        Ok(EmptyBatchReader::new(std::sync::Arc::new(Schema::empty())))
+        #[allow(unreachable_code)]
+        {
+            return Err(Error::with_message_and_status(
+                "Statistics not supported",
+                Status::NotImplemented,
+            ));
+            Ok(UnimplementedBatchReader::new())
+        }
     }
 }
 
